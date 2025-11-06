@@ -33,10 +33,8 @@ if [ "$HAS_OPENAI" = false ] && [ "$HAS_AZURE_OPENAI" = false ]; then
 fi
 
 if [ -z "$ADO_ORGANIZATION" ]; then
-    echo "❌ ADO_ORGANIZATION environment variable is not set"
-    echo "Please set your Azure DevOps organization:"
-    echo "export ADO_ORGANIZATION=\"your-org-name\""
-    exit 1
+    echo "ℹ️  ADO_ORGANIZATION not set, using default: SPOOL"
+    ADO_ORGANIZATION="SPOOL"
 fi
 
 if [ -z "$ADO_PAT" ]; then
@@ -62,16 +60,26 @@ fi
 echo "PAT: ${ADO_PAT:0:10}..."
 echo
 
-# Check if project and PR ID are provided
-if [ "$#" -ne 3 ]; then
-    echo "Usage: $0 <project-name> <repository-name> <pull-request-id>"
+# Check if repository and PR ID are provided
+if [ "$#" -eq 2 ]; then
+    # Format: <repository> <pull-request-id>
+    # Use default project SCC
+    PROJECT="SCC"
+    REPOSITORY=$1
+    PR_ID=$2
+    echo "Using default project: SCC"
+elif [ "$#" -eq 3 ]; then
+    # Format: <project> <repository> <pull-request-id>
+    PROJECT=$1
+    REPOSITORY=$2
+    PR_ID=$3
+else
+    echo "Usage: $0 <repository-name> <pull-request-id>"
+    echo "       $0 <project-name> <repository-name> <pull-request-id>"
+    echo "Example: $0 MyRepo 123"
     echo "Example: $0 MyProject MyRepo 123"
     exit 1
 fi
-
-PROJECT=$1
-REPOSITORY=$2
-PR_ID=$3
 
 echo "Testing Code Review Agent with:"
 echo "Project: $PROJECT"
