@@ -1,5 +1,4 @@
 #!/bin/bash
-
 # Test script for Code Review Agent
 # This script demonstrates how to use the code review agent
 
@@ -8,10 +7,28 @@ echo "=============================="
 echo
 
 # Check if environment variables are set
-if [ -z "$OPENAI_API_KEY" ]; then
-    echo "❌ OPENAI_API_KEY environment variable is not set"
-    echo "Please set your OpenAI API key:"
+HAS_OPENAI=false
+HAS_AZURE_OPENAI=false
+
+if [ ! -z "$OPENAI_API_KEY" ]; then
+    HAS_OPENAI=true
+fi
+
+if [ ! -z "$AZURE_OPENAI_ENDPOINT" ] && [ ! -z "$AZURE_OPENAI_API_KEY" ]; then
+    HAS_AZURE_OPENAI=true
+fi
+
+if [ "$HAS_OPENAI" = false ] && [ "$HAS_AZURE_OPENAI" = false ]; then
+    echo "❌ Neither OpenAI nor Azure OpenAI is configured"
+    echo "Please configure one of the following:"
+    echo
+    echo "Option 1 - OpenAI:"
     echo "export OPENAI_API_KEY=\"your-api-key-here\""
+    echo
+    echo "Option 2 - Azure OpenAI:"
+    echo "export AZURE_OPENAI_ENDPOINT=\"https://your-resource.openai.azure.com/\""
+    echo "export AZURE_OPENAI_API_KEY=\"your-azure-api-key\""
+    echo "export AZURE_OPENAI_DEPLOYMENT=\"gpt-4\"  # optional"
     exit 1
 fi
 
@@ -31,22 +48,34 @@ fi
 
 echo "✅ Environment variables are set"
 echo "Organization: $ADO_ORGANIZATION"
-echo "API Key: ${OPENAI_API_KEY:0:10}..."
+
+if [ "$HAS_AZURE_OPENAI" = true ]; then
+    echo "AI Service: Azure OpenAI"
+    echo "Endpoint: $AZURE_OPENAI_ENDPOINT"
+    echo "Deployment: ${AZURE_OPENAI_DEPLOYMENT:-gpt-4}"
+    echo "API Key: ${AZURE_OPENAI_API_KEY:0:10}..."
+else
+    echo "AI Service: OpenAI"
+    echo "API Key: ${OPENAI_API_KEY:0:10}..."
+fi
+
 echo "PAT: ${ADO_PAT:0:10}..."
 echo
 
 # Check if project and PR ID are provided
-if [ "$#" -ne 2 ]; then
-    echo "Usage: $0 <project-name> <pull-request-id>"
-    echo "Example: $0 MyProject 123"
+if [ "$#" -ne 3 ]; then
+    echo "Usage: $0 <project-name> <repository-name> <pull-request-id>"
+    echo "Example: $0 MyProject MyRepo 123"
     exit 1
 fi
 
 PROJECT=$1
-PR_ID=$2
+REPOSITORY=$2
+PR_ID=$3
 
 echo "Testing Code Review Agent with:"
 echo "Project: $PROJECT"
+echo "Repository: $REPOSITORY"
 echo "Pull Request ID: $PR_ID"
 echo
 
@@ -64,10 +93,10 @@ echo
 
 # Run the code review agent
 echo "Running code review agent..."
-echo "dotnet run --configuration Release -- \"$PROJECT\" $PR_ID"
+echo "dotnet run --configuration Release -- \"$PROJECT\" \"$REPOSITORY\" $PR_ID"
 echo
 
-dotnet run --configuration Release -- "$PROJECT" $PR_ID
+dotnet run --configuration Release -- "$PROJECT" "$REPOSITORY" $PR_ID
 
 if [ $? -eq 0 ]; then
     echo

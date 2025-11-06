@@ -60,6 +60,25 @@ public class AzureDevOpsMcpClient : IAsyncDisposable
 
     public async Task<PullRequest?> GetPullRequestAsync(string project, string repository, int pullRequestId)
     {
+        // Try REST API first as it's more reliable
+        try
+        {
+            _logger.LogInformation("Fetching PR {PullRequestId} from repository {Repository} (project {Project}) via REST API",
+                pullRequestId, repository, project);
+
+            var pullRequest = await _restClient.GetPullRequestAsync(project, repository, pullRequestId);
+            if (pullRequest != null)
+            {
+                _logger.LogInformation("Found PR {PullRequestId}: {Title}", pullRequest.Id, pullRequest.Title);
+                return pullRequest;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Error fetching pull request {PullRequestId} via REST API, trying MCP", pullRequestId);
+        }
+
+        // Fallback to MCP if REST API fails
         try
         {
             _logger.LogInformation("Fetching PR {PullRequestId} from repository {Repository} (project {Project}) via MCP",

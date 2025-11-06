@@ -36,6 +36,74 @@ public class AzureDevOpsRestClient
     }
 
     /// <summary>
+    /// Get pull request details
+    /// </summary>
+    public async Task<PullRequest?> GetPullRequestAsync(
+        string project,
+        string repository,
+        int pullRequestId)
+    {
+        try
+        {
+            _logger.LogInformation("Fetching PR {PullRequestId} in repository {Repository} (project {Project})",
+                pullRequestId, repository, project);
+
+            // Get repository ID first
+            var repoUrl = $"{project}/_apis/git/repositories/{repository}?api-version=7.1";
+            var repoResponse = await _httpClient.GetAsync(repoUrl);
+            repoResponse.EnsureSuccessStatusCode();
+
+            var repoContent = await repoResponse.Content.ReadAsStringAsync();
+            var repoData = JsonSerializer.Deserialize<JsonElement>(repoContent);
+            var repositoryId = repoData.GetProperty("id").GetString();
+
+            if (string.IsNullOrEmpty(repositoryId))
+            {
+                _logger.LogError("Could not find repository ID for {Repository}", repository);
+                return null;
+            }
+
+            // Get the PR details
+            var prUrl = $"{project}/_apis/git/repositories/{repositoryId}/pullRequests/{pullRequestId}?api-version=7.1";
+            var prResponse = await _httpClient.GetAsync(prUrl);
+            prResponse.EnsureSuccessStatusCode();
+
+            var prContent = await prResponse.Content.ReadAsStringAsync();
+            var prData = JsonSerializer.Deserialize<JsonElement>(prContent);
+
+            var pullRequest = new PullRequest
+            {
+                Id = prData.GetProperty("pullRequestId").GetInt32(),
+                Title = prData.GetProperty("title").GetString() ?? string.Empty,
+                Description = prData.TryGetProperty("description", out var desc) ? desc.GetString() ?? string.Empty : string.Empty,
+                SourceBranch = prData.GetProperty("sourceRefName").GetString() ?? string.Empty,
+                TargetBranch = prData.GetProperty("targetRefName").GetString() ?? string.Empty,
+                CreatedBy = prData.TryGetProperty("createdBy", out var creator)
+                    ? new PullRequestUser
+                    {
+                        DisplayName = creator.TryGetProperty("displayName", out var name) ? name.GetString() ?? string.Empty : string.Empty,
+                        UniqueName = creator.TryGetProperty("uniqueName", out var unique) ? unique.GetString() ?? string.Empty : string.Empty
+                    }
+                    : new PullRequestUser(),
+                CreationDate = prData.TryGetProperty("creationDate", out var date)
+                    ? date.GetDateTime()
+                    : DateTime.Now,
+                Status = prData.TryGetProperty("status", out var statusProp)
+                    ? (statusProp.ValueKind == JsonValueKind.Number ? statusProp.GetInt32().ToString() : statusProp.GetString() ?? "unknown")
+                    : "unknown"
+            };
+
+            _logger.LogInformation("Found PR {PullRequestId}: {Title}", pullRequest.Id, pullRequest.Title);
+            return pullRequest;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error fetching pull request {PullRequestId}", pullRequestId);
+            return null;
+        }
+    }
+
+    /// <summary>
     /// Get file changes for a pull request
     /// </summary>
     public async Task<List<PullRequestFile>> GetPullRequestChangesAsync(
