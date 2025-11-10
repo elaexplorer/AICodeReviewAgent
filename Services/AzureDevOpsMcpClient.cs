@@ -263,28 +263,69 @@ public class AzureDevOpsMcpClient : IAsyncDisposable
 
     public async Task<bool> PostCommentAsync(string project, string repository, int pullRequestId, CodeReviewComment comment)
     {
+        // Try REST API first as MCP doesn't support posting comments
         try
         {
-            _logger.LogInformation("Posting comment to PR {PullRequestId} in repository {Repository} via MCP",
+            _logger.LogInformation("Posting comment to PR {PullRequestId} in repository {Repository} via REST API",
                 pullRequestId, repository);
 
-            var client = await GetMcpClientAsync();
-
-            // Call the add_pull_request_comment MCP tool
-            var result = await client.CallToolAsync("add_pull_request_comment", new Dictionary<string, object?>
+            // Get repository ID first
+            var repoResult = await GetMcpClientAsync();
+            var repoResponse = await repoResult.CallToolAsync("repo_get_repo_by_name_or_id", new Dictionary<string, object?>
             {
                 ["project"] = project,
-                ["pullRequestId"] = pullRequestId.ToString(),
-                ["content"] = comment.CommentText
+                ["repositoryNameOrId"] = repository
             });
 
-            _logger.LogInformation("Posted comment to PR {PullRequestId}: {Comment}", pullRequestId, comment.CommentText);
-            return result.IsError == false;
+            string? repositoryId = null;
+            if (repoResponse.Content?.Count > 0)
+            {
+                var repoContent = JsonSerializer.Serialize(repoResponse.Content[0]);
+                var repoData = JsonSerializer.Deserialize<JsonElement>(repoContent);
+                var textValue = repoData.TryGetProperty("text", out var textProp) ? textProp.GetString() : repoContent;
+                var repo = JsonSerializer.Deserialize<JsonElement>(textValue!);
+                repositoryId = repo.GetProperty("id").GetString();
+            }
+
+            if (string.IsNullOrEmpty(repositoryId))
+            {
+                _logger.LogError("Repository {Repository} not found", repository);
+                return false;
+            }
+
+            // Use REST API to post comment
+            var success = await _restClient.PostPullRequestCommentAsync(project, repositoryId, pullRequestId, comment);
+            if (success)
+            {
+                _logger.LogInformation("Posted comment to PR {PullRequestId}: {Comment}", pullRequestId, comment.CommentText);
+                return true;
+            }
+
+            return false;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error posting comment to PR {PullRequestId} via MCP", pullRequestId);
+            _logger.LogError(ex, "Error posting comment to PR {PullRequestId}", pullRequestId);
             return false;
+        }
+    }
+
+    public async Task<List<PullRequest>> GetActivePullRequestsAsync(string project, string repository)
+    {
+        try
+        {
+            _logger.LogInformation("Fetching active PRs for {Project}/{Repository}", project, repository);
+
+            // Use REST API to get active pull requests
+            var prs = await _restClient.GetActivePullRequestsAsync(project, repository);
+
+            _logger.LogInformation("Found {Count} active PRs in {Repository}", prs.Count, repository);
+            return prs;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error fetching active pull requests");
+            return new List<PullRequest>();
         }
     }
 

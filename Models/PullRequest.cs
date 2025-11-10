@@ -13,10 +13,10 @@ public class PullRequest
     [JsonPropertyName("description")]
     public string Description { get; set; } = string.Empty;
 
-    [JsonPropertyName("sourceRefName")]
+    [JsonPropertyName("sourceBranch")]
     public string SourceBranch { get; set; } = string.Empty;
 
-    [JsonPropertyName("targetRefName")]
+    [JsonPropertyName("targetBranch")]
     public string TargetBranch { get; set; } = string.Empty;
 
     [JsonPropertyName("status")]
@@ -51,13 +51,18 @@ public class PullRequestFile
 
     [JsonPropertyName("previousContent")]
     public string PreviousContent { get; set; } = string.Empty;
+
+    [JsonPropertyName("unifiedDiff")]
+    public string UnifiedDiff { get; set; } = string.Empty;
 }
 
 public class CodeReviewComment
 {
+    public string Id { get; set; } = Guid.NewGuid().ToString();
     public string FilePath { get; set; } = string.Empty;
     public int LineNumber { get; set; }
     public string CommentText { get; set; } = string.Empty;
     public string CommentType { get; set; } = string.Empty; // "suggestion", "issue", "nitpick"
     public string Severity { get; set; } = string.Empty; // "low", "medium", "high"
+    public bool Posted { get; set; } = false;
 }

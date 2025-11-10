@@ -1,5 +1,6 @@
 using CodeReviewAgent.Agents;
 using CodeReviewAgent.Services;
+using Microsoft.AspNetCore.Builder;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -7,7 +8,8 @@ using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.ChatCompletion;
 using Microsoft.SemanticKernel.Connectors.OpenAI;
 
-var builder = Host.CreateApplicationBuilder(args);
+// Create web application builder
+var builder = WebApplication.CreateBuilder(args);
 
 // Configuration validation
 var openAiApiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY");
@@ -118,13 +120,52 @@ builder.Services.AddSingleton<CodeReviewOrchestrator>();
 builder.Services.AddSingleton<CodeReviewService>();
 builder.Services.AddSingleton<CodeReviewAgentService>();
 
+// Add web services
+builder.Services.AddControllers();
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddCors(options =>
+{
+    options.AddDefaultPolicy(policy =>
+    {
+        policy.AllowAnyOrigin()
+              .AllowAnyMethod()
+              .AllowAnyHeader();
+    });
+});
+
 var app = builder.Build();
+
+// Configure middleware
+app.UseCors();
+app.UseDefaultFiles();
+
+// Disable caching for static files during development
+app.UseStaticFiles(new StaticFileOptions
+{
+    OnPrepareResponse = ctx =>
+    {
+        ctx.Context.Response.Headers["Cache-Control"] = "no-cache, no-store, must-revalidate";
+        ctx.Context.Response.Headers["Pragma"] = "no-cache";
+        ctx.Context.Response.Headers["Expires"] = "0";
+    }
+});
+
+app.MapControllers();
 
 // Get required services
 var logger = app.Services.GetRequiredService<ILogger<Program>>();
 var codeReviewAgent = app.Services.GetRequiredService<CodeReviewAgentService>();
 
-logger.LogInformation("Code Review Agent started");
+// Check if running in web mode (no command-line arguments)
+if (args.Length == 0 || args.Contains("--web"))
+{
+    logger.LogInformation("Starting Code Review Agent in Web UI mode");
+    logger.LogInformation("Open http://localhost:5000 in your browser");
+    app.Run("http://localhost:5000");
+    return;
+}
+
+logger.LogInformation("Code Review Agent started in CLI mode");
 
 // Parse command-line arguments
 string project;

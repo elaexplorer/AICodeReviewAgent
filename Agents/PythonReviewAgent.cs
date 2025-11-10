@@ -45,22 +45,18 @@ public class PythonReviewAgent : ILanguageReviewAgent
                 - Popular Python frameworks (Django, Flask, FastAPI, pandas, numpy, etc.)
                 - Testing patterns (pytest, unittest, mocking)
 
-                Review the following Python file that was changed in a pull request:
+                Review ONLY THE CHANGES in the following Python file from a pull request.
+
+                IMPORTANT: Only review the lines that were ADDED or MODIFIED in this PR.
+                Do NOT comment on existing code that wasn't changed. Lines starting with '+' are additions, lines starting with '-' are removals.
 
                 File Path: {{{file.Path}}}
                 Change Type: {{{file.ChangeType}}}
 
-                Current Content:
-                ```python
-                {{{file.Content}}}
+                Changes (Unified Diff):
+                ```diff
+                {{{file.UnifiedDiff}}}
                 ```
-
-                {{{(string.IsNullOrEmpty(file.PreviousContent) ? "" : $@"
-                Previous Content:
-                ```python
-                {file.PreviousContent}
-                ```
-                ")}}}
 
                 Codebase Context:
                 {{{codebaseContext}}}
@@ -74,7 +70,7 @@ public class PythonReviewAgent : ILanguageReviewAgent
                 6. **Python-Specific**: Proper use of context managers, generators, decorators, type hints
 
                 For each issue found, provide:
-                - Line number (if applicable)
+                - Line number from the diff (lines marked with + are the new code)
                 - Severity (high/medium/low)
                 - Type (issue/suggestion/nitpick)
                 - Clear explanation of the problem

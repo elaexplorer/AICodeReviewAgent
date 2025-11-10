@@ -1,0 +1,1073 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Code Review Agent</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: #f5f7fa;
+            color: #333;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        header {
+            background: #fff;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+
+        h1 {
+            font-size: 24px;
+            margin-bottom: 20px;
+            color: #2c3e50;
+        }
+
+        .input-group {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+
+        input, select {
+            flex: 1;
+            min-width: 150px;
+            padding: 10px 15px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+
+        .pr-item {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 4px;
+            margin-bottom: 10px;
+            cursor: pointer;
+            transition: all 0.2s;
+            border-left: 4px solid #0078d4;
+        }
+
+        .pr-item:hover {
+            background: #e9ecef;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+
+        .pr-item-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+
+        .pr-item-title {
+            font-weight: 600;
+            color: #2c3e50;
+            font-size: 14px;
+        }
+
+        .pr-item-id {
+            color: #0078d4;
+            font-weight: 600;
+            font-size: 12px;
+        }
+
+        .pr-item-meta {
+            font-size: 12px;
+            color: #666;
+        }
+
+        button {
+            padding: 10px 20px;
+            background: #0078d4;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            transition: background 0.2s;
+        }
+
+        button:hover {
+            background: #005a9e;
+        }
+
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #666;
+        }
+
+        .spinner {
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #0078d4;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 20px;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .pr-info {
+            background: #fff;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+
+        .pr-title {
+            font-size: 20px;
+            font-weight: 600;
+            margin-bottom: 10px;
+        }
+
+        .pr-meta {
+            color: #666;
+            font-size: 14px;
+        }
+
+        .files-container {
+            display: grid;
+            gap: 20px;
+        }
+
+        .file-card {
+            background: #fff;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+
+        .file-header {
+            background: #f8f9fa;
+            padding: 15px 20px;
+            border-bottom: 1px solid #e9ecef;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .file-path {
+            font-family: 'Courier New', monospace;
+            font-weight: 600;
+            color: #2c3e50;
+        }
+
+        .change-type {
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+
+        .change-type.add {
+            background: #d4edda;
+            color: #155724;
+        }
+
+        .change-type.edit {
+            background: #fff3cd;
+            color: #856404;
+        }
+
+        .change-type.delete {
+            background: #f8d7da;
+            color: #721c24;
+        }
+
+        .diff-container {
+            padding: 0;
+            overflow-x: auto;
+            background: #f6f8fa;
+        }
+
+        .diff-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+        }
+
+        .diff-table td {
+            padding: 2px 10px;
+            vertical-align: top;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+
+        .diff-line-number {
+            width: 40px;
+            text-align: right;
+            color: #6e7781;
+            background: #f6f8fa;
+            border-right: 1px solid #d0d7de;
+            user-select: none;
+            padding-right: 10px;
+        }
+
+        .diff-line-content {
+            padding-left: 15px;
+        }
+
+        .diff-line.added {
+            background: #ccffd8;
+        }
+
+        .diff-line.added .diff-line-number {
+            background: #ccffd8;
+        }
+
+        .diff-line.added .diff-line-content::before {
+            content: '+';
+            color: #1a7f37;
+            margin-right: 10px;
+        }
+
+        .diff-line.removed {
+            background: #ffd7d5;
+        }
+
+        .diff-line.removed .diff-line-number {
+            background: #ffd7d5;
+        }
+
+        .diff-line.removed .diff-line-content::before {
+            content: '-';
+            color: #d1242f;
+            margin-right: 10px;
+        }
+
+        .diff-line.context {
+            background: #ffffff;
+        }
+
+        .diff-line.context .diff-line-content::before {
+            content: ' ';
+            margin-right: 10px;
+        }
+
+        /* Side-by-side diff styles - GitHub style split view */
+        .diff-split-view {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 0;
+            border: 1px solid #d0d7de;
+        }
+
+        .diff-split-pane {
+            overflow-x: auto;
+            border-right: 1px solid #d0d7de;
+        }
+
+        .diff-split-pane:last-child {
+            border-right: none;
+        }
+
+        .diff-split-header {
+            background: #f6f8fa;
+            padding: 8px 12px;
+            font-weight: 600;
+            font-size: 12px;
+            border-bottom: 1px solid #d0d7de;
+            color: #57606a;
+        }
+
+        .diff-table.split {
+            width: 100%;
+            border-collapse: collapse;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+        }
+
+        .diff-table.split td {
+            padding: 2px 10px;
+            vertical-align: top;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+
+        .diff-table.split .diff-line-number {
+            width: 40px;
+            text-align: right;
+            color: #6e7781;
+            background: #f6f8fa;
+            border-right: 1px solid #d0d7de;
+            user-select: none;
+            padding-right: 10px;
+        }
+
+        .diff-table.split .diff-line-content {
+            padding-left: 15px;
+        }
+
+        .diff-table.split .diff-line.removed {
+            background: #ffebe9;
+        }
+
+        .diff-table.split .diff-line.removed .diff-line-number {
+            background: #ffebe9;
+        }
+
+        .diff-table.split .diff-line.added {
+            background: #dafbe1;
+        }
+
+        .diff-table.split .diff-line.added .diff-line-number {
+            background: #dafbe1;
+        }
+
+        .diff-table.split .diff-line.context {
+            background: #ffffff;
+        }
+
+        .diff-table.split .diff-line.empty {
+            background: #f6f8fa;
+        }
+
+        .diff-table.split .diff-line.empty .diff-line-number {
+            background: #f6f8fa;
+        }
+
+        .diff-header {
+            background: #f6f8fa;
+            padding: 10px 15px;
+            border-bottom: 1px solid #d0d7de;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            color: #57606a;
+            font-weight: 600;
+        }
+
+        .comments-section {
+            border-top: 1px solid #e9ecef;
+            padding: 20px;
+            background: #f8f9fa;
+        }
+
+        .comment-header {
+            font-weight: 600;
+            margin-bottom: 15px;
+            color: #2c3e50;
+        }
+
+        .comment-item {
+            background: #fff;
+            border: 1px solid #e9ecef;
+            border-radius: 4px;
+            padding: 15px;
+            margin-bottom: 10px;
+            position: relative;
+        }
+
+        .comment-meta {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 10px;
+            flex-wrap: wrap;
+        }
+
+        .badge {
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+
+        .badge.severity-high {
+            background: #dc3545;
+            color: white;
+        }
+
+        .badge.severity-medium {
+            background: #ffc107;
+            color: #333;
+        }
+
+        .badge.severity-low {
+            background: #17a2b8;
+            color: white;
+        }
+
+        .badge.type {
+            background: #6c757d;
+            color: white;
+        }
+
+        .comment-text {
+            color: #495057;
+            line-height: 1.6;
+            margin-bottom: 10px;
+        }
+
+        .comment-actions {
+            display: flex;
+            gap: 10px;
+            justify-content: flex-end;
+        }
+
+        .btn-post {
+            background: #28a745;
+            padding: 6px 12px;
+            font-size: 12px;
+        }
+
+        .btn-post:hover {
+            background: #218838;
+        }
+
+        .btn-posted {
+            background: #6c757d;
+            cursor: default;
+        }
+
+        .btn-posted:hover {
+            background: #6c757d;
+        }
+
+        .error {
+            background: #f8d7da;
+            color: #721c24;
+            padding: 15px;
+            border-radius: 4px;
+            margin-bottom: 20px;
+        }
+
+        .success {
+            background: #d4edda;
+            color: #155724;
+            padding: 15px;
+            border-radius: 4px;
+            margin-bottom: 20px;
+        }
+
+        .line-number {
+            color: #0078d4;
+            font-weight: 600;
+        }
+
+        .summary {
+            background: #fff;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+
+        .summary-stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 15px;
+            margin-top: 15px;
+        }
+
+        .stat-item {
+            text-align: center;
+            padding: 15px;
+            background: #f8f9fa;
+            border-radius: 4px;
+        }
+
+        .stat-value {
+            font-size: 32px;
+            font-weight: 700;
+            color: #0078d4;
+        }
+
+        .stat-label {
+            font-size: 12px;
+            color: #666;
+            text-transform: uppercase;
+            margin-top: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🤖 AI Code Review Agent</h1>
+            <div class="input-group">
+                <select id="project" onchange="onProjectChange()">
+                    <option value="">Select Project...</option>
+                </select>
+                <select id="repository" onchange="onRepositoryChange()">
+                    <option value="">Select Repository...</option>
+                </select>
+                <button id="loadPRsBtn" onclick="loadActivePRs()" style="display:none;">Load Active PRs</button>
+            </div>
+        </header>
+
+        <div id="prListContainer" style="display:none; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px;">
+            <h2 style="margin-bottom: 15px;">Active Pull Requests</h2>
+            <div id="prList"></div>
+        </div>
+
+        <div id="loading" class="loading" style="display: none;">
+            <div class="spinner"></div>
+            <p>Analyzing pull request... This may take a minute.</p>
+        </div>
+
+        <div id="error" class="error" style="display: none;"></div>
+        <div id="success" class="success" style="display: none;"></div>
+
+        <div id="reviewContainer" style="display: none;">
+            <div class="pr-info">
+                <div class="pr-title" id="prTitle"></div>
+                <div class="pr-meta" id="prMeta"></div>
+            </div>
+
+            <div class="summary">
+                <h2>Review Summary</h2>
+                <div class="summary-stats">
+                    <div class="stat-item">
+                        <div class="stat-value" id="filesCount">0</div>
+                        <div class="stat-label">Files Changed</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-value" id="commentsCount">0</div>
+                        <div class="stat-label">Total Comments</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-value" id="highCount">0</div>
+                        <div class="stat-label">High Severity</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-value" id="mediumCount">0</div>
+                        <div class="stat-label">Medium Severity</div>
+                    </div>
+                </div>
+            </div>
+
+            <div id="filesContainer" class="files-container"></div>
+        </div>
+    </div>
+
+    <script>
+        let currentReview = null;
+        let selectedProject = '';
+        let selectedRepository = '';
+
+        // Load projects on page load
+        window.addEventListener('DOMContentLoaded', async () => {
+            await loadProjects();
+        });
+
+        async function loadProjects() {
+            try {
+                const response = await fetch('/api/CodeReview/projects');
+                const projects = await response.json();
+
+                const projectSelect = document.getElementById('project');
+                projectSelect.innerHTML = '<option value="">Select Project...</option>';
+
+                projects.forEach(project => {
+                    const option = document.createElement('option');
+                    option.value = project.name;
+                    option.textContent = project.displayName;
+                    projectSelect.appendChild(option);
+                });
+            } catch (error) {
+                showError('Failed to load projects: ' + error.message);
+            }
+        }
+
+        async function onProjectChange() {
+            const projectSelect = document.getElementById('project');
+            selectedProject = projectSelect.value;
+
+            // Clear repository and PR list
+            document.getElementById('repository').innerHTML = '<option value="">Select Repository...</option>';
+            document.getElementById('prListContainer').style.display = 'none';
+            document.getElementById('loadPRsBtn').style.display = 'none';
+
+            if (!selectedProject) return;
+
+            try {
+                const response = await fetch(`/api/CodeReview/repositories/${selectedProject}`);
+                const repositories = await response.json();
+
+                const repoSelect = document.getElementById('repository');
+                repoSelect.innerHTML = '<option value="">Select Repository...</option>';
+
+                repositories.forEach(repo => {
+                    const option = document.createElement('option');
+                    option.value = repo;
+                    option.textContent = repo;
+                    repoSelect.appendChild(option);
+                });
+            } catch (error) {
+                showError('Failed to load repositories: ' + error.message);
+            }
+        }
+
+        async function onRepositoryChange() {
+            const repoSelect = document.getElementById('repository');
+            selectedRepository = repoSelect.value;
+
+            if (selectedRepository) {
+                document.getElementById('loadPRsBtn').style.display = 'inline-block';
+                await loadActivePRs();
+            } else {
+                document.getElementById('loadPRsBtn').style.display = 'none';
+                document.getElementById('prListContainer').style.display = 'none';
+            }
+        }
+
+        async function loadActivePRs() {
+            if (!selectedProject || !selectedRepository) {
+                showError('Please select a project and repository');
+                return;
+            }
+
+            try {
+                document.getElementById('loading').style.display = 'block';
+                const response = await fetch(`/api/CodeReview/pullrequests/${selectedProject}/${selectedRepository}`);
+
+                if (!response.ok) {
+                    throw new Error('Failed to load pull requests');
+                }
+
+                const prs = await response.json();
+
+                const prList = document.getElementById('prList');
+                prList.innerHTML = '';
+
+                if (prs.length === 0) {
+                    prList.innerHTML = '<p style="color: #666;">No active pull requests found.</p>';
+                } else {
+                    prs.forEach(pr => {
+                        const prItem = createPRItem(pr);
+                        prList.appendChild(prItem);
+                    });
+                }
+
+                document.getElementById('prListContainer').style.display = 'block';
+            } catch (error) {
+                showError('Failed to load pull requests: ' + error.message);
+            } finally {
+                document.getElementById('loading').style.display = 'none';
+            }
+        }
+
+        function createPRItem(pr) {
+            const div = document.createElement('div');
+            div.className = 'pr-item';
+            div.onclick = () => startReviewForPR(pr.id);
+
+            div.innerHTML = `
+                <div class="pr-item-header">
+                    <div class="pr-item-title">${escapeHtml(pr.title)}</div>
+                    <div class="pr-item-id">#${pr.id}</div>
+                </div>
+                <div class="pr-item-meta">
+                    <strong>Author:</strong> ${escapeHtml(pr.createdBy.displayName)} |
+                    <strong>Created:</strong> ${new Date(pr.creationDate).toLocaleDateString()}
+                </div>
+            `;
+
+            return div;
+        }
+
+        async function startReviewForPR(prId) {
+            await startReview(selectedProject, selectedRepository, prId);
+        }
+
+        async function startReview(project, repository, prId) {
+            // Use the passed parameters directly (from dropdown selections)
+            if (!project || !repository || !prId) {
+                showError('Please select a project, repository, and PR');
+                return;
+            }
+
+            hideError();
+            hideSuccess();
+            document.getElementById('loading').style.display = 'block';
+            document.getElementById('reviewContainer').style.display = 'none';
+            document.getElementById('prListContainer').style.display = 'none';
+
+            try {
+                const response = await fetch('/api/CodeReview/start', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        project,
+                        repository,
+                        pullRequestId: parseInt(prId)
+                    })
+                });
+
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.error || 'Failed to start review');
+                }
+
+                currentReview = await response.json();
+                displayReview(currentReview);
+            } catch (error) {
+                showError(error.message);
+                document.getElementById('prListContainer').style.display = 'block';
+            } finally {
+                document.getElementById('loading').style.display = 'none';
+            }
+        }
+
+        function displayReview(review) {
+            document.getElementById('reviewContainer').style.display = 'block';
+
+            // Display PR info
+            document.getElementById('prTitle').textContent = review.pullRequest.title;
+            document.getElementById('prMeta').innerHTML = `
+                <strong>Author:</strong> ${review.pullRequest.createdBy.displayName} |
+                <strong>Created:</strong> ${new Date(review.pullRequest.creationDate).toLocaleString()} |
+                <strong>Source:</strong> ${review.pullRequest.sourceBranch} → ${review.pullRequest.targetBranch}
+            `;
+
+            // Display summary
+            document.getElementById('filesCount').textContent = review.files.length;
+            document.getElementById('commentsCount').textContent = review.comments.length;
+            document.getElementById('highCount').textContent =
+                review.comments.filter(c => c.severity === 'high').length;
+            document.getElementById('mediumCount').textContent =
+                review.comments.filter(c => c.severity === 'medium').length;
+
+            // Display files and comments
+            const filesContainer = document.getElementById('filesContainer');
+            filesContainer.innerHTML = '';
+
+            review.files.forEach((file, index) => {
+                const fileComments = review.comments.filter(c => c.filePath === file.path);
+                const fileCard = createFileCard(file, fileComments, index);
+                filesContainer.appendChild(fileCard);
+            });
+        }
+
+        function createFileCard(file, comments, index) {
+            const card = document.createElement('div');
+            card.className = 'file-card';
+
+            const changeTypeClass = file.changeType === 'add' ? 'add' :
+                                   file.changeType === 'delete' ? 'delete' : 'edit';
+
+            const diffId = `diff-${index}`;
+
+            card.innerHTML = `
+                <div class="file-header">
+                    <div class="file-path">${file.path}</div>
+                    <div class="change-type ${changeTypeClass}">${file.changeType}</div>
+                </div>
+                <div class="diff-container" id="${diffId}"></div>
+                ${comments.length > 0 ? `
+                    <div class="comments-section">
+                        <div class="comment-header">
+                            💬 ${comments.length} Review Comment${comments.length > 1 ? 's' : ''}
+                        </div>
+                        ${comments.map(c => createCommentHtml(c)).join('')}
+                    </div>
+                ` : ''}
+            `;
+
+            // Display diff
+            setTimeout(() => {
+                const diffContainer = document.getElementById(diffId);
+                displayDiff(diffContainer, file);
+            }, 0);
+
+            return card;
+        }
+
+        function displayDiff(container, file) {
+            console.log('displayDiff called for:', file.path);
+            console.log('unifiedDiff exists:', !!file.unifiedDiff);
+            console.log('unifiedDiff length:', file.unifiedDiff ? file.unifiedDiff.length : 0);
+
+            const header = document.createElement('div');
+            header.className = 'diff-header';
+            header.textContent = `@@ ${file.path} @@`;
+            container.appendChild(header);
+
+            // Use unified diff if available (from Azure DevOps Diffs API)
+            if (file.unifiedDiff && file.unifiedDiff.trim().length > 0) {
+                console.log('Displaying unified diff for:', file.path);
+                displayUnifiedDiff(container, file.unifiedDiff);
+            } else {
+                console.log('Displaying simple diff for:', file.path);
+                // Fallback to simple display
+                displaySimpleDiff(container, file);
+            }
+        }
+
+        function displayUnifiedDiff(container, unifiedDiff) {
+            // Create split view container
+            const splitView = document.createElement('div');
+            splitView.className = 'diff-split-view';
+
+            // Create left pane (old content)
+            const leftPane = document.createElement('div');
+            leftPane.className = 'diff-split-pane';
+            leftPane.innerHTML = '<div class="diff-split-header">Original</div>';
+            const leftTable = document.createElement('table');
+            leftTable.className = 'diff-table split';
+            leftPane.appendChild(leftTable);
+
+            // Create right pane (new content)
+            const rightPane = document.createElement('div');
+            rightPane.className = 'diff-split-pane';
+            rightPane.innerHTML = '<div class="diff-split-header">Changed</div>';
+            const rightTable = document.createElement('table');
+            rightTable.className = 'diff-table split';
+            rightPane.appendChild(rightTable);
+
+            splitView.appendChild(leftPane);
+            splitView.appendChild(rightPane);
+            container.appendChild(splitView);
+
+            const lines = unifiedDiff.split('\n');
+            let oldLineNum = 0;
+            let newLineNum = 0;
+
+            for (const line of lines) {
+                if (line.startsWith('@@')) {
+                    // Hunk header - extract starting line numbers
+                    const match = line.match(/@@ -(\d+),\d+ \+(\d+),\d+ @@/);
+                    if (match) {
+                        oldLineNum = parseInt(match[1]);
+                        newLineNum = parseInt(match[2]);
+                    }
+                    continue;
+                }
+
+                if (line.startsWith('-')) {
+                    // Removed line - show only in left pane
+                    const leftRow = leftTable.insertRow();
+                    leftRow.className = 'diff-line removed';
+
+                    const lineNumCell = leftRow.insertCell();
+                    lineNumCell.className = 'diff-line-number';
+                    lineNumCell.textContent = oldLineNum;
+
+                    const contentCell = leftRow.insertCell();
+                    contentCell.className = 'diff-line-content';
+                    contentCell.textContent = line.substring(1);
+
+                    // Add empty row in right pane
+                    const rightRow = rightTable.insertRow();
+                    rightRow.className = 'diff-line empty';
+                    const emptyNumCell = rightRow.insertCell();
+                    emptyNumCell.className = 'diff-line-number';
+                    emptyNumCell.textContent = '';
+                    const emptyContentCell = rightRow.insertCell();
+                    emptyContentCell.className = 'diff-line-content';
+                    emptyContentCell.textContent = '';
+
+                    oldLineNum++;
+                } else if (line.startsWith('+')) {
+                    // Added line - show only in right pane
+                    // Add empty row in left pane
+                    const leftRow = leftTable.insertRow();
+                    leftRow.className = 'diff-line empty';
+                    const emptyNumCell = leftRow.insertCell();
+                    emptyNumCell.className = 'diff-line-number';
+                    emptyNumCell.textContent = '';
+                    const emptyContentCell = leftRow.insertCell();
+                    emptyContentCell.className = 'diff-line-content';
+                    emptyContentCell.textContent = '';
+
+                    const rightRow = rightTable.insertRow();
+                    rightRow.className = 'diff-line added';
+
+                    const lineNumCell = rightRow.insertCell();
+                    lineNumCell.className = 'diff-line-number';
+                    lineNumCell.textContent = newLineNum;
+
+                    const contentCell = rightRow.insertCell();
+                    contentCell.className = 'diff-line-content';
+                    contentCell.textContent = line.substring(1);
+
+                    newLineNum++;
+                } else {
+                    // Context line (unchanged) - show in both panes
+                    const leftRow = leftTable.insertRow();
+                    leftRow.className = 'diff-line context';
+                    const leftNumCell = leftRow.insertCell();
+                    leftNumCell.className = 'diff-line-number';
+                    leftNumCell.textContent = oldLineNum;
+                    const leftContentCell = leftRow.insertCell();
+                    leftContentCell.className = 'diff-line-content';
+                    leftContentCell.textContent = line.startsWith(' ') ? line.substring(1) : line;
+
+                    const rightRow = rightTable.insertRow();
+                    rightRow.className = 'diff-line context';
+                    const rightNumCell = rightRow.insertCell();
+                    rightNumCell.className = 'diff-line-number';
+                    rightNumCell.textContent = newLineNum;
+                    const rightContentCell = rightRow.insertCell();
+                    rightContentCell.className = 'diff-line-content';
+                    rightContentCell.textContent = line.startsWith(' ') ? line.substring(1) : line;
+
+                    oldLineNum++;
+                    newLineNum++;
+                }
+            }
+        }
+
+        function displaySimpleDiff(container, file) {
+            const table = document.createElement('table');
+            table.className = 'diff-table';
+            container.appendChild(table);
+
+            if (file.changeType === 'add') {
+                // New file - show all lines as added
+                const lines = file.content ? file.content.split('\n') : [];
+                lines.forEach((line, i) => {
+                    const row = table.insertRow();
+                    row.className = 'diff-line added';
+
+                    const lineNumCell = row.insertCell();
+                    lineNumCell.className = 'diff-line-number';
+                    lineNumCell.textContent = i + 1;
+
+                    const contentCell = row.insertCell();
+                    contentCell.className = 'diff-line-content';
+                    contentCell.textContent = line;
+                });
+            } else if (file.changeType === 'delete') {
+                // Deleted file - show all lines as removed
+                const lines = file.previousContent ? file.previousContent.split('\n') : [];
+                lines.forEach((line, i) => {
+                    const row = table.insertRow();
+                    row.className = 'diff-line removed';
+
+                    const lineNumCell = row.insertCell();
+                    lineNumCell.className = 'diff-line-number';
+                    lineNumCell.textContent = i + 1;
+
+                    const contentCell = row.insertCell();
+                    contentCell.className = 'diff-line-content';
+                    contentCell.textContent = line;
+                });
+            } else {
+                // Modified file without unified diff - show message
+                const row = table.insertRow();
+                row.className = 'diff-line context';
+                const cell = row.insertCell();
+                cell.colSpan = 2;
+                cell.className = 'diff-line-content';
+                cell.textContent = 'Diff not available for this file';
+            }
+        }
+
+        function createCommentHtml(comment) {
+            const severityClass = `severity-${comment.severity}`;
+            const isPosted = comment.posted;
+
+            return `
+                <div class="comment-item" id="comment-${comment.id}">
+                    <div class="comment-meta">
+                        <span class="badge ${severityClass}">${comment.severity}</span>
+                        <span class="badge type">${comment.commentType}</span>
+                        <span class="line-number">Line ${comment.lineNumber}</span>
+                    </div>
+                    <div class="comment-text">${escapeHtml(comment.commentText)}</div>
+                    <div class="comment-actions">
+                        ${isPosted ?
+                            '<button class="btn-posted" disabled>✓ Posted</button>' :
+                            `<button class="btn-post" onclick="postComment('${comment.id}')">Post to PR</button>`
+                        }
+                    </div>
+                </div>
+            `;
+        }
+
+        async function postComment(commentId) {
+            const button = event.target;
+            button.disabled = true;
+            button.textContent = 'Posting...';
+
+            try {
+                const response = await fetch('/api/CodeReview/comment', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ commentId })
+                });
+
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.error || 'Failed to post comment');
+                }
+
+                const result = await response.json();
+
+                // Update UI
+                const commentItem = document.getElementById(`comment-${commentId}`);
+                const actionsDiv = commentItem.querySelector('.comment-actions');
+                actionsDiv.innerHTML = '<button class="btn-posted" disabled>✓ Posted</button>';
+
+                // Update current review
+                const comment = currentReview.comments.find(c => c.id === commentId);
+                if (comment) comment.posted = true;
+
+                showSuccess('Comment posted successfully to the PR!');
+            } catch (error) {
+                showError(error.message);
+                button.disabled = false;
+                button.textContent = 'Post to PR';
+            }
+        }
+
+        function showError(message) {
+            const errorDiv = document.getElementById('error');
+            errorDiv.textContent = message;
+            errorDiv.style.display = 'block';
+            setTimeout(() => hideError(), 5000);
+        }
+
+        function hideError() {
+            document.getElementById('error').style.display = 'none';
+        }
+
+        function showSuccess(message) {
+            const successDiv = document.getElementById('success');
+            successDiv.textContent = message;
+            successDiv.style.display = 'block';
+            setTimeout(() => hideSuccess(), 5000);
+        }
+
+        function hideSuccess() {
+            document.getElementById('success').style.display = 'none';
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+    </script>
+</body>
+</html>
