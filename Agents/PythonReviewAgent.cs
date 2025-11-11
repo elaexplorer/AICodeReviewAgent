@@ -47,16 +47,38 @@ public class PythonReviewAgent : ILanguageReviewAgent
 
                 Review ONLY THE CHANGES in the following Python file from a pull request.
 
-                IMPORTANT: Only review the lines that were ADDED or MODIFIED in this PR.
-                Do NOT comment on existing code that wasn't changed. Lines starting with '+' are additions, lines starting with '-' are removals.
+                CRITICAL RULES:
+                1. ONLY comment on lines marked with '+' in the diff below (new/modified lines)
+                2. The full file contents are provided ONLY for understanding context
+                3. DO NOT comment on any line that is not part of the diff changes
+                4. DO NOT comment on lines marked with '-' (removed lines) or context lines (no prefix)
+                5. You can reference existing code for context, but your comments must be about the NEW changes only
 
                 File Path: {{{file.Path}}}
                 Change Type: {{{file.ChangeType}}}
 
-                Changes (Unified Diff):
+                ========================================
+                CHANGES TO REVIEW (lines with '+' prefix):
+                ========================================
                 ```diff
                 {{{file.UnifiedDiff}}}
                 ```
+
+                ========================================
+                FULL FILE CONTENT (FOR CONTEXT ONLY - DO NOT REVIEW):
+                ========================================
+                ```python
+                {{{file.Content}}}
+                ```
+
+                {{{(string.IsNullOrEmpty(file.PreviousContent) ? "" : $@"
+                ========================================
+                PREVIOUS FILE CONTENT (FOR CONTEXT ONLY - DO NOT REVIEW):
+                ========================================
+                ```python
+                {file.PreviousContent}
+                ```
+                ")}}}
 
                 Codebase Context:
                 {{{codebaseContext}}}

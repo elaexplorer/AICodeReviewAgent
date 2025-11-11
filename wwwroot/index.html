@@ -275,19 +275,46 @@
 
         /* Side-by-side diff styles - GitHub style split view */
         .diff-split-view {
+            display: -ms-grid;
             display: grid;
+            -ms-grid-columns: 1fr 1fr;
             grid-template-columns: 1fr 1fr;
             gap: 0;
             border: 1px solid #d0d7de;
+            width: 100%;
+        }
+
+        /* Edge fallback using flexbox */
+        @supports not (display: grid) {
+            .diff-split-view {
+                display: -ms-flexbox;
+                display: flex;
+                -ms-flex-direction: row;
+                flex-direction: row;
+            }
+            .diff-split-pane {
+                -ms-flex: 1;
+                flex: 1;
+                width: 50%;
+            }
         }
 
         .diff-split-pane {
             overflow-x: auto;
             border-right: 1px solid #d0d7de;
+            min-width: 0; /* Fix for Edge grid overflow */
         }
 
         .diff-split-pane:last-child {
             border-right: none;
+        }
+
+        .diff-split-pane:nth-child(1) {
+            -ms-grid-column: 1;
+        }
+
+        .diff-split-pane:nth-child(2) {
+            -ms-grid-column: 2;
         }
 
         .diff-split-header {
@@ -304,6 +331,7 @@
             border-collapse: collapse;
             font-family: 'Courier New', monospace;
             font-size: 12px;
+            table-layout: fixed; /* Fix for Edge table rendering */
         }
 
         .diff-table.split td {
@@ -311,6 +339,7 @@
             vertical-align: top;
             white-space: pre-wrap;
             word-wrap: break-word;
+            word-break: break-word; /* Edge compatibility */
         }
 
         .diff-table.split .diff-line-number {
@@ -804,16 +833,19 @@
 
         function displayDiff(container, file) {
             console.log('displayDiff called for:', file.path);
-            console.log('unifiedDiff exists:', !!file.unifiedDiff);
-            console.log('unifiedDiff length:', file.unifiedDiff ? file.unifiedDiff.length : 0);
+            console.log('content exists:', !!file.content);
+            console.log('previousContent exists:', !!file.previousContent);
 
             const header = document.createElement('div');
             header.className = 'diff-header';
             header.textContent = `@@ ${file.path} @@`;
             container.appendChild(header);
 
-            // Use unified diff if available (from Azure DevOps Diffs API)
-            if (file.unifiedDiff && file.unifiedDiff.trim().length > 0) {
+            // Display full file side-by-side comparison
+            if (file.previousContent || file.content) {
+                console.log('Displaying full file side-by-side for:', file.path);
+                displayFullFileSideBySide(container, file);
+            } else if (file.unifiedDiff && file.unifiedDiff.trim().length > 0) {
                 console.log('Displaying unified diff for:', file.path);
                 displayUnifiedDiff(container, file.unifiedDiff);
             } else {
@@ -821,6 +853,186 @@
                 // Fallback to simple display
                 displaySimpleDiff(container, file);
             }
+        }
+
+        function displayFullFileSideBySide(container, file) {
+            // Create split view container
+            const splitView = document.createElement('div');
+            splitView.className = 'diff-split-view';
+
+            // Create left pane (old content)
+            const leftPane = document.createElement('div');
+            leftPane.className = 'diff-split-pane';
+            leftPane.innerHTML = '<div class="diff-split-header">Original</div>';
+            const leftTable = document.createElement('table');
+            leftTable.className = 'diff-table split';
+            leftPane.appendChild(leftTable);
+
+            // Create right pane (new content)
+            const rightPane = document.createElement('div');
+            rightPane.className = 'diff-split-pane';
+            rightPane.innerHTML = '<div class="diff-split-header">Changed</div>';
+            const rightTable = document.createElement('table');
+            rightTable.className = 'diff-table split';
+            rightPane.appendChild(rightTable);
+
+            splitView.appendChild(leftPane);
+            splitView.appendChild(rightPane);
+            container.appendChild(splitView);
+
+            const oldLines = (file.previousContent || '').split('\n');
+            const newLines = (file.content || '').split('\n');
+
+            // Compute diff using LCS algorithm
+            const diff = computeDiff(oldLines, newLines);
+
+            let leftLineNum = 1;
+            let rightLineNum = 1;
+
+            // Render diff operations
+            for (const op of diff) {
+                if (op.type === 'equal') {
+                    // Unchanged line - show on both sides
+                    const leftRow = leftTable.insertRow();
+                    leftRow.className = 'diff-line context';
+                    const leftNumCell = leftRow.insertCell();
+                    leftNumCell.className = 'diff-line-number';
+                    leftNumCell.textContent = leftLineNum;
+                    const leftContentCell = leftRow.insertCell();
+                    leftContentCell.className = 'diff-line-content';
+                    leftContentCell.textContent = op.line;
+
+                    const rightRow = rightTable.insertRow();
+                    rightRow.className = 'diff-line context';
+                    const rightNumCell = rightRow.insertCell();
+                    rightNumCell.className = 'diff-line-number';
+                    rightNumCell.textContent = rightLineNum;
+                    const rightContentCell = rightRow.insertCell();
+                    rightContentCell.className = 'diff-line-content';
+                    rightContentCell.textContent = op.line;
+
+                    leftLineNum++;
+                    rightLineNum++;
+                } else if (op.type === 'delete') {
+                    // Deleted line - show only on left with empty row on right
+                    const leftRow = leftTable.insertRow();
+                    leftRow.className = 'diff-line removed';
+                    const leftNumCell = leftRow.insertCell();
+                    leftNumCell.className = 'diff-line-number';
+                    leftNumCell.textContent = leftLineNum;
+                    const leftContentCell = leftRow.insertCell();
+                    leftContentCell.className = 'diff-line-content';
+                    leftContentCell.textContent = op.line;
+
+                    const rightRow = rightTable.insertRow();
+                    rightRow.className = 'diff-line empty';
+                    const rightNumCell = rightRow.insertCell();
+                    rightNumCell.className = 'diff-line-number';
+                    rightNumCell.textContent = '';
+                    const rightContentCell = rightRow.insertCell();
+                    rightContentCell.className = 'diff-line-content';
+                    rightContentCell.textContent = '';
+
+                    leftLineNum++;
+                } else if (op.type === 'insert') {
+                    // Added line - show only on right with empty row on left
+                    const leftRow = leftTable.insertRow();
+                    leftRow.className = 'diff-line empty';
+                    const leftNumCell = leftRow.insertCell();
+                    leftNumCell.className = 'diff-line-number';
+                    leftNumCell.textContent = '';
+                    const leftContentCell = leftRow.insertCell();
+                    leftContentCell.className = 'diff-line-content';
+                    leftContentCell.textContent = '';
+
+                    const rightRow = rightTable.insertRow();
+                    rightRow.className = 'diff-line added';
+                    const rightNumCell = rightRow.insertCell();
+                    rightNumCell.className = 'diff-line-number';
+                    rightNumCell.textContent = rightLineNum;
+                    const rightContentCell = rightRow.insertCell();
+                    rightContentCell.className = 'diff-line-content';
+                    rightContentCell.textContent = op.line;
+
+                    rightLineNum++;
+                }
+            }
+        }
+
+        // Compute diff using Myers' diff algorithm (LCS-based)
+        function computeDiff(oldLines, newLines) {
+            const lcs = computeLCS(oldLines, newLines);
+            const diff = [];
+
+            let i = 0; // index in oldLines
+            let j = 0; // index in newLines
+            let lcsIndex = 0; // index in lcs
+
+            while (i < oldLines.length || j < newLines.length) {
+                if (lcsIndex < lcs.length &&
+                    i === lcs[lcsIndex].oldIndex &&
+                    j === lcs[lcsIndex].newIndex) {
+                    // Common line
+                    diff.push({ type: 'equal', line: oldLines[i] });
+                    i++;
+                    j++;
+                    lcsIndex++;
+                } else if (lcsIndex < lcs.length && i < lcs[lcsIndex].oldIndex) {
+                    // Deleted line
+                    diff.push({ type: 'delete', line: oldLines[i] });
+                    i++;
+                } else if (lcsIndex < lcs.length && j < lcs[lcsIndex].newIndex) {
+                    // Added line
+                    diff.push({ type: 'insert', line: newLines[j] });
+                    j++;
+                } else {
+                    // At end, handle remaining lines
+                    if (i < oldLines.length) {
+                        diff.push({ type: 'delete', line: oldLines[i] });
+                        i++;
+                    } else if (j < newLines.length) {
+                        diff.push({ type: 'insert', line: newLines[j] });
+                        j++;
+                    }
+                }
+            }
+
+            return diff;
+        }
+
+        // Compute Longest Common Subsequence
+        function computeLCS(oldLines, newLines) {
+            const m = oldLines.length;
+            const n = newLines.length;
+            const dp = Array(m + 1).fill(null).map(() => Array(n + 1).fill(0));
+
+            // Fill DP table
+            for (let i = 1; i <= m; i++) {
+                for (let j = 1; j <= n; j++) {
+                    if (oldLines[i - 1] === newLines[j - 1]) {
+                        dp[i][j] = dp[i - 1][j - 1] + 1;
+                    } else {
+                        dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
+                    }
+                }
+            }
+
+            // Backtrack to find LCS
+            const lcs = [];
+            let i = m, j = n;
+            while (i > 0 && j > 0) {
+                if (oldLines[i - 1] === newLines[j - 1]) {
+                    lcs.unshift({ oldIndex: i - 1, newIndex: j - 1, line: oldLines[i - 1] });
+                    i--;
+                    j--;
+                } else if (dp[i - 1][j] > dp[i][j - 1]) {
+                    i--;
+                } else {
+                    j--;
+                }
+            }
+
+            return lcs;
         }
 
         function displayUnifiedDiff(container, unifiedDiff) {
@@ -849,75 +1061,55 @@
             container.appendChild(splitView);
 
             const lines = unifiedDiff.split('\n');
-            let oldLineNum = 0;
-            let newLineNum = 0;
+            let leftLineNum = 1;
+            let rightLineNum = 1;
 
             for (const line of lines) {
                 if (line.startsWith('@@')) {
                     // Hunk header - extract starting line numbers
-                    const match = line.match(/@@ -(\d+),\d+ \+(\d+),\d+ @@/);
+                    const match = line.match(/@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
                     if (match) {
-                        oldLineNum = parseInt(match[1]);
-                        newLineNum = parseInt(match[2]);
+                        leftLineNum = parseInt(match[1]);
+                        rightLineNum = parseInt(match[2]);
                     }
                     continue;
                 }
 
                 if (line.startsWith('-')) {
-                    // Removed line - show only in left pane
+                    // Removed line - show in left pane only
                     const leftRow = leftTable.insertRow();
                     leftRow.className = 'diff-line removed';
 
                     const lineNumCell = leftRow.insertCell();
                     lineNumCell.className = 'diff-line-number';
-                    lineNumCell.textContent = oldLineNum;
+                    lineNumCell.textContent = leftLineNum;
 
                     const contentCell = leftRow.insertCell();
                     contentCell.className = 'diff-line-content';
                     contentCell.textContent = line.substring(1);
 
-                    // Add empty row in right pane
-                    const rightRow = rightTable.insertRow();
-                    rightRow.className = 'diff-line empty';
-                    const emptyNumCell = rightRow.insertCell();
-                    emptyNumCell.className = 'diff-line-number';
-                    emptyNumCell.textContent = '';
-                    const emptyContentCell = rightRow.insertCell();
-                    emptyContentCell.className = 'diff-line-content';
-                    emptyContentCell.textContent = '';
-
-                    oldLineNum++;
+                    leftLineNum++;
                 } else if (line.startsWith('+')) {
-                    // Added line - show only in right pane
-                    // Add empty row in left pane
-                    const leftRow = leftTable.insertRow();
-                    leftRow.className = 'diff-line empty';
-                    const emptyNumCell = leftRow.insertCell();
-                    emptyNumCell.className = 'diff-line-number';
-                    emptyNumCell.textContent = '';
-                    const emptyContentCell = leftRow.insertCell();
-                    emptyContentCell.className = 'diff-line-content';
-                    emptyContentCell.textContent = '';
-
+                    // Added line - show in right pane only
                     const rightRow = rightTable.insertRow();
                     rightRow.className = 'diff-line added';
 
                     const lineNumCell = rightRow.insertCell();
                     lineNumCell.className = 'diff-line-number';
-                    lineNumCell.textContent = newLineNum;
+                    lineNumCell.textContent = rightLineNum;
 
                     const contentCell = rightRow.insertCell();
                     contentCell.className = 'diff-line-content';
                     contentCell.textContent = line.substring(1);
 
-                    newLineNum++;
+                    rightLineNum++;
                 } else {
                     // Context line (unchanged) - show in both panes
                     const leftRow = leftTable.insertRow();
                     leftRow.className = 'diff-line context';
                     const leftNumCell = leftRow.insertCell();
                     leftNumCell.className = 'diff-line-number';
-                    leftNumCell.textContent = oldLineNum;
+                    leftNumCell.textContent = leftLineNum;
                     const leftContentCell = leftRow.insertCell();
                     leftContentCell.className = 'diff-line-content';
                     leftContentCell.textContent = line.startsWith(' ') ? line.substring(1) : line;
@@ -926,13 +1118,13 @@
                     rightRow.className = 'diff-line context';
                     const rightNumCell = rightRow.insertCell();
                     rightNumCell.className = 'diff-line-number';
-                    rightNumCell.textContent = newLineNum;
+                    rightNumCell.textContent = rightLineNum;
                     const rightContentCell = rightRow.insertCell();
                     rightContentCell.className = 'diff-line-content';
                     rightContentCell.textContent = line.startsWith(' ') ? line.substring(1) : line;
 
-                    oldLineNum++;
-                    newLineNum++;
+                    leftLineNum++;
+                    rightLineNum++;
                 }
             }
         }
