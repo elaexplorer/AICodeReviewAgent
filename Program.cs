@@ -73,11 +73,20 @@ if (hasAzureOpenAI)
         deploymentName: azureOpenAiDeployment,
         endpoint: azureOpenAiEndpoint!,
         apiKey: azureOpenAiApiKey!);
+
+    // Add embedding generation service for RAG
+    kernelBuilder.AddAzureOpenAITextEmbeddingGeneration(
+        deploymentName: "text-embedding-ada-002", // Standard embedding model
+        endpoint: azureOpenAiEndpoint!,
+        apiKey: azureOpenAiApiKey!);
 }
 else if (hasOpenAI)
 {
     Console.WriteLine("Using OpenAI with model: gpt-4");
     kernelBuilder.AddOpenAIChatCompletion("gpt-4", openAiApiKey!);
+
+    // Add embedding generation service for RAG
+    kernelBuilder.AddOpenAITextEmbeddingGeneration("text-embedding-ada-002", openAiApiKey!);
 }
 
 // Add custom services
@@ -97,6 +106,9 @@ builder.Services.AddSingleton(provider =>
         args.Length > 0 ? args[0] : "",
         provider.GetRequiredService<AzureDevOpsRestClient>(),
         provider.GetRequiredService<CodebaseCache>()));
+
+// Add RAG context service
+builder.Services.AddSingleton<CodebaseContextService>();
 
 // Add language-specific review agents
 builder.Services.AddSingleton<ILanguageReviewAgent, PythonReviewAgent>(provider =>

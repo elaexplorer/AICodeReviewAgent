@@ -397,20 +397,25 @@ public class AzureDevOpsRestClient
     }
 
     /// <summary>
-    /// Get file content at a specific commit
+    /// Get file content at a specific commit or branch
     /// </summary>
-    private async Task<string> GetFileContentAsync(string project, string repositoryId, string path, string commitId)
+    public async Task<string> GetFileContentAsync(
+        string project,
+        string repositoryId,
+        string path,
+        string versionOrBranch = "main")
     {
         try
         {
-            var url = $"{project}/_apis/git/repositories/{repositoryId}/items?path={Uri.EscapeDataString(path)}&version={commitId}&api-version=7.1";
+            // Add $format=text to get raw content instead of JSON metadata
+            var url = $"{project}/_apis/git/repositories/{repositoryId}/items?path={Uri.EscapeDataString(path)}&versionDescriptor.version={versionOrBranch}&$format=text&api-version=7.1";
             var response = await _httpClient.GetAsync(url);
             response.EnsureSuccessStatusCode();
             return await response.Content.ReadAsStringAsync();
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error fetching file content for {Path} at commit {CommitId}", path, commitId);
+            _logger.LogDebug(ex, "Error fetching file content for {Path} at {Version}", path, versionOrBranch);
             return string.Empty;
         }
     }

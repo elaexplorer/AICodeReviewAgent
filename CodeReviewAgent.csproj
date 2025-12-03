@@ -13,6 +13,8 @@
     <PackageReference Include="Microsoft.Extensions.Http" Version="8.0.0" />
     <PackageReference Include="Microsoft.SemanticKernel" Version="1.59.0" />
     <PackageReference Include="Microsoft.SemanticKernel.Agents.Core" Version="1.59.0" />
+    <PackageReference Include="Microsoft.SemanticKernel.Connectors.AzureOpenAI" Version="1.59.0" />
+    <PackageReference Include="Microsoft.SemanticKernel.Plugins.Memory" Version="1.59.0-alpha" />
     <PackageReference Include="ModelContextProtocol" Version="0.4.0-preview.3" />
     <PackageReference Include="System.Net.Http" Version="4.3.4" />
   </ItemGroup>

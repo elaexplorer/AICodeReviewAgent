@@ -79,21 +79,128 @@ var summary = await codeReviewAgent.GetReviewSummaryAsync("MyProject", 123);
 
 ## Architecture
 
-### Components
+### System Overview
 
-1. **CodeReviewAgentService**: Main orchestrator that coordinates the review process
-2. **AzureDevOpsMcpClient**: Handles Azure DevOps API interactions
-3. **CodeReviewService**: AI-powered code analysis using Semantic Kernel
-4. **Models**: Data models for pull requests, files, and comments
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          Code Review Agent                              │
+│                           (Program.cs)                                  │
+└────────────┬────────────────────────────────────────────────────────────┘
+             │
+             ├──────────────┬──────────────────────────────────────────────┐
+             │              │                                              │
+        ┌────▼─────┐   ┌────▼──────┐                              ┌───────▼────────┐
+        │ CLI Mode │   │ Web Mode  │                              │  Configuration │
+        │          │   │           │                              │  & DI Setup    │
+        └────┬─────┘   └────┬──────┘                              └───────┬────────┘
+             │              │                                              │
+             │         ┌────▼──────────────────────────────┐              │
+             │         │   CodeReviewController.cs         │              │
+             │         │  - GET /api/codereview/prs        │◄─────────────┘
+             │         │  - POST /api/codereview/review    │
+             │         │  - GET /api/codereview/summary    │
+             │         └────┬──────────────────────────────┘
+             │              │
+             └──────────────┴───────────────────┐
+                                                │
+                         ┌──────────────────────▼─────────────────────┐
+                         │   CodeReviewAgentService.cs                │
+                         │   - ReviewPullRequestAsync()               │
+                         │   - GetReviewSummaryAsync()                │
+                         └──────────────────────┬─────────────────────┘
+                                                │
+                    ┌───────────────────────────┼────────────────────────┐
+                    │                           │                        │
+         ┌──────────▼─────────────┐  ┌──────────▼──────────┐  ┌────────▼─────────┐
+         │  AzureDevOpsMcpClient  │  │ CodeReviewService   │  │ CodebaseCache    │
+         │  - GetPullRequest()    │  │ - ReviewFile()      │  │ - Store/Retrieve │
+         │  - GetFiles()          │  │ - ParseResponse()   │  │   PR data        │
+         │  - PostComment()       │  └──────────┬──────────┘  └──────────────────┘
+         └──────────┬─────────────┘             │
+                    │                 ┌─────────▼──────────────────────────┐
+         ┌──────────▼─────────────┐   │  CodeReviewOrchestrator.cs        │
+         │ AzureDevOpsRestClient  │   │  - Routes files to language agents│
+         │  - REST API calls to   │   │  - Uses Semantic Kernel function  │
+         │    Azure DevOps        │   │    calling for agent selection    │
+         └──────────┬─────────────┘   └────────┬──────────────────────────┘
+                    │                          │
+                    │              ┌───────────┼────────────┐
+                    │              │           │            │
+                    │   ┌──────────▼──┐  ┌─────▼──────┐  ┌─▼───────────┐
+                    │   │  Python     │  │  DotNet    │  │   Rust      │
+                    │   │ ReviewAgent │  │ReviewAgent │  │ ReviewAgent │
+                    │   │  (.py)      │  │ (.cs)      │  │  (.rs)      │
+                    │   └──────┬──────┘  └─────┬──────┘  └──┬──────────┘
+                    │          │               │            │
+                    │          └───────────────┴────────────┘
+                    │                         │
+                    │          ┌──────────────▼─────────────────────┐
+                    │          │  CodebaseContextService.cs         │
+                    │          │  (RAG - Retrieval Augmented Gen.)  │
+                    │          │  - Embedding generation            │
+                    │          │  - Semantic search                 │
+                    │          │  - Context enrichment              │
+                    │          └──────────────┬─────────────────────┘
+                    │                         │
+                    │          ┌──────────────▼─────────────────────┐
+                    └──────────►  Microsoft Semantic Kernel         │
+                               │  - AI orchestration                │
+                               │  - Plugin system                   │
+                               │  - Function calling                │
+                               └──────────────┬─────────────────────┘
+                                              │
+                    ┌─────────────────────────┼─────────────────────┐
+                    │                         │                     │
+         ┌──────────▼─────────┐    ┌──────────▼──────────┐   ┌─────▼──────────┐
+         │  Azure DevOps      │    │  OpenAI / Azure     │   │  Data Models   │
+         │  - Pull Requests   │    │  OpenAI             │   │ - PullRequest  │
+         │  - Files           │    │  - GPT-4/GPT-5      │   │ - FileChange   │
+         │  - Comments        │    │  - Embeddings       │   │ - Comment      │
+         └────────────────────┘    └─────────────────────┘   └────────────────┘
+```
+
+### Key Components
+
+**Entry Points:**
+- **Program.cs** - Main entry point, supports CLI and Web UI modes
+
+**Controllers:**
+- **CodeReviewController** - REST API endpoints for web interface
+
+**Core Services:**
+- **CodeReviewAgentService** - Main orchestrator for PR reviews
+- **CodeReviewOrchestrator** - Routes files to language-specific agents
+- **CodeReviewService** - AI-powered code analysis
+- **CodebaseContextService** - RAG implementation for context enrichment
+
+**External Integration:**
+- **AzureDevOpsMcpClient** - MCP protocol wrapper for Azure DevOps
+- **AzureDevOpsRestClient** - Direct REST API calls to Azure DevOps
+
+**Language Agents** (Extensible):
+- **PythonReviewAgent** - Python-specific code review
+- **DotNetReviewAgent** - C#/.NET code review
+- **RustReviewAgent** - Rust code review
+
+**AI Integration:**
+- **Microsoft Semantic Kernel** - AI orchestration framework
+- **OpenAI/Azure OpenAI** - GPT models for code analysis and embeddings
+
+**Supporting Services:**
+- **CodebaseCache** - In-memory caching for PR data
+- **Models** - Data transfer objects for PR, files, and comments
 
 ### Workflow
 
 1. Fetch pull request details from Azure DevOps
 2. Retrieve changed files and their content
-3. Analyze each file using GPT-4 for code quality issues
-4. Generate structured review comments
-5. Post comments back to the pull request
-6. Provide summary report
+3. Route each file to appropriate language-specific agent
+4. Analyze files using GPT-4 with RAG-enhanced context
+5. Generate structured review comments
+6. Post comments back to the pull request
+7. Provide comprehensive summary report
+
+The architecture uses a **plugin-based system** where language-specific agents can be easily added, and Semantic Kernel's function calling dynamically routes files to the appropriate agent based on file extension.
 
 ## Configuration
 
