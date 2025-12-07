@@ -1,25 +1,24 @@
 using CodeReviewAgent.Models;
 using Microsoft.Extensions.Logging;
-using Microsoft.SemanticKernel;
-using Microsoft.SemanticKernel.ChatCompletion;
+using Microsoft.Extensions.AI;
 using System.Text;
 
 namespace CodeReviewAgent.Services;
 
 public class CodeReviewService
 {
-    private readonly IChatCompletionService _chatCompletion;
+    private readonly IChatClient _chatClient;
     private readonly ILogger<CodeReviewService> _logger;
     private readonly CodeReviewOrchestrator _orchestrator;
     private readonly AzureDevOpsMcpClient _adoClient;
 
     public CodeReviewService(
-        IChatCompletionService chatCompletion,
+        IChatClient chatClient,
         ILogger<CodeReviewService> logger,
         CodeReviewOrchestrator orchestrator,
         AzureDevOpsMcpClient adoClient)
     {
-        _chatCompletion = chatCompletion;
+        _chatClient = chatClient;
         _logger = logger;
         _orchestrator = orchestrator;
         _adoClient = adoClient;
@@ -104,13 +103,15 @@ public class CodeReviewService
         {
             var prompt = BuildCodeReviewPrompt(file);
 
-            var chatHistory = new ChatHistory();
-            chatHistory.AddSystemMessage("You are an expert code reviewer. Analyze the provided code changes and provide constructive feedback.");
-            chatHistory.AddUserMessage(prompt);
+            var messages = new List<ChatMessage>
+            {
+                new(ChatRole.System, "You are an expert code reviewer. Analyze the provided code changes and provide constructive feedback."),
+                new(ChatRole.User, prompt)
+            };
 
-            var response = await _chatCompletion.GetChatMessageContentAsync(chatHistory);
+            ChatResponse response = await _chatClient.GetResponseAsync(messages);
 
-            return ParseReviewResponse(response.Content ?? string.Empty, file.Path);
+            return ParseReviewResponse(response.Text ?? string.Empty, file.Path);
         }
         catch (Exception ex)
         {

@@ -2,7 +2,7 @@ using System.Text;
 using System.Text.RegularExpressions;
 using CodeReviewAgent.Models;
 using Microsoft.Extensions.Logging;
-using Microsoft.SemanticKernel.Embeddings;
+using Microsoft.Extensions.AI;
 
 namespace CodeReviewAgent.Services;
 
@@ -11,18 +11,18 @@ namespace CodeReviewAgent.Services;
 /// </summary>
 public class CodebaseContextService
 {
-    private readonly ITextEmbeddingGenerationService _embeddingService;
+    private readonly IEmbeddingGenerator<string, Embedding<float>> _embeddingGenerator;
     private readonly AzureDevOpsRestClient _adoClient;
     private readonly ILogger<CodebaseContextService> _logger;
     private readonly Dictionary<string, List<CodeChunk>> _inMemoryStore;
     private const string COLLECTION_NAME = "codebase";
 
     public CodebaseContextService(
-        ITextEmbeddingGenerationService embeddingService,
+        IEmbeddingGenerator<string, Embedding<float>> embeddingGenerator,
         AzureDevOpsRestClient adoClient,
         ILogger<CodebaseContextService> logger)
     {
-        _embeddingService = embeddingService;
+        _embeddingGenerator = embeddingGenerator;
         _adoClient = adoClient;
         _logger = logger;
         _inMemoryStore = new Dictionary<string, List<CodeChunk>>();
@@ -67,8 +67,8 @@ public class CodebaseContextService
                 foreach (var chunk in fileChunks)
                 {
                     // Generate embedding for the chunk
-                    var embedding = await _embeddingService.GenerateEmbeddingAsync(chunk.Content);
-                    chunk.Embedding = embedding.ToArray();
+                    var embeddingResponse = await _embeddingGenerator.GenerateAsync(chunk.Content);
+                    chunk.Embedding = embeddingResponse.Vector.ToArray();
                     chunks.Add(chunk);
                     indexed++;
                 }
@@ -118,8 +118,8 @@ public class CodebaseContextService
         try
         {
             // Generate embedding for the search query
-            var queryEmbedding = await _embeddingService.GenerateEmbeddingAsync(searchQuery);
-            var queryVector = queryEmbedding.ToArray();
+            var queryEmbeddingResponse = await _embeddingGenerator.GenerateAsync(searchQuery);
+            var queryVector = queryEmbeddingResponse.Vector.ToArray();
 
             // Semantic search for similar code using cosine similarity
             var chunks = _inMemoryStore[repositoryId];

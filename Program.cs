@@ -4,9 +4,13 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using Microsoft.SemanticKernel;
-using Microsoft.SemanticKernel.ChatCompletion;
-using Microsoft.SemanticKernel.Connectors.OpenAI;
+using Microsoft.Extensions.AI;
+using Azure.AI.OpenAI;
+using Azure;
+using OpenAI;
+using System.ClientModel;
+using OpenTelemetry.Trace;
+using OpenTelemetry.Resources;
 
 // Create web application builder
 var builder = WebApplication.CreateBuilder(args);
@@ -63,31 +67,65 @@ if ((!hasOpenAI && !hasAzureOpenAI) || string.IsNullOrEmpty(adoPat))
 // Add services
 builder.Services.AddLogging(config => config.AddConsole().SetMinimumLevel(LogLevel.Information));
 
-// Add Semantic Kernel with appropriate AI service
-var kernelBuilder = builder.Services.AddKernel();
+// Add OpenTelemetry for observability
+builder.Services.AddOpenTelemetry()
+    .ConfigureResource(resource => resource.AddService("CodeReviewAgent"))
+    .WithTracing(tracing => tracing
+        .AddSource("Microsoft.Extensions.AI")
+        .AddHttpClientInstrumentation()
+        .AddConsoleExporter());
 
+// Register IChatClient with middleware pipeline
 if (hasAzureOpenAI)
 {
     Console.WriteLine($"Using Azure OpenAI with deployment: {azureOpenAiDeployment}");
-    kernelBuilder.AddAzureOpenAIChatCompletion(
-        deploymentName: azureOpenAiDeployment,
-        endpoint: azureOpenAiEndpoint!,
-        apiKey: azureOpenAiApiKey!);
 
-    // Add embedding generation service for RAG
-    kernelBuilder.AddAzureOpenAITextEmbeddingGeneration(
-        deploymentName: "text-embedding-ada-002", // Standard embedding model
-        endpoint: azureOpenAiEndpoint!,
-        apiKey: azureOpenAiApiKey!);
+    builder.Services.AddSingleton<IChatClient>(provider =>
+    {
+        var azureClient = new AzureOpenAIClient(
+            new Uri(azureOpenAiEndpoint!),
+            new AzureKeyCredential(azureOpenAiApiKey!));
+
+        // Get ChatClient and convert to IChatClient using AsIChatClient()
+        var chatClient = azureClient.GetChatClient(azureOpenAiDeployment);
+        return chatClient.AsIChatClient();
+    });
+
+    // Register embedding generator for RAG
+    builder.Services.AddSingleton<IEmbeddingGenerator<string, Embedding<float>>>(provider =>
+    {
+        var azureClient = new AzureOpenAIClient(
+            new Uri(azureOpenAiEndpoint!),
+            new AzureKeyCredential(azureOpenAiApiKey!));
+
+        // Get EmbeddingClient and convert to IEmbeddingGenerator
+        var embeddingClient = azureClient.GetEmbeddingClient("text-embedding-ada-002");
+        return embeddingClient.AsIEmbeddingGenerator();
+    });
 }
 else if (hasOpenAI)
 {
     Console.WriteLine("Using OpenAI with model: gpt-4");
-    kernelBuilder.AddOpenAIChatCompletion("gpt-4", openAiApiKey!);
 
-    // Add embedding generation service for RAG
-    kernelBuilder.AddOpenAITextEmbeddingGeneration("text-embedding-ada-002", openAiApiKey!);
+    builder.Services.AddSingleton<IChatClient>(provider =>
+    {
+        var openAIClient = new OpenAIClient(openAiApiKey!);
+        // Get ChatClient and convert to IChatClient using AsIChatClient()
+        var chatClient = openAIClient.GetChatClient("gpt-4");
+        return chatClient.AsIChatClient();
+    });
+
+    builder.Services.AddSingleton<IEmbeddingGenerator<string, Embedding<float>>>(provider =>
+    {
+        var openAIClient = new OpenAIClient(openAiApiKey!);
+        // Get EmbeddingClient and convert to IEmbeddingGenerator
+        var embeddingClient = openAIClient.GetEmbeddingClient("text-embedding-ada-002");
+        return embeddingClient.AsIEmbeddingGenerator();
+    });
 }
+
+// Add distributed cache for response caching (in-memory for now)
+builder.Services.AddDistributedMemoryCache();
 
 // Add custom services
 builder.Services.AddSingleton<CodebaseCache>();
@@ -110,21 +148,10 @@ builder.Services.AddSingleton(provider =>
 // Add RAG context service
 builder.Services.AddSingleton<CodebaseContextService>();
 
-// Add language-specific review agents
-builder.Services.AddSingleton<ILanguageReviewAgent, PythonReviewAgent>(provider =>
-    new PythonReviewAgent(
-        provider.GetRequiredService<ILogger<PythonReviewAgent>>(),
-        provider.GetRequiredService<Kernel>()));
-
-builder.Services.AddSingleton<ILanguageReviewAgent, DotNetReviewAgent>(provider =>
-    new DotNetReviewAgent(
-        provider.GetRequiredService<ILogger<DotNetReviewAgent>>(),
-        provider.GetRequiredService<Kernel>()));
-
-builder.Services.AddSingleton<ILanguageReviewAgent, RustReviewAgent>(provider =>
-    new RustReviewAgent(
-        provider.GetRequiredService<ILogger<RustReviewAgent>>(),
-        provider.GetRequiredService<Kernel>()));
+// Add language-specific review agents (simplified - no Kernel dependency)
+builder.Services.AddSingleton<ILanguageReviewAgent, PythonReviewAgent>();
+builder.Services.AddSingleton<ILanguageReviewAgent, DotNetReviewAgent>();
+builder.Services.AddSingleton<ILanguageReviewAgent, RustReviewAgent>();
 
 // Add orchestrator
 builder.Services.AddSingleton<CodeReviewOrchestrator>();

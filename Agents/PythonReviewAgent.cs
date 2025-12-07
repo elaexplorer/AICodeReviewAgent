@@ -1,8 +1,7 @@
 using System.ComponentModel;
 using CodeReviewAgent.Models;
 using Microsoft.Extensions.Logging;
-using Microsoft.SemanticKernel;
-using Microsoft.SemanticKernel.ChatCompletion;
+using Microsoft.Extensions.AI;
 
 namespace CodeReviewAgent.Agents;
 
@@ -12,25 +11,22 @@ namespace CodeReviewAgent.Agents;
 public class PythonReviewAgent : ILanguageReviewAgent
 {
     private readonly ILogger<PythonReviewAgent> _logger;
-    private readonly Kernel _kernel;
-    private readonly IChatCompletionService _chatService;
+    private readonly IChatClient _chatClient;
 
     public string Language => "Python";
     public string[] FileExtensions => new[] { ".py", ".pyw", ".pyi" };
 
     public PythonReviewAgent(
         ILogger<PythonReviewAgent> logger,
-        Kernel kernel)
+        IChatClient chatClient)
     {
         _logger = logger;
-        _kernel = kernel;
-        _chatService = kernel.GetRequiredService<IChatCompletionService>();
+        _chatClient = chatClient;
     }
 
-    [KernelFunction, Description("Review Python code for issues, best practices, and potential bugs")]
     public async Task<List<CodeReviewComment>> ReviewFileAsync(
-        [Description("The file to review")] PullRequestFile file,
-        [Description("Context about the codebase structure")] string codebaseContext)
+        PullRequestFile file,
+        string codebaseContext)
     {
         try
         {
@@ -111,8 +107,14 @@ public class PythonReviewAgent : ILanguageReviewAgent
                 If no issues are found, return an empty array: []
                 """;
 
-            var response = await _chatService.GetChatMessageContentAsync(prompt);
-            var responseText = response.Content ?? "[]";
+            var messages = new List<ChatMessage>
+            {
+                new(ChatRole.System, "You are an expert Python code reviewer with comprehensive knowledge of best practices, PEP standards, and security."),
+                new(ChatRole.User, prompt)
+            };
+
+            ChatResponse response = await _chatClient.GetResponseAsync(messages);
+            var responseText = response.Text ?? "[]";
 
             // Parse the JSON response
             var comments = ParseReviewComments(responseText, file.Path);

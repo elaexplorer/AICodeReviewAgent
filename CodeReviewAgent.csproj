@@ -11,10 +11,22 @@
     <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="9.0.0" />
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.0" />
     <PackageReference Include="Microsoft.Extensions.Http" Version="8.0.0" />
-    <PackageReference Include="Microsoft.SemanticKernel" Version="1.59.0" />
-    <PackageReference Include="Microsoft.SemanticKernel.Agents.Core" Version="1.59.0" />
-    <PackageReference Include="Microsoft.SemanticKernel.Connectors.AzureOpenAI" Version="1.59.0" />
-    <PackageReference Include="Microsoft.SemanticKernel.Plugins.Memory" Version="1.59.0-alpha" />
+    <!-- Microsoft.Extensions.AI - Core AI abstractions (Stable) -->
+    <PackageReference Include="Microsoft.Extensions.AI" Version="10.0.1" />
+    <PackageReference Include="Microsoft.Extensions.AI.Abstractions" Version="10.0.1" />
+    <PackageReference Include="Microsoft.Extensions.AI.OpenAI" Version="10.0.1-preview.1.25571.5" />
+
+    <!-- Microsoft Agent Framework for multi-agent orchestration -->
+    <PackageReference Include="Microsoft.Agents.AI" Version="1.0.0-preview.251001.1" />
+
+    <!-- Azure OpenAI SDK - compatible with Microsoft.Extensions.AI.OpenAI 10.0.1 -->
+    <PackageReference Include="Azure.AI.OpenAI" Version="2.7.0-beta.2" />
+    <PackageReference Include="Azure.Identity" Version="1.13.1" />
+
+    <!-- OpenTelemetry for observability -->
+    <PackageReference Include="OpenTelemetry.Exporter.Console" Version="1.10.0" />
+    <PackageReference Include="OpenTelemetry.Extensions.Hosting" Version="1.10.0" />
+    <PackageReference Include="OpenTelemetry.Instrumentation.Http" Version="1.10.0" />
     <PackageReference Include="ModelContextProtocol" Version="0.4.0-preview.3" />
     <PackageReference Include="System.Net.Http" Version="4.3.4" />
   </ItemGroup>

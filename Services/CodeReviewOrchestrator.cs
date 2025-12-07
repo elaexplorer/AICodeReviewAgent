@@ -2,9 +2,7 @@ using System.ComponentModel;
 using CodeReviewAgent.Agents;
 using CodeReviewAgent.Models;
 using Microsoft.Extensions.Logging;
-using Microsoft.SemanticKernel;
-using Microsoft.SemanticKernel.ChatCompletion;
-using Microsoft.SemanticKernel.Connectors.OpenAI;
+using Microsoft.Extensions.AI;
 
 namespace CodeReviewAgent.Services;
 
@@ -15,19 +13,17 @@ namespace CodeReviewAgent.Services;
 public class CodeReviewOrchestrator
 {
     private readonly ILogger<CodeReviewOrchestrator> _logger;
-    private readonly Kernel _kernel;
-    private readonly IChatCompletionService _chatService;
+    private readonly IChatClient _chatClient;
     private readonly Dictionary<string, ILanguageReviewAgent> _agents;
     private readonly Dictionary<string, string> _extensionToLanguage;
 
     public CodeReviewOrchestrator(
         ILogger<CodeReviewOrchestrator> logger,
-        Kernel kernel,
+        IChatClient chatClient,
         IEnumerable<ILanguageReviewAgent> agents)
     {
         _logger = logger;
-        _kernel = kernel;
-        _chatService = kernel.GetRequiredService<IChatCompletionService>();
+        _chatClient = chatClient;
         _agents = agents.ToDictionary(a => a.Language, a => a);
         _extensionToLanguage = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
@@ -40,12 +36,7 @@ public class CodeReviewOrchestrator
             }
         }
 
-        // Register agents as kernel plugins for function calling
-        foreach (var agent in agents)
-        {
-            _kernel.Plugins.AddFromObject(agent, agent.Language);
-        }
-
+        // No plugin registration needed - manual routing
         _logger.LogInformation("Registered {AgentCount} language review agents: {Languages}",
             _agents.Count, string.Join(", ", _agents.Keys));
     }
@@ -57,9 +48,8 @@ public class CodeReviewOrchestrator
         List<PullRequestFile> files,
         string codebaseContext)
     {
-        var allComments = new List<CodeReviewComment>();
-
-        foreach (var file in files)
+        // Process files in parallel for faster reviews
+        var reviewTasks = files.Select(async file =>
         {
             try
             {
@@ -68,7 +58,7 @@ public class CodeReviewOrchestrator
                 if (string.IsNullOrEmpty(extension))
                 {
                     _logger.LogWarning("Skipping file without extension: {FilePath}", file.Path);
-                    continue;
+                    return new List<CodeReviewComment>();
                 }
 
                 // Determine which agent should review this file
@@ -76,91 +66,32 @@ public class CodeReviewOrchestrator
                     _agents.TryGetValue(language, out var agent))
                 {
                     _logger.LogInformation("Routing {FilePath} to {Language} agent", file.Path, language);
-
-                    var comments = await agent.ReviewFileAsync(file, codebaseContext);
-                    allComments.AddRange(comments);
+                    return await agent.ReviewFileAsync(file, codebaseContext);
                 }
                 else
                 {
                     _logger.LogInformation("No specialized agent for {Extension}, using general review for {FilePath}",
                         extension, file.Path);
-
-                    var comments = await ReviewWithGeneralAgentAsync(file, codebaseContext);
-                    allComments.AddRange(comments);
+                    return await ReviewWithGeneralAgentAsync(file, codebaseContext);
                 }
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error reviewing file {FilePath}", file.Path);
+                return new List<CodeReviewComment>();
             }
-        }
+        });
 
-        return allComments;
-    }
-
-    /// <summary>
-    /// Use Semantic Kernel's function calling to automatically select and invoke the right agent
-    /// </summary>
-    public async Task<List<CodeReviewComment>> ReviewFilesWithAutoSelectionAsync(
-        List<PullRequestFile> files,
-        string codebaseContext)
-    {
-        var allComments = new List<CodeReviewComment>();
-
-        foreach (var file in files)
-        {
-            try
-            {
-                _logger.LogInformation("Auto-selecting agent for file: {FilePath}", file.Path);
-
-                // Create a prompt for the orchestrator to decide which agent to use
-                var orchestrationPrompt = $$$"""
-                    You are a code review orchestrator. You have access to specialized code review agents for different programming languages.
-
-                    Available agents:
-                    {{{string.Join("\n", _agents.Keys.Select(k => $"- {k}"))}}}
-
-                    File to review: {{{file.Path}}}
-                    File extension: {{{Path.GetExtension(file.Path)}}}
-
-                    Based on the file path and extension, call the appropriate language-specific review agent function to review this file.
-
-                    If no specialized agent matches, provide a general code review.
-                    """;
-
-                // Use automatic function calling to route to the right agent
-                var executionSettings = new OpenAIPromptExecutionSettings
-                {
-                    ToolCallBehavior = ToolCallBehavior.AutoInvokeKernelFunctions
-                };
-
-                var result = await _kernel.InvokePromptAsync(
-                    orchestrationPrompt,
-                    new KernelArguments(executionSettings)
-                    {
-                        ["file"] = file,
-                        ["codebaseContext"] = codebaseContext
-                    });
-
-                _logger.LogInformation("Orchestration result for {FilePath}: {Result}",
-                    file.Path, result.ToString());
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error in auto-selection orchestration for {FilePath}", file.Path);
-            }
-        }
-
-        return allComments;
+        var results = await Task.WhenAll(reviewTasks);
+        return results.SelectMany(comments => comments).ToList();
     }
 
     /// <summary>
     /// General review for files without specialized agents
     /// </summary>
-    [KernelFunction, Description("Review any code file when no specialized language agent is available")]
     private async Task<List<CodeReviewComment>> ReviewWithGeneralAgentAsync(
-        [Description("The file to review")] PullRequestFile file,
-        [Description("Context about the codebase")] string codebaseContext)
+        PullRequestFile file,
+        string codebaseContext)
     {
         try
         {
@@ -212,8 +143,14 @@ public class CodeReviewOrchestrator
                 If no issues are found, return an empty array: []
                 """;
 
-            var response = await _chatService.GetChatMessageContentAsync(prompt);
-            var responseText = response.Content ?? "[]";
+            var messages = new List<ChatMessage>
+            {
+                new(ChatRole.System, "You are a general code reviewer with broad knowledge of software engineering best practices."),
+                new(ChatRole.User, prompt)
+            };
+
+            ChatResponse response = await _chatClient.GetResponseAsync(messages);
+            var responseText = response.Text ?? "[]";
 
             return ParseReviewComments(responseText, file.Path);
         }
