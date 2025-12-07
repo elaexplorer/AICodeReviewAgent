@@ -8,7 +8,7 @@ namespace CodeReviewAgent.Services;
 
 /// <summary>
 /// Orchestrates code review by routing files to appropriate language-specific agents
-/// using Semantic Kernel's function calling capabilities
+/// using Microsoft.Agents.AI multi-agent coordination
 /// </summary>
 public class CodeReviewOrchestrator
 {
@@ -23,7 +23,7 @@ public class CodeReviewOrchestrator
         IEnumerable<ILanguageReviewAgent> agents)
     {
         _logger = logger;
-        _chatClient = chatClient;
+        _chatClient = chatClient; // Used for general reviews when no specialized agent exists
         _agents = agents.ToDictionary(a => a.Language, a => a);
         _extensionToLanguage = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 

@@ -2,16 +2,17 @@ using System.ComponentModel;
 using CodeReviewAgent.Models;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.AI;
+using Microsoft.Agents.AI;
 
 namespace CodeReviewAgent.Agents;
 
 /// <summary>
-/// .NET/C# code review expert agent
+/// .NET/C# code review expert agent using Microsoft.Agents.AI
 /// </summary>
 public class DotNetReviewAgent : ILanguageReviewAgent
 {
     private readonly ILogger<DotNetReviewAgent> _logger;
-    private readonly IChatClient _chatClient;
+    private readonly AIAgent _agent;
 
     public string Language => "DotNet";
     public string[] FileExtensions => new[] { ".cs", ".csproj", ".cshtml", ".razor" };
@@ -21,18 +22,11 @@ public class DotNetReviewAgent : ILanguageReviewAgent
         IChatClient chatClient)
     {
         _logger = logger;
-        _chatClient = chatClient;
-    }
 
-    public async Task<List<CodeReviewComment>> ReviewFileAsync(
-        PullRequestFile file,
-        string codebaseContext)
-    {
-        try
-        {
-            _logger.LogInformation("Reviewing .NET file: {FilePath}", file.Path);
-
-            var prompt = $$$"""
+        // Create ChatClientAgent with specialized instructions
+        _agent = new ChatClientAgent(
+            chatClient,
+            instructions: """
                 You are an expert C#/.NET code reviewer with deep knowledge of:
                 - C# best practices and coding standards
                 - .NET Framework/.NET Core/.NET 5+ features and patterns
@@ -44,14 +38,43 @@ public class DotNetReviewAgent : ILanguageReviewAgent
                 - Dependency injection and IoC patterns
                 - Unit testing with xUnit/NUnit/MSTest
 
-                Review ONLY THE CHANGES in the following C#/.NET file from a pull request.
-
                 CRITICAL RULES:
-                1. ONLY comment on lines marked with '+' in the diff below (new/modified lines)
-                2. The full file contents are provided ONLY for understanding context
-                3. DO NOT comment on any line that is not part of the diff changes
-                4. DO NOT comment on lines marked with '-' (removed lines) or context lines (no prefix)
-                5. You can reference existing code for context, but your comments must be about the NEW changes only
+                1. ONLY comment on lines marked with '+' in the diff (new/modified lines)
+                2. DO NOT comment on lines marked with '-' (removed lines) or context lines
+                3. Provide your response as a JSON array of review comments
+
+                For each issue found, provide:
+                - Line number from the diff (lines marked with + are the new code)
+                - Severity (high/medium/low)
+                - Type (issue/suggestion/nitpick)
+                - Clear explanation of the problem
+                - Specific recommendation for fixing it
+
+                Return your response as a JSON array of objects with this structure:
+                [
+                  {
+                    "lineNumber": 10,
+                    "severity": "high",
+                    "type": "issue",
+                    "comment": "Detailed explanation and recommendation"
+                  }
+                ]
+
+                If no issues are found, return an empty array: []
+                """,
+            name: "DotNetReviewAgent");
+    }
+
+    public async Task<List<CodeReviewComment>> ReviewFileAsync(
+        PullRequestFile file,
+        string codebaseContext)
+    {
+        try
+        {
+            _logger.LogInformation("Reviewing .NET file: {FilePath}", file.Path);
+
+            var prompt = $$$"""
+                Review ONLY THE CHANGES in the following C#/.NET file from a pull request.
 
                 File Path: {{{file.Path}}}
                 Change Type: {{{file.ChangeType}}}
@@ -89,35 +112,11 @@ public class DotNetReviewAgent : ILanguageReviewAgent
                 4. **Best Practices**: SOLID principles, proper disposal (IDisposable), exception handling, logging
                 5. **Code Quality**: Naming conventions, method complexity, code duplication, accessibility modifiers
                 6. **.NET-Specific**: Proper use of async/await, ConfigureAwait, CancellationToken, modern C# features
-
-                For each issue found, provide:
-                - Line number from the diff (lines marked with + are the new code)
-                - Severity (high/medium/low)
-                - Type (issue/suggestion/nitpick)
-                - Clear explanation of the problem
-                - Specific recommendation for fixing it
-
-                Return your response as a JSON array of objects with this structure:
-                [
-                  {
-                    "lineNumber": 10,
-                    "severity": "high",
-                    "type": "issue",
-                    "comment": "Detailed explanation and recommendation"
-                  }
-                ]
-
-                If no issues are found, return an empty array: []
                 """;
 
-            var messages = new List<ChatMessage>
-            {
-                new(ChatRole.System, "You are an expert C#/.NET code reviewer with comprehensive knowledge of best practices, security, and performance optimization."),
-                new(ChatRole.User, prompt)
-            };
-
-            ChatResponse response = await _chatClient.GetResponseAsync(messages);
-            var responseText = response.Text ?? "[]";
+            // Use AIAgent.RunAsync to execute the agent
+            var response = await _agent.RunAsync(prompt);
+            var responseText = response.Text;
 
             // Parse the JSON response
             var comments = ParseReviewComments(responseText, file.Path);

@@ -2,16 +2,17 @@ using System.ComponentModel;
 using CodeReviewAgent.Models;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.AI;
+using Microsoft.Agents.AI;
 
 namespace CodeReviewAgent.Agents;
 
 /// <summary>
-/// Python code review expert agent
+/// Python code review expert agent using Microsoft.Agents.AI
 /// </summary>
 public class PythonReviewAgent : ILanguageReviewAgent
 {
     private readonly ILogger<PythonReviewAgent> _logger;
-    private readonly IChatClient _chatClient;
+    private readonly AIAgent _agent;
 
     public string Language => "Python";
     public string[] FileExtensions => new[] { ".py", ".pyw", ".pyi" };
@@ -21,7 +22,44 @@ public class PythonReviewAgent : ILanguageReviewAgent
         IChatClient chatClient)
     {
         _logger = logger;
-        _chatClient = chatClient;
+
+        // Create ChatClientAgent with specialized instructions
+        _agent = new ChatClientAgent(
+            chatClient,
+            instructions: """
+                You are an expert Python code reviewer with deep knowledge of:
+                - Python best practices and PEP standards (PEP 8, PEP 20, PEP 484, etc.)
+                - Common Python security vulnerabilities and patterns
+                - Performance optimization techniques
+                - Modern Python features (3.10+, async/await, type hints, dataclasses, etc.)
+                - Popular Python frameworks (Django, Flask, FastAPI, pandas, numpy, etc.)
+                - Testing patterns (pytest, unittest, mocking)
+
+                CRITICAL RULES:
+                1. ONLY comment on lines marked with '+' in the diff (new/modified lines)
+                2. DO NOT comment on lines marked with '-' (removed lines) or context lines
+                3. Provide your response as a JSON array of review comments
+
+                For each issue found, provide:
+                - Line number from the diff (lines marked with + are the new code)
+                - Severity (high/medium/low)
+                - Type (issue/suggestion/nitpick)
+                - Clear explanation of the problem
+                - Specific recommendation for fixing it
+
+                Return your response as a JSON array of objects with this structure:
+                [
+                  {
+                    "lineNumber": 10,
+                    "severity": "high",
+                    "type": "issue",
+                    "comment": "Detailed explanation and recommendation"
+                  }
+                ]
+
+                If no issues are found, return an empty array: []
+                """,
+            name: "PythonReviewAgent");
     }
 
     public async Task<List<CodeReviewComment>> ReviewFileAsync(
@@ -33,22 +71,7 @@ public class PythonReviewAgent : ILanguageReviewAgent
             _logger.LogInformation("Reviewing Python file: {FilePath}", file.Path);
 
             var prompt = $$$"""
-                You are an expert Python code reviewer with deep knowledge of:
-                - Python best practices and PEP standards (PEP 8, PEP 20, PEP 484, etc.)
-                - Common Python security vulnerabilities and patterns
-                - Performance optimization techniques
-                - Modern Python features (3.10+, async/await, type hints, dataclasses, etc.)
-                - Popular Python frameworks (Django, Flask, FastAPI, pandas, numpy, etc.)
-                - Testing patterns (pytest, unittest, mocking)
-
                 Review ONLY THE CHANGES in the following Python file from a pull request.
-
-                CRITICAL RULES:
-                1. ONLY comment on lines marked with '+' in the diff below (new/modified lines)
-                2. The full file contents are provided ONLY for understanding context
-                3. DO NOT comment on any line that is not part of the diff changes
-                4. DO NOT comment on lines marked with '-' (removed lines) or context lines (no prefix)
-                5. You can reference existing code for context, but your comments must be about the NEW changes only
 
                 File Path: {{{file.Path}}}
                 Change Type: {{{file.ChangeType}}}
@@ -86,35 +109,11 @@ public class PythonReviewAgent : ILanguageReviewAgent
                 4. **Best Practices**: PEP compliance, proper error handling, logging, documentation
                 5. **Code Quality**: Naming conventions, function complexity, code duplication
                 6. **Python-Specific**: Proper use of context managers, generators, decorators, type hints
-
-                For each issue found, provide:
-                - Line number from the diff (lines marked with + are the new code)
-                - Severity (high/medium/low)
-                - Type (issue/suggestion/nitpick)
-                - Clear explanation of the problem
-                - Specific recommendation for fixing it
-
-                Return your response as a JSON array of objects with this structure:
-                [
-                  {
-                    "lineNumber": 10,
-                    "severity": "high",
-                    "type": "issue",
-                    "comment": "Detailed explanation and recommendation"
-                  }
-                ]
-
-                If no issues are found, return an empty array: []
                 """;
 
-            var messages = new List<ChatMessage>
-            {
-                new(ChatRole.System, "You are an expert Python code reviewer with comprehensive knowledge of best practices, PEP standards, and security."),
-                new(ChatRole.User, prompt)
-            };
-
-            ChatResponse response = await _chatClient.GetResponseAsync(messages);
-            var responseText = response.Text ?? "[]";
+            // Use AIAgent.RunAsync to execute the agent
+            var response = await _agent.RunAsync(prompt);
+            var responseText = response.Text;
 
             // Parse the JSON response
             var comments = ParseReviewComments(responseText, file.Path);

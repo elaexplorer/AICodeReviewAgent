@@ -2,16 +2,17 @@ using System.ComponentModel;
 using CodeReviewAgent.Models;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.AI;
+using Microsoft.Agents.AI;
 
 namespace CodeReviewAgent.Agents;
 
 /// <summary>
-/// Rust code review expert agent
+/// Rust code review expert agent using Microsoft.Agents.AI
 /// </summary>
 public class RustReviewAgent : ILanguageReviewAgent
 {
     private readonly ILogger<RustReviewAgent> _logger;
-    private readonly IChatClient _chatClient;
+    private readonly AIAgent _agent;
 
     public string Language => "Rust";
     public string[] FileExtensions => new[] { ".rs", ".toml" };
@@ -21,18 +22,11 @@ public class RustReviewAgent : ILanguageReviewAgent
         IChatClient chatClient)
     {
         _logger = logger;
-        _chatClient = chatClient;
-    }
 
-    public async Task<List<CodeReviewComment>> ReviewFileAsync(
-        PullRequestFile file,
-        string codebaseContext)
-    {
-        try
-        {
-            _logger.LogInformation("Reviewing Rust file: {FilePath}", file.Path);
-
-            var prompt = $$$"""
+        // Create ChatClientAgent with specialized instructions
+        _agent = new ChatClientAgent(
+            chatClient,
+            instructions: """
                 You are an expert Rust code reviewer with deep knowledge of:
                 - Rust best practices and idioms
                 - Ownership, borrowing, and lifetime rules
@@ -44,14 +38,43 @@ public class RustReviewAgent : ILanguageReviewAgent
                 - Popular Rust frameworks (tokio, actix, serde, etc.)
                 - Cargo and dependency management
 
-                Review ONLY THE CHANGES in the following Rust file from a pull request.
-
                 CRITICAL RULES:
-                1. ONLY comment on lines marked with '+' in the diff below (new/modified lines)
-                2. The full file contents are provided ONLY for understanding context
-                3. DO NOT comment on any line that is not part of the diff changes
-                4. DO NOT comment on lines marked with '-' (removed lines) or context lines (no prefix)
-                5. You can reference existing code for context, but your comments must be about the NEW changes only
+                1. ONLY comment on lines marked with '+' in the diff (new/modified lines)
+                2. DO NOT comment on lines marked with '-' (removed lines) or context lines
+                3. Provide your response as a JSON array of review comments
+
+                For each issue found, provide:
+                - Line number from the diff (lines marked with + are the new code)
+                - Severity (high/medium/low)
+                - Type (issue/suggestion/nitpick)
+                - Clear explanation of the problem
+                - Specific recommendation for fixing it
+
+                Return your response as a JSON array of objects with this structure:
+                [
+                  {
+                    "lineNumber": 10,
+                    "severity": "high",
+                    "type": "issue",
+                    "comment": "Detailed explanation and recommendation"
+                  }
+                ]
+
+                If no issues are found, return an empty array: []
+                """,
+            name: "RustReviewAgent");
+    }
+
+    public async Task<List<CodeReviewComment>> ReviewFileAsync(
+        PullRequestFile file,
+        string codebaseContext)
+    {
+        try
+        {
+            _logger.LogInformation("Reviewing Rust file: {FilePath}", file.Path);
+
+            var prompt = $$$"""
+                Review ONLY THE CHANGES in the following Rust file from a pull request.
 
                 File Path: {{{file.Path}}}
                 Change Type: {{{file.ChangeType}}}
@@ -89,35 +112,11 @@ public class RustReviewAgent : ILanguageReviewAgent
                 4. **Performance**: Unnecessary cloning, inefficient algorithms, blocking operations
                 5. **Best Practices**: Proper error propagation, idiomatic Rust patterns, documentation
                 6. **Rust-Specific**: Ownership patterns, trait implementations, lifetime annotations, macro usage
-
-                For each issue found, provide:
-                - Line number from the diff (lines marked with + are the new code)
-                - Severity (high/medium/low)
-                - Type (issue/suggestion/nitpick)
-                - Clear explanation of the problem
-                - Specific recommendation for fixing it
-
-                Return your response as a JSON array of objects with this structure:
-                [
-                  {
-                    "lineNumber": 10,
-                    "severity": "high",
-                    "type": "issue",
-                    "comment": "Detailed explanation and recommendation"
-                  }
-                ]
-
-                If no issues are found, return an empty array: []
                 """;
 
-            var messages = new List<ChatMessage>
-            {
-                new(ChatRole.System, "You are an expert Rust code reviewer with comprehensive knowledge of memory safety, ownership, and best practices."),
-                new(ChatRole.User, prompt)
-            };
-
-            ChatResponse response = await _chatClient.GetResponseAsync(messages);
-            var responseText = response.Text ?? "[]";
+            // Use AIAgent.RunAsync to execute the agent
+            var response = await _agent.RunAsync(prompt);
+            var responseText = response.Text;
 
             // Parse the JSON response
             var comments = ParseReviewComments(responseText, file.Path);
