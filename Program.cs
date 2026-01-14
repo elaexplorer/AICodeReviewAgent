@@ -129,6 +129,7 @@ builder.Services.AddDistributedMemoryCache();
 
 // Add custom services
 builder.Services.AddSingleton<CodebaseCache>();
+builder.Services.AddSingleton<AdoConfigurationService>();
 
 builder.Services.AddSingleton(provider =>
     new AzureDevOpsRestClient(

@@ -312,21 +312,22 @@ public class AzureDevOpsMcpClient : IAsyncDisposable
 
     public async Task<List<PullRequest>> GetActivePullRequestsAsync(string project, string repository)
     {
-        try
-        {
-            _logger.LogInformation("Fetching active PRs for {Project}/{Repository}", project, repository);
+        _logger.LogInformation("Fetching active PRs for {Project}/{Repository}", project, repository);
 
-            // Use REST API to get active pull requests
-            var prs = await _restClient.GetActivePullRequestsAsync(project, repository);
+        // Use REST API to get active pull requests - let exceptions propagate
+        var prs = await _restClient.GetActivePullRequestsAsync(project, repository);
 
-            _logger.LogInformation("Found {Count} active PRs in {Repository}", prs.Count, repository);
-            return prs;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error fetching active pull requests");
-            return new List<PullRequest>();
-        }
+        _logger.LogInformation("Found {Count} active PRs in {Repository}", prs.Count, repository);
+        return prs;
+    }
+
+    /// <summary>
+    /// Updates the REST client configuration with new PAT and organization
+    /// </summary>
+    public void UpdateConfiguration(string organization, string personalAccessToken)
+    {
+        _restClient.UpdateConfiguration(organization, personalAccessToken);
+        _logger.LogInformation("Updated ADO client configuration for organization: {Organization}", organization);
     }
 
     public async ValueTask DisposeAsync()

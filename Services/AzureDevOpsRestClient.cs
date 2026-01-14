@@ -12,9 +12,9 @@ namespace CodeReviewAgent.Services;
 public class AzureDevOpsRestClient
 {
     private readonly ILogger<AzureDevOpsRestClient> _logger;
-    private readonly HttpClient _httpClient;
-    private readonly string _organization;
-    private readonly string _personalAccessToken;
+    private HttpClient _httpClient;
+    private string _organization;
+    private string _personalAccessToken;
 
     public AzureDevOpsRestClient(
         ILogger<AzureDevOpsRestClient> logger,
@@ -25,14 +25,28 @@ public class AzureDevOpsRestClient
         _organization = organization;
         _personalAccessToken = personalAccessToken;
 
+        InitializeHttpClient(organization, personalAccessToken);
+    }
+
+    private void InitializeHttpClient(string organization, string personalAccessToken)
+    {
+        _httpClient?.Dispose();
         _httpClient = new HttpClient
         {
-            BaseAddress = new Uri($"https://{organization}.visualstudio.com/")
+            BaseAddress = new Uri($"https://dev.azure.com/{organization}/")
         };
 
         var authToken = Convert.ToBase64String(Encoding.ASCII.GetBytes($":{personalAccessToken}"));
         _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Basic", authToken);
         _httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+    }
+
+    public void UpdateConfiguration(string organization, string personalAccessToken)
+    {
+        _organization = organization;
+        _personalAccessToken = personalAccessToken;
+        InitializeHttpClient(organization, personalAccessToken);
+        _logger.LogInformation("Updated REST client configuration for organization: {Organization}", organization);
     }
 
     /// <summary>
@@ -550,42 +564,90 @@ public class AzureDevOpsRestClient
     {
         try
         {
-            _logger.LogInformation("Fetching repository structure for {RepositoryId} on branch {Branch}",
-                repositoryId, branch);
+            _logger.LogInformation("========================================");
+            _logger.LogInformation("RAG INDEXING: Fetching repository structure");
+            _logger.LogInformation("Repository ID: {RepositoryId}", repositoryId);
+            _logger.LogInformation("Branch: {Branch}", branch);
+            _logger.LogInformation("Scope Path: {ScopePath}", scopePath);
 
             var url = $"{project}/_apis/git/repositories/{repositoryId}/items?scopePath={Uri.EscapeDataString(scopePath)}&recursionLevel=Full&versionDescriptor.version={branch}&api-version=7.1";
+            _logger.LogInformation("API URL: {Url}", url);
+
+            _logger.LogInformation("Calling Azure DevOps API...");
             var response = await _httpClient.GetAsync(url);
-            response.EnsureSuccessStatusCode();
+
+            _logger.LogInformation("Response Status: {StatusCode}", response.StatusCode);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                var errorContent = await response.Content.ReadAsStringAsync();
+                _logger.LogError("API Error Response: {Error}", errorContent);
+                response.EnsureSuccessStatusCode();
+            }
 
             var content = await response.Content.ReadAsStringAsync();
+            _logger.LogInformation("Response Content Length: {Length} bytes", content.Length);
+
             var data = JsonSerializer.Deserialize<JsonElement>(content);
 
             var files = new List<string>();
+            int totalItems = 0;
+            int folders = 0;
 
             if (data.TryGetProperty("value", out var items))
             {
                 foreach (var item in items.EnumerateArray())
                 {
-                    if (item.TryGetProperty("isFolder", out var isFolder) && !isFolder.GetBoolean())
+                    totalItems++;
+
+                    if (item.TryGetProperty("isFolder", out var isFolder))
                     {
-                        if (item.TryGetProperty("path", out var pathProp))
+                        bool isFolderValue = isFolder.GetBoolean();
+
+                        if (isFolderValue)
                         {
-                            var path = pathProp.GetString() ?? string.Empty;
-                            if (!string.IsNullOrEmpty(path))
+                            folders++;
+                            if (item.TryGetProperty("path", out var folderPath))
                             {
-                                files.Add(path);
+                                _logger.LogDebug("Found folder: {Path}", folderPath.GetString());
+                            }
+                        }
+                        else
+                        {
+                            if (item.TryGetProperty("path", out var pathProp))
+                            {
+                                var path = pathProp.GetString() ?? string.Empty;
+                                if (!string.IsNullOrEmpty(path))
+                                {
+                                    files.Add(path);
+                                    _logger.LogDebug("Found file: {Path}", path);
+                                }
                             }
                         }
                     }
                 }
             }
+            else
+            {
+                _logger.LogWarning("Response does not contain 'value' property");
+                _logger.LogWarning("Response: {Response}", content.Length > 500 ? content.Substring(0, 500) + "..." : content);
+            }
 
-            _logger.LogInformation("Found {FileCount} files in repository {RepositoryId}", files.Count, repositoryId);
+            _logger.LogInformation("RAG INDEXING: Summary");
+            _logger.LogInformation("  Total items: {Total}", totalItems);
+            _logger.LogInformation("  Folders: {Folders}", folders);
+            _logger.LogInformation("  Files: {Files}", files.Count);
+            _logger.LogInformation("========================================");
+
             return files;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error fetching repository items for {RepositoryId}", repositoryId);
+            _logger.LogError(ex, "RAG INDEXING ERROR: Failed to fetch repository items");
+            _logger.LogError("  Repository: {RepositoryId}", repositoryId);
+            _logger.LogError("  Branch: {Branch}", branch);
+            _logger.LogError("  Error: {Message}", ex.Message);
+            _logger.LogError("========================================");
             return new List<string>();
         }
     }

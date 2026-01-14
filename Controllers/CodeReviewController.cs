@@ -13,16 +13,19 @@ public class CodeReviewController : ControllerBase
 {
     private readonly CodeReviewAgentService _codeReviewAgent;
     private readonly AzureDevOpsMcpClient _adoClient;
+    private readonly AdoConfigurationService _adoConfig;
     private readonly ILogger<CodeReviewController> _logger;
     private static ReviewResult? _currentReview;
 
     public CodeReviewController(
         CodeReviewAgentService codeReviewAgent,
         AzureDevOpsMcpClient adoClient,
+        AdoConfigurationService adoConfig,
         ILogger<CodeReviewController> logger)
     {
         _codeReviewAgent = codeReviewAgent;
         _adoClient = adoClient;
+        _adoConfig = adoConfig;
         _logger = logger;
     }
 
@@ -122,6 +125,15 @@ public class CodeReviewController : ControllerBase
     {
         try
         {
+            // Check if configuration is valid
+            if (!_adoConfig.IsConfigured)
+            {
+                return Unauthorized(new {
+                    error = "Azure DevOps not configured. Please provide your Personal Access Token.",
+                    requiresConfig = true
+                });
+            }
+
             _logger.LogInformation("Fetching active PRs for {Project}/{Repository}", project, repository);
 
             // Get active pull requests from ADO
@@ -129,10 +141,25 @@ public class CodeReviewController : ControllerBase
 
             return Ok(prs);
         }
+        catch (HttpRequestException ex) when (ex.Message.Contains("401") || ex.Message.Contains("Unauthorized"))
+        {
+            _logger.LogError(ex, "Authentication error fetching pull requests");
+            return Unauthorized(new {
+                error = "Authentication failed. Your Personal Access Token may have expired or doesn't have access to this organization/project.",
+                requiresConfig = true
+            });
+        }
+        catch (HttpRequestException ex) when (ex.Message.Contains("404") || ex.Message.Contains("Not Found"))
+        {
+            _logger.LogError(ex, "Project or repository not found");
+            return NotFound(new {
+                error = $"Project '{project}' or repository '{repository}' not found."
+            });
+        }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error fetching pull requests");
-            return StatusCode(500, new { error = ex.Message });
+            return StatusCode(500, new { error = $"Failed to fetch pull requests: {ex.Message}" });
         }
     }
 
@@ -175,6 +202,58 @@ public class CodeReviewController : ControllerBase
             return StatusCode(500, new { error = ex.Message });
         }
     }
+
+    [HttpGet("config/status")]
+    public IActionResult GetConfigStatus()
+    {
+        return Ok(new {
+            isConfigured = _adoConfig.IsConfigured,
+            organization = _adoConfig.Organization
+        });
+    }
+
+    [HttpPost("config/validate")]
+    public async Task<IActionResult> ValidateConfig([FromBody] ConfigRequest request)
+    {
+        try
+        {
+            var (isValid, errorMessage) = await _adoConfig.ValidateAndConfigureAsync(request.Organization, request.PersonalAccessToken);
+
+            if (isValid)
+            {
+                // Reinitialize ADO client with new credentials
+                _adoClient.UpdateConfiguration(request.Organization, request.PersonalAccessToken);
+
+                return Ok(new {
+                    success = true,
+                    message = "Configuration validated successfully",
+                    organization = request.Organization
+                });
+            }
+            else
+            {
+                return BadRequest(new {
+                    success = false,
+                    error = errorMessage
+                });
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error validating configuration");
+            return StatusCode(500, new {
+                success = false,
+                error = $"Validation error: {ex.Message}"
+            });
+        }
+    }
+
+    [HttpPost("config/clear")]
+    public IActionResult ClearConfig()
+    {
+        _adoConfig.ClearConfiguration();
+        return Ok(new { success = true, message = "Configuration cleared" });
+    }
 }
 
 public class ReviewRequest
@@ -187,6 +266,12 @@ public class ReviewRequest
 public class PostCommentRequest
 {
     public string CommentId { get; set; } = "";
+}
+
+public class ConfigRequest
+{
+    public string Organization { get; set; } = "";
+    public string PersonalAccessToken { get; set; } = "";
 }
 
 public class ReviewResult

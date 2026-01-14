@@ -539,9 +539,53 @@
     </style>
 </head>
 <body>
-    <div class="container">
+    <!-- Login/Configuration Page -->
+    <div id="loginContainer" class="container" style="display:none;">
+        <div style="max-width: 500px; margin: 100px auto; background: #fff; padding: 40px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1);">
+            <h1 style="text-align: center; margin-bottom: 30px;">🤖 Code Review Agent</h1>
+            <h2 style="font-size: 18px; margin-bottom: 20px; color: #666;">Configure Azure DevOps Access</h2>
+
+            <div id="loginError" class="error" style="display: none; margin-bottom: 20px;"></div>
+
+            <div style="margin-bottom: 20px;">
+                <label style="display: block; margin-bottom: 8px; font-weight: 600;">Organization Name:</label>
+                <input type="text" id="organizationInput" value="Skype" placeholder="e.g., SCC or mycompany"
+                       style="width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px;">
+                <p style="font-size: 12px; color: #666; margin-top: 5px;">Your Azure DevOps organization name from the URL (dev.azure.com/<strong>organization</strong>)</p>
+            </div>
+
+            <div style="margin-bottom: 20px;">
+                <label style="display: block; margin-bottom: 8px; font-weight: 600;">Personal Access Token:</label>
+                <input type="password" id="patInput" placeholder="Enter your Azure DevOps PAT"
+                       style="width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px;">
+                <p style="font-size: 12px; color: #666; margin-top: 5px;">
+                    Required scopes: <strong>Code (Read)</strong><br>
+                    <a href="https://dev.azure.com/_usersSettings/tokens" target="_blank" style="color: #0078d4;">Create a new PAT</a>
+                </p>
+            </div>
+
+            <button id="loginBtn" onclick="validateAndLogin()" style="width: 100%; padding: 12px; font-size: 16px;">
+                Continue
+            </button>
+
+            <div style="margin-top: 20px; padding: 15px; background: #f8f9fa; border-radius: 4px; font-size: 12px; color: #666;">
+                <strong>Note:</strong> Your credentials are validated against Azure DevOps and stored only in your browser session. They are never saved to disk.
+            </div>
+        </div>
+    </div>
+
+    <!-- Main Application -->
+    <div id="mainContainer" class="container" style="display:none;">
         <header>
-            <h1>🤖 AI Code Review Agent</h1>
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <h1>🤖 AI Code Review Agent</h1>
+                <button onclick="logout()" style="background: #6c757d; padding: 8px 16px; font-size: 13px;">
+                    Logout
+                </button>
+            </div>
+            <div style="margin: 10px 0; padding: 10px; background: #e7f3ff; border-radius: 4px; font-size: 13px;">
+                <strong>Organization:</strong> <span id="currentOrg"></span>
+            </div>
             <div class="input-group">
                 <select id="project" onchange="onProjectChange()">
                     <option value="">Select Project...</option>
@@ -603,10 +647,94 @@
         let selectedProject = '';
         let selectedRepository = '';
 
-        // Load projects on page load
+        // Check configuration status on page load
         window.addEventListener('DOMContentLoaded', async () => {
-            await loadProjects();
+            await checkConfigStatus();
         });
+
+        async function checkConfigStatus() {
+            try {
+                const response = await fetch('/api/CodeReview/config/status');
+                const status = await response.json();
+
+                if (status.isConfigured) {
+                    // Already configured, show main app
+                    document.getElementById('currentOrg').textContent = status.organization;
+                    document.getElementById('mainContainer').style.display = 'block';
+                    await loadProjects();
+                } else {
+                    // Not configured, show login page
+                    document.getElementById('loginContainer').style.display = 'block';
+                }
+            } catch (error) {
+                console.error('Error checking config status:', error);
+                // Show login page on error
+                document.getElementById('loginContainer').style.display = 'block';
+            }
+        }
+
+        async function validateAndLogin() {
+            const organization = document.getElementById('organizationInput').value.trim();
+            const pat = document.getElementById('patInput').value.trim();
+            const loginBtn = document.getElementById('loginBtn');
+            const loginError = document.getElementById('loginError');
+
+            // Validate inputs
+            if (!organization || !pat) {
+                showLoginError('Please fill in both organization and Personal Access Token');
+                return;
+            }
+
+            loginBtn.disabled = true;
+            loginBtn.textContent = 'Validating...';
+            loginError.style.display = 'none';
+
+            try {
+                const response = await fetch('/api/CodeReview/config/validate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        organization: organization,
+                        personalAccessToken: pat
+                    })
+                });
+
+                const result = await response.json();
+
+                if (response.ok && result.success) {
+                    // Success - switch to main app
+                    document.getElementById('loginContainer').style.display = 'none';
+                    document.getElementById('mainContainer').style.display = 'block';
+                    document.getElementById('currentOrg').textContent = organization;
+                    await loadProjects();
+                } else {
+                    showLoginError(result.error || 'Failed to validate credentials');
+                }
+            } catch (error) {
+                showLoginError('Network error: ' + error.message);
+            } finally {
+                loginBtn.disabled = false;
+                loginBtn.textContent = 'Continue';
+            }
+        }
+
+        function showLoginError(message) {
+            const loginError = document.getElementById('loginError');
+            loginError.textContent = message;
+            loginError.style.display = 'block';
+        }
+
+        async function logout() {
+            try {
+                await fetch('/api/CodeReview/config/clear', { method: 'POST' });
+                document.getElementById('mainContainer').style.display = 'none';
+                document.getElementById('loginContainer').style.display = 'block';
+                document.getElementById('organizationInput').value = 'Skype';
+                document.getElementById('patInput').value = '';
+            } catch (error) {
+                console.error('Error logging out:', error);
+            }
+        }
 
         async function loadProjects() {
             try {
@@ -677,10 +805,22 @@
 
             try {
                 document.getElementById('loading').style.display = 'block';
+                hideError();
                 const response = await fetch(`/api/CodeReview/pullrequests/${selectedProject}/${selectedRepository}`);
 
                 if (!response.ok) {
-                    throw new Error('Failed to load pull requests');
+                    const errorData = await response.json().catch(() => ({}));
+
+                    if (response.status === 401 || errorData.requiresConfig) {
+                        // Token expired or invalid - redirect to login
+                        showError(errorData.error || 'Your session has expired. Please log in again.');
+                        setTimeout(() => logout(), 2000);
+                        return;
+                    } else if (response.status === 404) {
+                        throw new Error(errorData.error || 'Project or repository not found. Please check the names.');
+                    } else {
+                        throw new Error(errorData.error || 'Failed to load pull requests');
+                    }
                 }
 
                 const prs = await response.json();
@@ -689,7 +829,7 @@
                 prList.innerHTML = '';
 
                 if (prs.length === 0) {
-                    prList.innerHTML = '<p style="color: #666;">No active pull requests found.</p>';
+                    prList.innerHTML = '<p style="color: #666;">No active pull requests found in this repository.</p>';
                 } else {
                     prs.forEach(pr => {
                         const prItem = createPRItem(pr);
@@ -699,7 +839,7 @@
 
                 document.getElementById('prListContainer').style.display = 'block';
             } catch (error) {
-                showError('Failed to load pull requests: ' + error.message);
+                showError(error.message);
             } finally {
                 document.getElementById('loading').style.display = 'none';
             }
