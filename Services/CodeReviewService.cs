@@ -11,17 +11,20 @@ public class CodeReviewService
     private readonly ILogger<CodeReviewService> _logger;
     private readonly CodeReviewOrchestrator _orchestrator;
     private readonly AzureDevOpsMcpClient _adoClient;
+    private readonly CodebaseContextService _codebaseContextService;
 
     public CodeReviewService(
         IChatClient chatClient,
         ILogger<CodeReviewService> logger,
         CodeReviewOrchestrator orchestrator,
-        AzureDevOpsMcpClient adoClient)
+        AzureDevOpsMcpClient adoClient,
+        CodebaseContextService codebaseContextService)
     {
         _chatClient = chatClient;
         _logger = logger;
         _orchestrator = orchestrator;
         _adoClient = adoClient;
+        _codebaseContextService = codebaseContextService;
     }
 
     public async Task<List<CodeReviewComment>> ReviewPullRequestAsync(
@@ -36,11 +39,53 @@ public class CodeReviewService
         var branch = pullRequest.TargetBranch.Replace("refs/heads/", "");
         var repoStructure = await _adoClient.GetRepositoryStructureAsync(project, repository, branch);
 
-        // Build codebase context summary
-        var codebaseContext = BuildCodebaseContext(repoStructure, files);
+        // Build basic codebase context summary
+        var basicContext = BuildCodebaseContext(repoStructure, files);
 
-        _logger.LogInformation("Codebase context built with {FileCount} total files, reviewing {ChangedFileCount} changed files",
+        _logger.LogInformation("Basic codebase context built with {FileCount} total files, reviewing {ChangedFileCount} changed files",
             repoStructure.Count, files.Count);
+
+        // Check if RAG indexing is available
+        string codebaseContext;
+        if (_codebaseContextService.IsRepositoryIndexed(repository))
+        {
+            _logger.LogInformation("╔════════════════════════════════════════════════════════════╗");
+            _logger.LogInformation("║ RAG CONTEXT: Repository is indexed, using semantic context ║");
+            _logger.LogInformation("╚════════════════════════════════════════════════════════════╝");
+            _logger.LogInformation("Repository '{Repository}' has {ChunkCount} indexed chunks",
+                repository, _codebaseContextService.GetChunkCount(repository));
+
+            // Build RAG-enhanced context for each file
+            var ragContextBuilder = new StringBuilder();
+            ragContextBuilder.AppendLine(basicContext);
+            ragContextBuilder.AppendLine();
+            ragContextBuilder.AppendLine("=== RAG-Enhanced Semantic Context ===");
+
+            foreach (var file in files)
+            {
+                _logger.LogInformation("Building RAG context for file: {FilePath}", file.Path);
+                var fileRagContext = await _codebaseContextService.BuildReviewContextAsync(
+                    file, pullRequest, project, repository);
+
+                if (!string.IsNullOrEmpty(fileRagContext))
+                {
+                    ragContextBuilder.AppendLine($"\n--- Context for {file.Path} ---");
+                    ragContextBuilder.AppendLine(fileRagContext);
+                }
+            }
+
+            codebaseContext = ragContextBuilder.ToString();
+            _logger.LogInformation("RAG context built: {Length} total characters", codebaseContext.Length);
+        }
+        else
+        {
+            _logger.LogInformation("╔════════════════════════════════════════════════════════════╗");
+            _logger.LogInformation("║ RAG CONTEXT: Repository NOT indexed                        ║");
+            _logger.LogInformation("╚════════════════════════════════════════════════════════════╝");
+            _logger.LogInformation("To enable RAG context, call POST /api/codereview/index first");
+            _logger.LogInformation("Using basic directory-based context instead");
+            codebaseContext = basicContext;
+        }
 
         // Use orchestrator to route reviews to language-specific agents
         var comments = await _orchestrator.ReviewFilesAsync(files, codebaseContext);

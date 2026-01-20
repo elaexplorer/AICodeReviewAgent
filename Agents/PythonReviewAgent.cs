@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Diagnostics;
 using CodeReviewAgent.Models;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.AI;
@@ -111,14 +112,63 @@ public class PythonReviewAgent : ILanguageReviewAgent
                 6. **Python-Specific**: Proper use of context managers, generators, decorators, type hints
                 """;
 
+            // Log LLM request details
+            _logger.LogInformation("╔════════════════════════════════════════════════════════════╗");
+            _logger.LogInformation("║ LLM REQUEST: Python Code Review Agent                      ║");
+            _logger.LogInformation("╚════════════════════════════════════════════════════════════╝");
+            _logger.LogInformation("📤 SENDING TO LLM:");
+            _logger.LogInformation("   Agent: {AgentName}", "PythonReviewAgent");
+            _logger.LogInformation("   File: {FilePath}", file.Path);
+            _logger.LogInformation("   Prompt length: {Length} chars", prompt.Length);
+            _logger.LogInformation("   Diff length: {DiffLength} chars", file.UnifiedDiff?.Length ?? 0);
+            _logger.LogInformation("   File content length: {ContentLength} chars", file.Content?.Length ?? 0);
+            _logger.LogInformation("   Codebase context included: {HasContext}", !string.IsNullOrEmpty(codebaseContext));
+            _logger.LogInformation("   Codebase context length: {ContextLength} chars", codebaseContext?.Length ?? 0);
+            _logger.LogDebug("📝 FULL PROMPT:\n{Prompt}", prompt);
+
             // Use AIAgent.RunAsync to execute the agent
+            var stopwatch = Stopwatch.StartNew();
             var response = await _agent.RunAsync(prompt);
+            stopwatch.Stop();
+
             var responseText = response.Text;
 
-            // Parse the JSON response
-            var comments = ParseReviewComments(responseText, file.Path);
+            // Log LLM response details
+            _logger.LogInformation("╔════════════════════════════════════════════════════════════╗");
+            _logger.LogInformation("║ LLM RESPONSE: Python Code Review Agent                     ║");
+            _logger.LogInformation("╚════════════════════════════════════════════════════════════╝");
+            _logger.LogInformation("📥 RECEIVED FROM LLM:");
+            _logger.LogInformation("   Response length: {Length} chars", responseText?.Length ?? 0);
+            _logger.LogInformation("   ⏱️  Time taken: {ElapsedMs} ms ({ElapsedSec:F2} seconds)",
+                stopwatch.ElapsedMilliseconds, stopwatch.Elapsed.TotalSeconds);
 
-            _logger.LogInformation("Found {CommentCount} review comments for {FilePath}",
+            // Log token usage if available
+            if (response.Usage != null)
+            {
+                _logger.LogInformation("📊 TOKEN USAGE:");
+                _logger.LogInformation("   Input tokens: {InputTokens}", response.Usage.InputTokenCount ?? 0);
+                _logger.LogInformation("   Output tokens: {OutputTokens}", response.Usage.OutputTokenCount ?? 0);
+                _logger.LogInformation("   Total tokens: {TotalTokens}",
+                    (response.Usage.InputTokenCount ?? 0) + (response.Usage.OutputTokenCount ?? 0));
+
+                // Estimate cost (approximate pricing for GPT-4)
+                var inputCost = (response.Usage.InputTokenCount ?? 0) * 0.00003m;
+                var outputCost = (response.Usage.OutputTokenCount ?? 0) * 0.00006m;
+                _logger.LogInformation("   💰 Estimated cost: ${TotalCost:F4} (input: ${InputCost:F4}, output: ${OutputCost:F4})",
+                    inputCost + outputCost, inputCost, outputCost);
+            }
+            else
+            {
+                _logger.LogInformation("📊 TOKEN USAGE: Not available from agent response");
+            }
+
+            _logger.LogDebug("📝 FULL LLM RESPONSE:\n{Response}", responseText);
+            _logger.LogInformation("════════════════════════════════════════════════════════════");
+
+            // Parse the JSON response
+            var comments = ParseReviewComments(responseText ?? "[]", file.Path);
+
+            _logger.LogInformation("✅ Found {CommentCount} review comments for {FilePath}",
                 comments.Count, file.Path);
 
             return comments;

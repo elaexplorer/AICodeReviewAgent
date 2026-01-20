@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Diagnostics;
 using CodeReviewAgent.Agents;
 using CodeReviewAgent.Models;
 using Microsoft.Extensions.Logging;
@@ -149,8 +150,55 @@ public class CodeReviewOrchestrator
                 new(ChatRole.User, prompt)
             };
 
+            // Log LLM request details
+            _logger.LogInformation("╔════════════════════════════════════════════════════════════╗");
+            _logger.LogInformation("║ LLM REQUEST: General Code Review                           ║");
+            _logger.LogInformation("╚════════════════════════════════════════════════════════════╝");
+            _logger.LogInformation("📤 SENDING TO LLM:");
+            _logger.LogInformation("   File: {FilePath}", file.Path);
+            _logger.LogInformation("   System prompt length: {Length} chars", messages[0].Text?.Length ?? 0);
+            _logger.LogInformation("   User prompt length: {Length} chars", prompt.Length);
+            _logger.LogInformation("   Total prompt length: {Length} chars", (messages[0].Text?.Length ?? 0) + prompt.Length);
+            _logger.LogInformation("   Codebase context included: {HasContext}", !string.IsNullOrEmpty(codebaseContext));
+            _logger.LogDebug("📝 FULL USER PROMPT:\n{Prompt}", prompt);
+
+            var stopwatch = Stopwatch.StartNew();
             ChatResponse response = await _chatClient.GetResponseAsync(messages);
+            stopwatch.Stop();
+
             var responseText = response.Text ?? "[]";
+
+            // Log LLM response details
+            _logger.LogInformation("╔════════════════════════════════════════════════════════════╗");
+            _logger.LogInformation("║ LLM RESPONSE: General Code Review                          ║");
+            _logger.LogInformation("╚════════════════════════════════════════════════════════════╝");
+            _logger.LogInformation("📥 RECEIVED FROM LLM:");
+            _logger.LogInformation("   Response length: {Length} chars", responseText.Length);
+            _logger.LogInformation("   ⏱️  Time taken: {ElapsedMs} ms ({ElapsedSec:F2} seconds)",
+                stopwatch.ElapsedMilliseconds, stopwatch.Elapsed.TotalSeconds);
+
+            // Log token usage if available
+            if (response.Usage != null)
+            {
+                _logger.LogInformation("📊 TOKEN USAGE:");
+                _logger.LogInformation("   Input tokens: {InputTokens}", response.Usage.InputTokenCount ?? 0);
+                _logger.LogInformation("   Output tokens: {OutputTokens}", response.Usage.OutputTokenCount ?? 0);
+                _logger.LogInformation("   Total tokens: {TotalTokens}",
+                    (response.Usage.InputTokenCount ?? 0) + (response.Usage.OutputTokenCount ?? 0));
+
+                // Estimate cost (approximate pricing for GPT-4)
+                var inputCost = (response.Usage.InputTokenCount ?? 0) * 0.00003m; // $0.03 per 1K input
+                var outputCost = (response.Usage.OutputTokenCount ?? 0) * 0.00006m; // $0.06 per 1K output
+                _logger.LogInformation("   💰 Estimated cost: ${TotalCost:F4} (input: ${InputCost:F4}, output: ${OutputCost:F4})",
+                    inputCost + outputCost, inputCost, outputCost);
+            }
+            else
+            {
+                _logger.LogInformation("📊 TOKEN USAGE: Not available from response");
+            }
+
+            _logger.LogDebug("📝 FULL LLM RESPONSE:\n{Response}", responseText);
+            _logger.LogInformation("════════════════════════════════════════════════════════════");
 
             return ParseReviewComments(responseText, file.Path);
         }

@@ -600,28 +600,31 @@ public class AzureDevOpsRestClient
                 {
                     totalItems++;
 
+                    // Check if it's a folder - items without isFolder property are treated as files
+                    bool isFolderValue = false;
                     if (item.TryGetProperty("isFolder", out var isFolder))
                     {
-                        bool isFolderValue = isFolder.GetBoolean();
+                        isFolderValue = isFolder.GetBoolean();
+                    }
 
-                        if (isFolderValue)
+                    if (isFolderValue)
+                    {
+                        folders++;
+                        if (item.TryGetProperty("path", out var folderPath))
                         {
-                            folders++;
-                            if (item.TryGetProperty("path", out var folderPath))
-                            {
-                                _logger.LogDebug("Found folder: {Path}", folderPath.GetString());
-                            }
+                            _logger.LogDebug("Found folder: {Path}", folderPath.GetString());
                         }
-                        else
+                    }
+                    else
+                    {
+                        // It's a file - get its path
+                        if (item.TryGetProperty("path", out var pathProp))
                         {
-                            if (item.TryGetProperty("path", out var pathProp))
+                            var path = pathProp.GetString() ?? string.Empty;
+                            if (!string.IsNullOrEmpty(path))
                             {
-                                var path = pathProp.GetString() ?? string.Empty;
-                                if (!string.IsNullOrEmpty(path))
-                                {
-                                    files.Add(path);
-                                    _logger.LogDebug("Found file: {Path}", path);
-                                }
+                                files.Add(path);
+                                _logger.LogDebug("Found file: {Path}", path);
                             }
                         }
                     }

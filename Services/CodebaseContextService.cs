@@ -29,6 +29,51 @@ public class CodebaseContextService
     }
 
     /// <summary>
+    /// Check if a repository has been indexed
+    /// </summary>
+    public bool IsRepositoryIndexed(string repositoryId)
+    {
+        return _inMemoryStore.ContainsKey(repositoryId) && _inMemoryStore[repositoryId].Count > 0;
+    }
+
+    /// <summary>
+    /// Get the number of chunks indexed for a repository
+    /// </summary>
+    public int GetChunkCount(string repositoryId)
+    {
+        return _inMemoryStore.TryGetValue(repositoryId, out var chunks) ? chunks.Count : 0;
+    }
+
+    /// <summary>
+    /// Get a summary of what's indexed (for debugging/logging)
+    /// </summary>
+    public string GetIndexSummary(string repositoryId)
+    {
+        if (!_inMemoryStore.TryGetValue(repositoryId, out var chunks) || chunks.Count == 0)
+        {
+            return $"Repository '{repositoryId}' is not indexed.";
+        }
+
+        var files = chunks.Select(c => c.FilePath).Distinct().ToList();
+        var summary = new StringBuilder();
+        summary.AppendLine($"Repository '{repositoryId}' Index Summary:");
+        summary.AppendLine($"  Total chunks: {chunks.Count}");
+        summary.AppendLine($"  Total files: {files.Count}");
+        summary.AppendLine($"  Vector dimension: {(chunks.FirstOrDefault()?.Embedding.Length ?? 0)}");
+        summary.AppendLine($"  Files indexed:");
+        foreach (var file in files.Take(20))
+        {
+            var fileChunks = chunks.Count(c => c.FilePath == file);
+            summary.AppendLine($"    - {file} ({fileChunks} chunks)");
+        }
+        if (files.Count > 20)
+        {
+            summary.AppendLine($"    ... and {files.Count - 20} more files");
+        }
+        return summary.ToString();
+    }
+
+    /// <summary>
     /// Index the entire repository for semantic search
     /// Run this once when PR is opened, or periodically
     /// </summary>
@@ -148,6 +193,31 @@ public class CodebaseContextService
         _logger.LogInformation("  Vector dimension: {Dim}", chunks.Any() ? chunks[0].Embedding.Length : 0);
         _logger.LogInformation("════════════════════════════════════════════════════════════");
 
+        // Log storage details
+        _logger.LogInformation("📦 STORAGE DETAILS:");
+        _logger.LogInformation("  Storage type: In-Memory Dictionary<string, List<CodeChunk>>");
+        _logger.LogInformation("  Storage key: Repository ID = '{RepositoryId}'", repositoryId);
+        _logger.LogInformation("  Total repositories in store: {Count}", _inMemoryStore.Count);
+        _logger.LogInformation("  Memory estimate: ~{Size} KB (embeddings only)",
+            chunks.Sum(c => c.Embedding.Length * sizeof(float)) / 1024);
+
+        // Log sample embedding vector
+        if (chunks.Any() && chunks[0].Embedding.Length > 0)
+        {
+            var sampleEmbedding = chunks[0].Embedding;
+            _logger.LogInformation("📐 SAMPLE EMBEDDING VECTOR (first chunk):");
+            _logger.LogInformation("  File: {FilePath}", chunks[0].FilePath);
+            _logger.LogInformation("  Vector dimension: {Dim}", sampleEmbedding.Length);
+            _logger.LogInformation("  First 10 values: [{Values}]",
+                string.Join(", ", sampleEmbedding.Take(10).Select(v => v.ToString("F6"))));
+            _logger.LogInformation("  Last 10 values: [{Values}]",
+                string.Join(", ", sampleEmbedding.TakeLast(10).Select(v => v.ToString("F6"))));
+            _logger.LogInformation("  Min value: {Min:F6}", sampleEmbedding.Min());
+            _logger.LogInformation("  Max value: {Max:F6}", sampleEmbedding.Max());
+            _logger.LogInformation("  Mean value: {Mean:F6}", sampleEmbedding.Average());
+        }
+        _logger.LogInformation("════════════════════════════════════════════════════════════");
+
         return indexed;
     }
 
@@ -161,66 +231,119 @@ public class CodebaseContextService
     {
         var context = new StringBuilder();
 
+        _logger.LogInformation("╔════════════════════════════════════════════════════════════╗");
+        _logger.LogInformation("║ RAG RETRIEVAL: Starting Context Search                     ║");
+        _logger.LogInformation("╚════════════════════════════════════════════════════════════╝");
+        _logger.LogInformation("Target file: {FilePath}", file.Path);
+
         // Check if repository is indexed
         if (!_inMemoryStore.ContainsKey(repositoryId) || _inMemoryStore[repositoryId].Count == 0)
         {
-            _logger.LogWarning("Repository {RepositoryId} is not indexed", repositoryId);
+            _logger.LogWarning("⚠️  Repository {RepositoryId} is NOT indexed!", repositoryId);
+            _logger.LogWarning("   Call IndexRepositoryAsync() first to index the codebase.");
             return string.Empty;
         }
 
+        _logger.LogInformation("✅ Repository is indexed. Storage key: '{RepositoryId}'", repositoryId);
+        _logger.LogInformation("   Available chunks: {Count}", _inMemoryStore[repositoryId].Count);
+
         // Build search query from file content and changes
+        _logger.LogInformation("Step 1: Building search query from PR diff...");
         var searchQuery = BuildSearchQuery(file);
 
         if (string.IsNullOrEmpty(searchQuery))
         {
-            _logger.LogInformation("Search query is empty for {FilePath}", file.Path);
+            _logger.LogInformation("⚠️  Search query is empty for {FilePath} - no added lines in diff", file.Path);
             return string.Empty;
         }
 
-        _logger.LogInformation("Search Query ({Length} chars): {Query}",
-            searchQuery.Length, searchQuery.Length > 200 ? searchQuery.Substring(0, 200) + "..." : searchQuery);
+        _logger.LogInformation("🔍 SEARCH QUERY CONSTRUCTED:");
+        _logger.LogInformation("   Length: {Length} characters", searchQuery.Length);
+        _logger.LogInformation("   Content: {Query}",
+            searchQuery.Length > 300 ? searchQuery.Substring(0, 300) + "..." : searchQuery);
 
         try
         {
             // Generate embedding for the search query
-            _logger.LogInformation("Generating embedding for search query...");
+            _logger.LogInformation("Step 2: Generating embedding for search query...");
             var queryEmbeddingResponse = await _embeddingGenerator.GenerateAsync(searchQuery);
             var queryVector = queryEmbeddingResponse.Vector.ToArray();
-            _logger.LogInformation("Query embedding generated (dimension: {Dim})", queryVector.Length);
+
+            _logger.LogInformation("📐 QUERY EMBEDDING GENERATED:");
+            _logger.LogInformation("   Vector dimension: {Dim}", queryVector.Length);
+            _logger.LogInformation("   First 5 values: [{Values}]",
+                string.Join(", ", queryVector.Take(5).Select(v => v.ToString("F6"))));
+            _logger.LogInformation("   Vector range: [{Min:F6} to {Max:F6}]", queryVector.Min(), queryVector.Max());
 
             // Semantic search for similar code using cosine similarity
             var chunks = _inMemoryStore[repositoryId];
-            _logger.LogInformation("Searching through {Count} code chunks...", chunks.Count);
+            _logger.LogInformation("Step 3: Calculating cosine similarity against {Count} chunks...", chunks.Count);
 
-            var results = chunks
+            // Calculate all similarities for logging
+            var allSimilarities = chunks
                 .Select(chunk => new
                 {
                     Chunk = chunk,
                     Similarity = CosineSimilarity(queryVector, chunk.Embedding)
                 })
-                .Where(r => r.Similarity > 0.7) // Relevance threshold
                 .OrderByDescending(r => r.Similarity)
+                .ToList();
+
+            // Log similarity distribution
+            _logger.LogInformation("📊 SIMILARITY DISTRIBUTION:");
+            _logger.LogInformation("   Max similarity: {Max:F4}", allSimilarities.First().Similarity);
+            _logger.LogInformation("   Min similarity: {Min:F4}", allSimilarities.Last().Similarity);
+            _logger.LogInformation("   Mean similarity: {Mean:F4}", allSimilarities.Average(s => s.Similarity));
+
+            var aboveThreshold = allSimilarities.Count(s => s.Similarity > 0.7);
+            var above06 = allSimilarities.Count(s => s.Similarity > 0.6 && s.Similarity <= 0.7);
+            var above05 = allSimilarities.Count(s => s.Similarity > 0.5 && s.Similarity <= 0.6);
+            var below05 = allSimilarities.Count(s => s.Similarity <= 0.5);
+
+            _logger.LogInformation("   Chunks with similarity > 0.7 (threshold): {Count}", aboveThreshold);
+            _logger.LogInformation("   Chunks with similarity 0.6-0.7: {Count}", above06);
+            _logger.LogInformation("   Chunks with similarity 0.5-0.6: {Count}", above05);
+            _logger.LogInformation("   Chunks with similarity <= 0.5: {Count}", below05);
+
+            // Top 10 matches regardless of threshold (for debugging)
+            _logger.LogInformation("🔝 TOP 10 MATCHES (before threshold filter):");
+            foreach (var match in allSimilarities.Take(10))
+            {
+                _logger.LogInformation("   {Similarity:F4} - {Location}",
+                    match.Similarity, match.Chunk.Metadata);
+            }
+
+            var results = allSimilarities
+                .Where(r => r.Similarity > 0.7) // Relevance threshold
                 .Take(maxResults)
                 .ToList();
 
-            if (!results.Any())
+            if (results.Count == 0)
             {
-                _logger.LogInformation("No relevant context found for {FilePath} (threshold: 0.7)", file.Path);
+                _logger.LogInformation("❌ No chunks passed the 0.7 similarity threshold for {FilePath}", file.Path);
+                _logger.LogInformation("   Closest match was: {Similarity:F4} at {Location}",
+                    allSimilarities.First().Similarity, allSimilarities.First().Chunk.Metadata);
                 return string.Empty;
             }
 
-            _logger.LogInformation("Found {Count} relevant snippets:", results.Count);
-            foreach (var result in results)
-            {
-                _logger.LogInformation("  - {Location} (similarity: {Similarity:F3})",
-                    result.Chunk.Metadata, result.Similarity);
-            }
+            _logger.LogInformation("✅ RETRIEVAL RESULTS: Found {Count} relevant chunks above threshold", results.Count);
+            _logger.LogInformation("Step 4: Building context from retrieved chunks...");
 
             context.AppendLine("## Relevant Codebase Context");
             context.AppendLine();
 
+            int resultIndex = 1;
             foreach (var result in results)
             {
+                _logger.LogInformation("📄 RETRIEVED CHUNK {Index}:", resultIndex);
+                _logger.LogInformation("   File: {FilePath}", result.Chunk.FilePath);
+                _logger.LogInformation("   Lines: {Start} to {End}", result.Chunk.StartLine, result.Chunk.EndLine);
+                _logger.LogInformation("   Similarity: {Similarity:F4}", result.Similarity);
+                _logger.LogInformation("   Content preview: {Preview}",
+                    result.Chunk.Content.Length > 100
+                        ? result.Chunk.Content.Substring(0, 100).Replace("\n", "\\n") + "..."
+                        : result.Chunk.Content.Replace("\n", "\\n"));
+
                 context.AppendLine($"### Similar code (relevance: {result.Similarity:F2})");
                 context.AppendLine($"Location: {result.Chunk.Metadata}");
                 context.AppendLine("```");
@@ -229,11 +352,14 @@ public class CodebaseContextService
                     : result.Chunk.Content);
                 context.AppendLine("```");
                 context.AppendLine();
+                resultIndex++;
             }
+
+            _logger.LogInformation("════════════════════════════════════════════════════════════");
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error searching for relevant context");
+            _logger.LogError(ex, "❌ Error searching for relevant context");
         }
 
         return context.ToString();
@@ -416,16 +542,36 @@ public class CodebaseContextService
 
     private string BuildSearchQuery(PullRequestFile file)
     {
+        _logger.LogDebug("🔧 BUILD SEARCH QUERY:");
+        _logger.LogDebug("   Input file: {FilePath}", file.Path);
+        _logger.LogDebug("   Diff available: {HasDiff}", !string.IsNullOrEmpty(file.UnifiedDiff));
+
         var queryParts = new List<string>();
 
         // Extract meaningful content from changes
         if (!string.IsNullOrEmpty(file.UnifiedDiff))
         {
-            var diffLines = file.UnifiedDiff.Split('\n')
+            _logger.LogDebug("   Processing unified diff ({Length} chars)...", file.UnifiedDiff.Length);
+
+            var allDiffLines = file.UnifiedDiff.Split('\n');
+            var addedLines = allDiffLines
                 .Where(l => l.StartsWith('+') && !l.StartsWith("+++"))
+                .ToList();
+
+            _logger.LogDebug("   Total lines in diff: {Total}", allDiffLines.Length);
+            _logger.LogDebug("   Added lines (starting with '+'): {Added}", addedLines.Count);
+
+            var diffLines = addedLines
                 .Select(l => l.Substring(1).Trim())
                 .Where(l => !string.IsNullOrWhiteSpace(l) && l.Length > 5)
-                .Take(10); // First 10 added lines
+                .Take(10) // First 10 added lines
+                .ToList();
+
+            _logger.LogDebug("   Selected lines for query (non-empty, >5 chars, max 10): {Count}", diffLines.Count);
+            foreach (var line in diffLines.Take(5))
+            {
+                _logger.LogDebug("     - \"{Line}\"", line.Length > 60 ? line.Substring(0, 60) + "..." : line);
+            }
 
             queryParts.AddRange(diffLines);
         }
@@ -433,9 +579,13 @@ public class CodebaseContextService
         // Add file name context
         var fileName = Path.GetFileNameWithoutExtension(file.Path);
         queryParts.Add($"file {fileName}");
+        _logger.LogDebug("   Added file name context: 'file {FileName}'", fileName);
 
         var query = string.Join(' ', queryParts);
-        return query.Length > 1000 ? query.Substring(0, 1000) : query;
+        var finalQuery = query.Length > 1000 ? query.Substring(0, 1000) : query;
+
+        _logger.LogDebug("   Final query length: {Length} chars (max 1000)", finalQuery.Length);
+        return finalQuery;
     }
 
     private List<string> ParseDependencies(string? content, string filePath)

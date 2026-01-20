@@ -14,18 +14,23 @@ public class CodeReviewController : ControllerBase
     private readonly CodeReviewAgentService _codeReviewAgent;
     private readonly AzureDevOpsMcpClient _adoClient;
     private readonly AdoConfigurationService _adoConfig;
+    private readonly CodebaseContextService _codebaseContextService;
     private readonly ILogger<CodeReviewController> _logger;
     private static ReviewResult? _currentReview;
+    private static readonly HashSet<string> _indexingInProgress = new();
+    private static readonly object _indexingLock = new();
 
     public CodeReviewController(
         CodeReviewAgentService codeReviewAgent,
         AzureDevOpsMcpClient adoClient,
         AdoConfigurationService adoConfig,
+        CodebaseContextService codebaseContextService,
         ILogger<CodeReviewController> logger)
     {
         _codeReviewAgent = codeReviewAgent;
         _adoClient = adoClient;
         _adoConfig = adoConfig;
+        _codebaseContextService = codebaseContextService;
         _logger = logger;
     }
 
@@ -139,7 +144,26 @@ public class CodeReviewController : ControllerBase
             // Get active pull requests from ADO
             var prs = await _adoClient.GetActivePullRequestsAsync(project, repository);
 
-            return Ok(prs);
+            // Trigger background indexing if not already indexed or in progress
+            TriggerBackgroundIndexing(project, repository);
+
+            // Return index status along with PRs
+            var isIndexed = _codebaseContextService.IsRepositoryIndexed(repository);
+            var chunkCount = _codebaseContextService.GetChunkCount(repository);
+            bool isCurrentlyIndexing;
+            lock (_indexingLock)
+            {
+                isCurrentlyIndexing = _indexingInProgress.Contains(repository);
+            }
+
+            return Ok(new {
+                pullRequests = prs,
+                indexStatus = new {
+                    isIndexed = isIndexed,
+                    isIndexing = isCurrentlyIndexing,
+                    chunkCount = chunkCount
+                }
+            });
         }
         catch (HttpRequestException ex) when (ex.Message.Contains("401") || ex.Message.Contains("Unauthorized"))
         {
@@ -161,6 +185,69 @@ public class CodeReviewController : ControllerBase
             _logger.LogError(ex, "Error fetching pull requests");
             return StatusCode(500, new { error = $"Failed to fetch pull requests: {ex.Message}" });
         }
+    }
+
+    /// <summary>
+    /// Triggers background indexing for a repository if not already indexed or in progress
+    /// </summary>
+    private void TriggerBackgroundIndexing(string project, string repository, string branch = "main")
+    {
+        // Skip if already indexed
+        if (_codebaseContextService.IsRepositoryIndexed(repository))
+        {
+            _logger.LogInformation("📦 Repository '{Repository}' is already indexed ({ChunkCount} chunks)",
+                repository, _codebaseContextService.GetChunkCount(repository));
+            return;
+        }
+
+        // Skip if indexing is already in progress
+        lock (_indexingLock)
+        {
+            if (_indexingInProgress.Contains(repository))
+            {
+                _logger.LogInformation("⏳ Indexing already in progress for '{Repository}'", repository);
+                return;
+            }
+            _indexingInProgress.Add(repository);
+        }
+
+        _logger.LogInformation("╔════════════════════════════════════════════════════════════╗");
+        _logger.LogInformation("║ AUTO-INDEX: Starting Background Indexing                   ║");
+        _logger.LogInformation("╚════════════════════════════════════════════════════════════╝");
+        _logger.LogInformation("Repository: {Repository}", repository);
+        _logger.LogInformation("Indexing will run in background while you browse PRs...");
+
+        // Run indexing in background (fire and forget)
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var startTime = DateTime.UtcNow;
+                _logger.LogInformation("🚀 Background indexing started for '{Repository}'", repository);
+
+                var chunksIndexed = await _codebaseContextService.IndexRepositoryAsync(project, repository, branch);
+
+                var duration = DateTime.UtcNow - startTime;
+                _logger.LogInformation("╔════════════════════════════════════════════════════════════╗");
+                _logger.LogInformation("║ AUTO-INDEX: Background Indexing Complete                   ║");
+                _logger.LogInformation("╚════════════════════════════════════════════════════════════╝");
+                _logger.LogInformation("✅ Repository '{Repository}' indexed successfully", repository);
+                _logger.LogInformation("   Chunks indexed: {ChunkCount}", chunksIndexed);
+                _logger.LogInformation("   Duration: {Duration:F1} seconds", duration.TotalSeconds);
+                _logger.LogInformation("   Embeddings are now ready for semantic search!");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "❌ Background indexing failed for '{Repository}'", repository);
+            }
+            finally
+            {
+                lock (_indexingLock)
+                {
+                    _indexingInProgress.Remove(repository);
+                }
+            }
+        });
     }
 
     [HttpPost("comment")]
@@ -254,6 +341,61 @@ public class CodeReviewController : ControllerBase
         _adoConfig.ClearConfiguration();
         return Ok(new { success = true, message = "Configuration cleared" });
     }
+
+    /// <summary>
+    /// Index a repository for RAG-based context retrieval
+    /// This generates embeddings for all code files and stores them for semantic search
+    /// </summary>
+    [HttpPost("index")]
+    public async Task<IActionResult> IndexRepository([FromBody] IndexRequest request)
+    {
+        try
+        {
+            _logger.LogInformation("╔════════════════════════════════════════════════════════════╗");
+            _logger.LogInformation("║ API: Starting Repository Indexing                          ║");
+            _logger.LogInformation("╚════════════════════════════════════════════════════════════╝");
+            _logger.LogInformation("Project: {Project}", request.Project);
+            _logger.LogInformation("Repository: {Repository}", request.Repository);
+            _logger.LogInformation("Branch: {Branch}", request.Branch);
+
+            var indexedCount = await _codebaseContextService.IndexRepositoryAsync(
+                request.Project,
+                request.Repository,
+                request.Branch);
+
+            _logger.LogInformation("✅ Indexing complete: {Count} chunks indexed", indexedCount);
+
+            return Ok(new
+            {
+                success = true,
+                message = $"Repository indexed successfully",
+                chunksIndexed = indexedCount,
+                repositoryId = request.Repository
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "❌ Error indexing repository");
+            return StatusCode(500, new { error = ex.Message });
+        }
+    }
+
+    /// <summary>
+    /// Get RAG indexing status for a repository
+    /// </summary>
+    [HttpGet("index/status/{repositoryId}")]
+    public IActionResult GetIndexStatus(string repositoryId)
+    {
+        var isIndexed = _codebaseContextService.IsRepositoryIndexed(repositoryId);
+        var chunkCount = _codebaseContextService.GetChunkCount(repositoryId);
+
+        return Ok(new
+        {
+            repositoryId = repositoryId,
+            isIndexed = isIndexed,
+            chunkCount = chunkCount
+        });
+    }
 }
 
 public class ReviewRequest
@@ -272,6 +414,13 @@ public class ConfigRequest
 {
     public string Organization { get; set; } = "";
     public string PersonalAccessToken { get; set; } = "";
+}
+
+public class IndexRequest
+{
+    public string Project { get; set; } = "SCC";
+    public string Repository { get; set; } = "";
+    public string Branch { get; set; } = "main";
 }
 
 public class ReviewResult

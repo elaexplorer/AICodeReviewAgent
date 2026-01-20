@@ -20,6 +20,10 @@ var openAiApiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY");
 var azureOpenAiEndpoint = Environment.GetEnvironmentVariable("AZURE_OPENAI_ENDPOINT");
 var azureOpenAiApiKey = Environment.GetEnvironmentVariable("AZURE_OPENAI_API_KEY");
 var azureOpenAiDeployment = Environment.GetEnvironmentVariable("AZURE_OPENAI_DEPLOYMENT") ?? "gpt-4";
+var azureOpenAiEmbeddingDeployment = Environment.GetEnvironmentVariable("AZURE_OPENAI_EMBEDDING_DEPLOYMENT") ?? "text-embedding-ada-002";
+// Support separate endpoint for embeddings (some orgs have different resources for chat vs embeddings)
+var azureOpenAiEmbeddingEndpoint = Environment.GetEnvironmentVariable("AZURE_OPENAI_EMBEDDING_ENDPOINT") ?? azureOpenAiEndpoint;
+var azureOpenAiEmbeddingApiKey = Environment.GetEnvironmentVariable("AZURE_OPENAI_EMBEDDING_API_KEY") ?? azureOpenAiApiKey;
 var adoOrganization = Environment.GetEnvironmentVariable("ADO_ORGANIZATION") ?? "SPOOL";
 var adoPat = Environment.GetEnvironmentVariable("ADO_PAT");
 var mcpServerUrl = Environment.GetEnvironmentVariable("MCP_SERVER_URL") ?? "http://localhost:3000";
@@ -92,14 +96,16 @@ if (hasAzureOpenAI)
     });
 
     // Register embedding generator for RAG
+    Console.WriteLine($"Using embedding model: {azureOpenAiEmbeddingDeployment}");
+    Console.WriteLine($"Embedding endpoint: {azureOpenAiEmbeddingEndpoint}");
     builder.Services.AddSingleton<IEmbeddingGenerator<string, Embedding<float>>>(provider =>
     {
         var azureClient = new AzureOpenAIClient(
-            new Uri(azureOpenAiEndpoint!),
-            new AzureKeyCredential(azureOpenAiApiKey!));
+            new Uri(azureOpenAiEmbeddingEndpoint!),
+            new AzureKeyCredential(azureOpenAiEmbeddingApiKey!));
 
         // Get EmbeddingClient and convert to IEmbeddingGenerator
-        var embeddingClient = azureClient.GetEmbeddingClient("text-embedding-ada-002");
+        var embeddingClient = azureClient.GetEmbeddingClient(azureOpenAiEmbeddingDeployment);
         return embeddingClient.AsIEmbeddingGenerator();
     });
 }
@@ -200,8 +206,8 @@ var codeReviewAgent = app.Services.GetRequiredService<CodeReviewAgentService>();
 if (args.Length == 0 || args.Contains("--web"))
 {
     logger.LogInformation("Starting Code Review Agent in Web UI mode");
-    logger.LogInformation("Open http://localhost:5000 in your browser");
-    app.Run("http://localhost:5000");
+    logger.LogInformation("Open http://localhost:5001 in your browser");
+    app.Run("http://localhost:5001");
     return;
 }
 
