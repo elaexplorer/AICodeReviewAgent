@@ -259,6 +259,14 @@ cp .env.example .env
 nano .env
 ```
 
+**Working Configuration Example:**
+```bash
+# Azure OpenAI Configuration (tested working)
+AZURE_OPENAI_ENDPOINT=https://ela-azureopenai.openai.azure.com/
+AZURE_OPENAI_DEPLOYMENT=gpt-5-mini
+# Note: Ensure your deployment name matches exactly what exists in your Azure OpenAI resource
+```
+
 ### Supported File Types
 
 The agent reviews these file types:
