@@ -195,6 +195,10 @@ builder.Services.AddDistributedMemoryCache();
 builder.Services.AddSingleton<CodebaseCache>();
 builder.Services.AddSingleton<AdoConfigurationService>();
 
+// Add embedding inspection and visualization services
+builder.Services.AddEmbeddingInspection();
+builder.Services.AddEmbeddingVisualization();
+
 builder.Services.AddSingleton(provider =>
     new AzureDevOpsRestClient(
         provider.GetRequiredService<ILogger<AzureDevOpsRestClient>>(),
@@ -281,6 +285,22 @@ app.MapControllers();
 // Get required services
 var logger = app.Services.GetRequiredService<ILogger<Program>>();
 var codeReviewAgent = app.Services.GetRequiredService<CodeReviewAgentService>();
+
+// Check for embedding inspection mode
+if (args.Contains("--inspect-embeddings"))
+{
+    logger.LogInformation("Starting Embedding Inspector mode");
+    await EmbeddingInspectionExtensions.RunEmbeddingInspectionAsync(app.Services, args);
+    return;
+}
+
+// Check for embedding visualization mode
+if (args.Contains("--visualize-embeddings"))
+{
+    logger.LogInformation("Starting Embedding Visualizer mode");
+    await EmbeddingVisualizationExtensions.RunEmbeddingVisualizationAsync(app.Services, args);
+    return;
+}
 
 // Check if running in web mode (no command-line arguments)
 if (args.Length == 0 || args.Contains("--web"))
