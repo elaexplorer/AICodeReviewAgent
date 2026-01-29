@@ -30,3 +30,6 @@ TestResults/
 
 # macOS
 .DS_Store
+
+# Claude settings with secrets
+.claude/settings.local.json

@@ -31,14 +31,26 @@ public class AzureDevOpsRestClient
     private void InitializeHttpClient(string organization, string personalAccessToken)
     {
         _httpClient?.Dispose();
-        _httpClient = new HttpClient
+        
+        // Use SocketsHttpHandler for better proxy compatibility
+        var handler = new SocketsHttpHandler
         {
-            BaseAddress = new Uri($"https://dev.azure.com/{organization}/")
+            UseProxy = true,
+            DefaultProxyCredentials = System.Net.CredentialCache.DefaultCredentials,
+            PreAuthenticate = true,
+            PooledConnectionLifetime = TimeSpan.FromMinutes(2), // Refresh connections to avoid proxy issues
+            PooledConnectionIdleTimeout = TimeSpan.FromMinutes(1)
         };
+        
+        _httpClient = new HttpClient(handler);
+        // Don't set BaseAddress - use full URLs instead to avoid proxy issues
 
         var authToken = Convert.ToBase64String(Encoding.ASCII.GetBytes($":{personalAccessToken}"));
         _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Basic", authToken);
+        _httpClient.DefaultRequestHeaders.Accept.Clear();
         _httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+        _httpClient.DefaultRequestHeaders.Add("User-Agent", "CodeReviewAgent/1.0");
+        _httpClient.Timeout = TimeSpan.FromSeconds(30);
     }
 
     public void UpdateConfiguration(string organization, string personalAccessToken)
@@ -47,6 +59,33 @@ public class AzureDevOpsRestClient
         _personalAccessToken = personalAccessToken;
         InitializeHttpClient(organization, personalAccessToken);
         _logger.LogInformation("Updated REST client configuration for organization: {Organization}", organization);
+    }
+
+    /// <summary>
+    /// Get repository information by name
+    /// </summary>
+    public async Task<RepositoryInfo?> GetRepositoryAsync(string project, string repositoryName)
+    {
+        try
+        {
+            var repoUrl = $"https://dev.azure.com/{_organization}/{project}/_apis/git/repositories/{repositoryName}?api-version=7.1";
+            var repoResponse = await _httpClient.GetAsync(repoUrl);
+            repoResponse.EnsureSuccessStatusCode();
+
+            var repoContent = await repoResponse.Content.ReadAsStringAsync();
+            var repoData = JsonSerializer.Deserialize<JsonElement>(repoContent);
+
+            return new RepositoryInfo
+            {
+                Id = repoData.GetProperty("id").GetString() ?? string.Empty,
+                Name = repoData.GetProperty("name").GetString() ?? string.Empty
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error fetching repository {RepositoryName} in project {Project}", repositoryName, project);
+            return null;
+        }
     }
 
     /// <summary>
@@ -63,7 +102,7 @@ public class AzureDevOpsRestClient
                 pullRequestId, repository, project);
 
             // Get repository ID first
-            var repoUrl = $"{project}/_apis/git/repositories/{repository}?api-version=7.1";
+            var repoUrl = $"https://dev.azure.com/{_organization}/{project}/_apis/git/repositories/{repository}?api-version=7.1";
             var repoResponse = await _httpClient.GetAsync(repoUrl);
             repoResponse.EnsureSuccessStatusCode();
 
@@ -78,7 +117,7 @@ public class AzureDevOpsRestClient
             }
 
             // Get the PR details
-            var prUrl = $"{project}/_apis/git/repositories/{repositoryId}/pullRequests/{pullRequestId}?api-version=7.1";
+            var prUrl = $"https://dev.azure.com/{_organization}/{project}/_apis/git/repositories/{repositoryId}/pullRequests/{pullRequestId}?api-version=7.1";
             var prResponse = await _httpClient.GetAsync(prUrl);
             prResponse.EnsureSuccessStatusCode();
 
@@ -131,7 +170,7 @@ public class AzureDevOpsRestClient
                 pullRequestId, repositoryId);
 
             // Get the PR to find its iterations and merge base
-            var prUrl = $"{project}/_apis/git/repositories/{repositoryId}/pullRequests/{pullRequestId}?api-version=7.1";
+            var prUrl = $"https://dev.azure.com/{_organization}/{project}/_apis/git/repositories/{repositoryId}/pullRequests/{pullRequestId}?api-version=7.1";
             var prResponse = await _httpClient.GetAsync(prUrl);
             prResponse.EnsureSuccessStatusCode();
 
@@ -150,7 +189,7 @@ public class AzureDevOpsRestClient
                 pullRequestId, sourceCommitId, targetCommitId);
 
             // Get the latest iteration (or we could get all iterations)
-            var iterationsUrl = $"{project}/_apis/git/repositories/{repositoryId}/pullRequests/{pullRequestId}/iterations?api-version=7.1";
+            var iterationsUrl = $"https://dev.azure.com/{_organization}/{project}/_apis/git/repositories/{repositoryId}/pullRequests/{pullRequestId}/iterations?api-version=7.1";
             var iterationsResponse = await _httpClient.GetAsync(iterationsUrl);
             iterationsResponse.EnsureSuccessStatusCode();
 
@@ -169,7 +208,7 @@ public class AzureDevOpsRestClient
             var iterationId = latestIteration.GetProperty("id").GetInt32();
 
             // Get changes for this iteration
-            var changesUrl = $"{project}/_apis/git/repositories/{repositoryId}/pullRequests/{pullRequestId}/iterations/{iterationId}/changes?api-version=7.1";
+            var changesUrl = $"https://dev.azure.com/{_organization}/{project}/_apis/git/repositories/{repositoryId}/pullRequests/{pullRequestId}/iterations/{iterationId}/changes?api-version=7.1";
             var changesResponse = await _httpClient.GetAsync(changesUrl);
             changesResponse.EnsureSuccessStatusCode();
 
@@ -219,7 +258,7 @@ public class AzureDevOpsRestClient
                         try
                         {
                             // Get the file content from the base commit
-                            var baseFileUrl = $"{project}/_apis/git/repositories/{repositoryId}/items?path={Uri.EscapeDataString(path)}&versionDescriptor.versionType=commit&versionDescriptor.version={targetCommitId}&$format=text&api-version=7.1";
+                            var baseFileUrl = $"https://dev.azure.com/{_organization}/{project}/_apis/git/repositories/{repositoryId}/items?path={Uri.EscapeDataString(path)}&versionDescriptor.versionType=commit&versionDescriptor.version={targetCommitId}&$format=text&api-version=7.1";
                             var baseFileResponse = await _httpClient.GetAsync(baseFileUrl);
                             if (baseFileResponse.IsSuccessStatusCode)
                             {
@@ -398,7 +437,7 @@ public class AzureDevOpsRestClient
         try
         {
             // Add $format=text to get raw content instead of JSON metadata
-            var url = $"{project}/_apis/git/repositories/{repositoryId}/blobs/{objectId}?$format=text&api-version=7.1";
+            var url = $"https://dev.azure.com/{_organization}/{project}/_apis/git/repositories/{repositoryId}/blobs/{objectId}?$format=text&api-version=7.1";
             var response = await _httpClient.GetAsync(url);
             response.EnsureSuccessStatusCode();
             return await response.Content.ReadAsStringAsync();
@@ -422,7 +461,7 @@ public class AzureDevOpsRestClient
         try
         {
             // Add $format=text to get raw content instead of JSON metadata
-            var url = $"{project}/_apis/git/repositories/{repositoryId}/items?path={Uri.EscapeDataString(path)}&versionDescriptor.version={versionOrBranch}&$format=text&api-version=7.1";
+            var url = $"https://dev.azure.com/{_organization}/{project}/_apis/git/repositories/{repositoryId}/items?path={Uri.EscapeDataString(path)}&versionDescriptor.version={versionOrBranch}&$format=text&api-version=7.1";
             var response = await _httpClient.GetAsync(url);
             response.EnsureSuccessStatusCode();
             return await response.Content.ReadAsStringAsync();
@@ -462,7 +501,7 @@ public class AzureDevOpsRestClient
                 status = 1 // Active
             };
 
-            var url = $"{project}/_apis/git/repositories/{repositoryId}/pullRequests/{pullRequestId}/threads?api-version=7.1";
+            var url = $"https://dev.azure.com/{_organization}/{project}/_apis/git/repositories/{repositoryId}/pullRequests/{pullRequestId}/threads?api-version=7.1";
             var json = System.Text.Json.JsonSerializer.Serialize(commentPayload);
             var content = new StringContent(json, System.Text.Encoding.UTF8, "application/json");
 
@@ -486,14 +525,46 @@ public class AzureDevOpsRestClient
     {
         try
         {
-            _logger.LogInformation("Fetching active PRs for {Project}/{Repository}", project, repository);
+            _logger.LogInformation("========================================");
+            _logger.LogInformation("FETCHING ACTIVE PRS");
+            _logger.LogInformation("Organization: {Organization}", _organization);
+            _logger.LogInformation("Project: {Project}", project);
+            _logger.LogInformation("Repository: {Repository}", repository);
 
             // Get repository ID first
-            var repoUrl = $"{project}/_apis/git/repositories/{repository}?api-version=7.1";
+            var repoUrl = $"https://dev.azure.com/{_organization}/{project}/_apis/git/repositories/{repository}?api-version=7.1";
+            _logger.LogInformation("Repository URL: {RepoUrl}", repoUrl);
+            
             var repoResponse = await _httpClient.GetAsync(repoUrl);
-            repoResponse.EnsureSuccessStatusCode();
-
+            _logger.LogInformation("Repository response status: {Status}", repoResponse.StatusCode);
+            
             var repoContent = await repoResponse.Content.ReadAsStringAsync();
+            _logger.LogInformation("Repository response length: {Length} bytes", repoContent.Length);
+            
+            // Check if response is HTML (proxy intercepted)
+            if (repoContent.TrimStart().StartsWith("<"))
+            {
+                _logger.LogError("Received HTML instead of JSON - proxy or authentication issue");
+                _logger.LogError("Response status: {Status}", repoResponse.StatusCode);
+                _logger.LogError("Response preview: {Preview}", repoContent.Length > 300 ? repoContent.Substring(0, 300) : repoContent);
+                throw new Exception($"Authentication failed: Received HTML login page instead of JSON. Status: {repoResponse.StatusCode}");
+            }
+            
+            if (!repoResponse.IsSuccessStatusCode)
+            {
+                _logger.LogError("Repository API failed. Response preview: {Preview}", 
+                    repoContent.Length > 500 ? repoContent.Substring(0, 500) : repoContent);
+                
+                // Log the full HTML to see what the proxy is returning
+                _logger.LogError("Full HTML response: {Html}", repoContent);
+                
+                repoResponse.EnsureSuccessStatusCode();
+            }
+
+            // Log the first 200 chars to see if it's JSON or HTML
+            _logger.LogInformation("Repository response preview: {Preview}", 
+                repoContent.Length > 200 ? repoContent.Substring(0, 200) : repoContent);
+
             var repoData = JsonSerializer.Deserialize<JsonElement>(repoContent);
             var repositoryId = repoData.GetProperty("id").GetString();
 
@@ -503,12 +574,29 @@ public class AzureDevOpsRestClient
                 return new List<PullRequest>();
             }
 
-            // Get active pull requests
-            var prUrl = $"{project}/_apis/git/repositories/{repositoryId}/pullRequests?searchCriteria.status=active&api-version=7.1";
-            var prResponse = await _httpClient.GetAsync(prUrl);
-            prResponse.EnsureSuccessStatusCode();
+            _logger.LogInformation("Repository ID: {RepositoryId}", repositoryId);
 
+            // Get active pull requests
+            var prUrl = $"https://dev.azure.com/{_organization}/{project}/_apis/git/repositories/{repositoryId}/pullRequests?searchCriteria.status=active&api-version=7.1";
+            _logger.LogInformation("PR URL: {PrUrl}", prUrl);
+            
+            var prResponse = await _httpClient.GetAsync(prUrl);
+            _logger.LogInformation("PR response status: {Status}", prResponse.StatusCode);
+            
             var prContent = await prResponse.Content.ReadAsStringAsync();
+            _logger.LogInformation("PR response length: {Length} bytes", prContent.Length);
+            
+            if (!prResponse.IsSuccessStatusCode)
+            {
+                _logger.LogError("PR API failed. Response preview: {Preview}", 
+                    prContent.Length > 500 ? prContent.Substring(0, 500) : prContent);
+                prResponse.EnsureSuccessStatusCode();
+            }
+
+            // Log the first 200 chars to see if it's JSON or HTML
+            _logger.LogInformation("PR response preview: {Preview}", 
+                prContent.Length > 200 ? prContent.Substring(0, 200) : prContent);
+
             var prData = JsonSerializer.Deserialize<JsonElement>(prContent);
 
             var pullRequests = new List<PullRequest>();
@@ -570,7 +658,7 @@ public class AzureDevOpsRestClient
             _logger.LogInformation("Branch: {Branch}", branch);
             _logger.LogInformation("Scope Path: {ScopePath}", scopePath);
 
-            var url = $"{project}/_apis/git/repositories/{repositoryId}/items?scopePath={Uri.EscapeDataString(scopePath)}&recursionLevel=Full&versionDescriptor.version={branch}&api-version=7.1";
+            var url = $"https://dev.azure.com/{_organization}/{project}/_apis/git/repositories/{repositoryId}/items?scopePath={Uri.EscapeDataString(scopePath)}&recursionLevel=Full&versionDescriptor.version={branch}&api-version=7.1";
             _logger.LogInformation("API URL: {Url}", url);
 
             _logger.LogInformation("Calling Azure DevOps API...");

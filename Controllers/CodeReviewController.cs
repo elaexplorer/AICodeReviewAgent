@@ -293,9 +293,13 @@ public class CodeReviewController : ControllerBase
     [HttpGet("config/status")]
     public IActionResult GetConfigStatus()
     {
+        // Get default PAT from environment variable
+        var defaultPat = Environment.GetEnvironmentVariable("ADO_PAT") ?? "";
+        
         return Ok(new {
             isConfigured = _adoConfig.IsConfigured,
-            organization = _adoConfig.Organization
+            organization = _adoConfig.Organization,
+            defaultPat = defaultPat  // Send default PAT to populate the form
         });
     }
 

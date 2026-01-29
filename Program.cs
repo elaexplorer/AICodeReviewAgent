@@ -11,22 +11,38 @@ using OpenAI;
 using System.ClientModel;
 using OpenTelemetry.Trace;
 using OpenTelemetry.Resources;
+using DotNetEnv;
+
+// Load .env file if it exists
+var envPath = Path.Combine(Directory.GetCurrentDirectory(), ".env");
+if (File.Exists(envPath))
+{
+    Console.WriteLine($"✓ Loading environment variables from .env file");
+    Env.Load(envPath);
+}
+else
+{
+    Console.WriteLine($"ℹ No .env file found at {envPath}, using system environment variables");
+}
 
 // Create web application builder
 var builder = WebApplication.CreateBuilder(args);
 
-// Configuration validation
-var openAiApiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY");
-var azureOpenAiEndpoint = Environment.GetEnvironmentVariable("AZURE_OPENAI_ENDPOINT");
-var azureOpenAiApiKey = Environment.GetEnvironmentVariable("AZURE_OPENAI_API_KEY");
-var azureOpenAiDeployment = Environment.GetEnvironmentVariable("AZURE_OPENAI_DEPLOYMENT") ?? "gpt-4";
-var azureOpenAiEmbeddingDeployment = Environment.GetEnvironmentVariable("AZURE_OPENAI_EMBEDDING_DEPLOYMENT") ?? "text-embedding-ada-002";
+// Helper function to get environment variable with fallback
+string? GetEnvVar(string key) => Environment.GetEnvironmentVariable(key);
+
+// Configuration validation - now uses .env values first, then system variables
+var openAiApiKey = GetEnvVar("OPENAI_API_KEY");
+var azureOpenAiEndpoint = GetEnvVar("AZURE_OPENAI_ENDPOINT");
+var azureOpenAiApiKey = GetEnvVar("AZURE_OPENAI_API_KEY");
+var azureOpenAiDeployment = GetEnvVar("AZURE_OPENAI_DEPLOYMENT") ?? "gpt-4";
+var azureOpenAiEmbeddingDeployment = GetEnvVar("AZURE_OPENAI_EMBEDDING_DEPLOYMENT") ?? "text-embedding-ada-002";
 // Support separate endpoint for embeddings (some orgs have different resources for chat vs embeddings)
-var azureOpenAiEmbeddingEndpoint = Environment.GetEnvironmentVariable("AZURE_OPENAI_EMBEDDING_ENDPOINT") ?? azureOpenAiEndpoint;
-var azureOpenAiEmbeddingApiKey = Environment.GetEnvironmentVariable("AZURE_OPENAI_EMBEDDING_API_KEY") ?? azureOpenAiApiKey;
-var adoOrganization = Environment.GetEnvironmentVariable("ADO_ORGANIZATION") ?? "SPOOL";
-var adoPat = Environment.GetEnvironmentVariable("ADO_PAT");
-var mcpServerUrl = Environment.GetEnvironmentVariable("MCP_SERVER_URL") ?? "http://localhost:3000";
+var azureOpenAiEmbeddingEndpoint = GetEnvVar("AZURE_OPENAI_EMBEDDING_ENDPOINT") ?? azureOpenAiEndpoint;
+var azureOpenAiEmbeddingApiKey = GetEnvVar("AZURE_OPENAI_EMBEDDING_API_KEY") ?? azureOpenAiApiKey;
+var adoOrganization = GetEnvVar("ADO_ORGANIZATION") ?? "SPOOL";
+var adoPat = GetEnvVar("ADO_PAT");
+var mcpServerUrl = GetEnvVar("MCP_SERVER_URL") ?? "http://localhost:3000";
 
 // Check if either OpenAI or Azure OpenAI is configured
 var hasOpenAI = !string.IsNullOrEmpty(openAiApiKey);
@@ -86,13 +102,30 @@ if (hasAzureOpenAI)
 
     builder.Services.AddSingleton<IChatClient>(provider =>
     {
-        var azureClient = new AzureOpenAIClient(
-            new Uri(azureOpenAiEndpoint!),
-            new AzureKeyCredential(azureOpenAiApiKey!));
+        // Check if this is a Claude endpoint
+        if (azureOpenAiEndpoint!.Contains("anthropic", StringComparison.OrdinalIgnoreCase))
+        {
+            Console.WriteLine("Detected Claude endpoint, using ClaudeChatClient");
+            var httpClient = new HttpClient();
+            var logger = provider.GetRequiredService<ILogger<CodeReviewAgent.Services.ClaudeChatClient>>();
+            return new CodeReviewAgent.Services.ClaudeChatClient(
+                httpClient,
+                azureOpenAiEndpoint!,
+                azureOpenAiApiKey!,
+                azureOpenAiDeployment,
+                logger);
+        }
+        else
+        {
+            // Use standard Azure OpenAI client
+            var azureClient = new AzureOpenAIClient(
+                new Uri(azureOpenAiEndpoint!),
+                new AzureKeyCredential(azureOpenAiApiKey!));
 
-        // Get ChatClient and convert to IChatClient using AsIChatClient()
-        var chatClient = azureClient.GetChatClient(azureOpenAiDeployment);
-        return chatClient.AsIChatClient();
+            // Get ChatClient and convert to IChatClient using AsIChatClient()
+            var chatClient = azureClient.GetChatClient(azureOpenAiDeployment);
+            return chatClient.AsIChatClient();
+        }
     });
 
     // Register embedding generator for RAG
@@ -100,13 +133,38 @@ if (hasAzureOpenAI)
     Console.WriteLine($"Embedding endpoint: {azureOpenAiEmbeddingEndpoint}");
     builder.Services.AddSingleton<IEmbeddingGenerator<string, Embedding<float>>>(provider =>
     {
-        var azureClient = new AzureOpenAIClient(
-            new Uri(azureOpenAiEmbeddingEndpoint!),
-            new AzureKeyCredential(azureOpenAiEmbeddingApiKey!));
+        // Check if this is a Claude endpoint - but still try Azure OpenAI for embeddings since the endpoint supports both
+        if (azureOpenAiEmbeddingEndpoint!.Contains("anthropic", StringComparison.OrdinalIgnoreCase))
+        {
+            Console.WriteLine("Claude endpoint detected, attempting to use Azure OpenAI embedding client");
+            // Even though this is a Claude endpoint, it should support Azure OpenAI embeddings
+            try
+            {
+                var azureClient = new AzureOpenAIClient(
+                    new Uri(azureOpenAiEmbeddingEndpoint!),
+                    new AzureKeyCredential(azureOpenAiEmbeddingApiKey!));
 
-        // Get EmbeddingClient and convert to IEmbeddingGenerator
-        var embeddingClient = azureClient.GetEmbeddingClient(azureOpenAiEmbeddingDeployment);
-        return embeddingClient.AsIEmbeddingGenerator();
+                // Get EmbeddingClient and convert to IEmbeddingGenerator
+                var embeddingClient = azureClient.GetEmbeddingClient(azureOpenAiEmbeddingDeployment);
+                return embeddingClient.AsIEmbeddingGenerator();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to create Azure OpenAI embedding client: {ex.Message}");
+                Console.WriteLine("Falling back to dummy embeddings - RAG features disabled");
+                return new DummyEmbeddingGenerator();
+            }
+        }
+        else
+        {
+            var azureClient = new AzureOpenAIClient(
+                new Uri(azureOpenAiEmbeddingEndpoint!),
+                new AzureKeyCredential(azureOpenAiEmbeddingApiKey!));
+
+            // Get EmbeddingClient and convert to IEmbeddingGenerator
+            var embeddingClient = azureClient.GetEmbeddingClient(azureOpenAiEmbeddingDeployment);
+            return embeddingClient.AsIEmbeddingGenerator();
+        }
     });
 }
 else if (hasOpenAI)
@@ -180,6 +238,28 @@ builder.Services.AddCors(options =>
 });
 
 var app = builder.Build();
+
+// Initialize ADO configuration on startup if credentials are available
+if (!string.IsNullOrEmpty(adoOrganization) && !string.IsNullOrEmpty(adoPat))
+{
+    var adoConfig = app.Services.GetRequiredService<AdoConfigurationService>();
+    var adoClient = app.Services.GetRequiredService<AzureDevOpsMcpClient>();
+    var startupLogger = app.Services.GetRequiredService<ILogger<Program>>();
+    
+    startupLogger.LogInformation("Initializing ADO clients with credentials from environment...");
+    
+    var (isValid, errorMessage) = await adoConfig.ValidateAndConfigureAsync(adoOrganization, adoPat);
+    if (isValid)
+    {
+        adoClient.UpdateConfiguration(adoOrganization, adoPat);
+        startupLogger.LogInformation("✅ ADO clients initialized successfully for organization: {Organization}", adoOrganization);
+    }
+    else
+    {
+        startupLogger.LogWarning("⚠️  ADO PAT validation failed: {Error}", errorMessage);
+        startupLogger.LogWarning("   You will need to log in manually through the web UI");
+    }
+}
 
 // Configure middleware
 app.UseCors();

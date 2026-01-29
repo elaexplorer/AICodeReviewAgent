@@ -66,3 +66,9 @@ public class CodeReviewComment
     public string Severity { get; set; } = string.Empty; // "low", "medium", "high"
     public bool Posted { get; set; } = false;
 }
+
+public class RepositoryInfo
+{
+    public string Id { get; set; } = string.Empty;
+    public string Name { get; set; } = string.Empty;
+}

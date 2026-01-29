@@ -36,13 +36,39 @@ A Semantic Kernel-based AI agent that automatically reviews Azure DevOps pull re
    dotnet build
    ```
 
-2. **Set environment variables**:
+2. **Configure environment variables** (Choose one method):
+
+   **Method 1: Using .env file (Recommended)**
    ```bash
-   export OPENAI_API_KEY="your-openai-api-key"
-   export ADO_ORGANIZATION="your-ado-organization"
-   export ADO_PAT="your-personal-access-token"
-   # Optional: export MCP_SERVER_URL="http://localhost:3000"
+   # Copy the example file
+   cp .env.example .env
+   
+   # Edit .env with your actual credentials
+   # The application automatically loads this file on startup
    ```
+
+   **Method 2: Using system environment variables**
+   
+   PowerShell:
+   ```powershell
+   $env:AZURE_OPENAI_ENDPOINT = "https://your-resource.openai.azure.com/"
+   $env:AZURE_OPENAI_API_KEY = "your-api-key"
+   $env:ADO_PAT = "your-personal-access-token"
+   $env:ADO_ORGANIZATION = "your-organization"
+   ```
+   
+   Bash/Linux:
+   ```bash
+   export AZURE_OPENAI_ENDPOINT="https://your-resource.openai.azure.com/"
+   export AZURE_OPENAI_API_KEY="your-api-key"
+   export ADO_PAT="your-personal-access-token"
+   export ADO_ORGANIZATION="your-organization"
+   ```
+
+   **Configuration Priority:**
+   1. `.env` file (checked first)
+   2. System environment variables (fallback)
+   3. Default values (if applicable)
 
 3. **Create Azure DevOps PAT**:
    - Go to Azure DevOps → User Settings → Personal Access Tokens
@@ -206,12 +232,32 @@ The architecture uses a **plugin-based system** where language-specific agents c
 
 ### Environment Variables
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `OPENAI_API_KEY` | Yes | Your OpenAI API key for GPT-4 access |
-| `ADO_ORGANIZATION` | Yes | Azure DevOps organization name |
-| `ADO_PAT` | Yes | Personal Access Token with appropriate permissions |
-| `MCP_SERVER_URL` | No | MCP server URL (defaults to http://localhost:3000) |
+You can configure the agent using either a `.env` file or system environment variables. The application checks `.env` file first, then falls back to system variables.
+
+| Variable | Required | Description | Default |
+|----------|----------|-------------|---------|
+| `AZURE_OPENAI_ENDPOINT` | Yes* | Azure OpenAI endpoint URL | - |
+| `AZURE_OPENAI_API_KEY` | Yes* | Azure OpenAI API key | - |
+| `AZURE_OPENAI_DEPLOYMENT` | No | Model deployment name | `gpt-4` |
+| `OPENAI_API_KEY` | Yes* | OpenAI API key (alternative to Azure) | - |
+| `ADO_PAT` | Yes | Azure DevOps Personal Access Token | - |
+| `ADO_ORGANIZATION` | No | Azure DevOps organization name | `SPOOL` |
+| `MCP_SERVER_URL` | No | MCP server URL | `http://localhost:3000` |
+| `AZURE_OPENAI_EMBEDDING_DEPLOYMENT` | No | Embedding model deployment | `text-embedding-ada-002` |
+
+*Either Azure OpenAI (endpoint + key) or OpenAI (key) configuration is required.
+
+### .env File Example
+
+See [.env.example](.env.example) for a complete template:
+
+```bash
+# Copy the example file
+cp .env.example .env
+
+# Edit with your credentials
+nano .env
+```
 
 ### Supported File Types
 

@@ -657,15 +657,25 @@
                 const response = await fetch('/api/CodeReview/config/status');
                 const status = await response.json();
 
-                if (status.isConfigured) {
-                    // Already configured, show main app
-                    document.getElementById('currentOrg').textContent = status.organization;
-                    document.getElementById('mainContainer').style.display = 'block';
-                    await loadProjects();
-                } else {
-                    // Not configured, show login page
-                    document.getElementById('loginContainer').style.display = 'block';
+                // Populate form with defaults
+                if (status.defaultPat) {
+                    document.getElementById('patInput').value = status.defaultPat;
                 }
+                
+                if (status.organization) {
+                    document.getElementById('organizationInput').value = status.organization;
+                }
+
+                // Show login page - don't auto-login to avoid proxy timing issues
+                // User needs to manually click the button
+                document.getElementById('loginContainer').style.display = 'block';
+                
+                // If already configured, show a different message
+                if (status.isConfigured && status.defaultPat && status.organization) {
+                    document.getElementById('loginBtn').textContent = 'Continue with Saved Credentials';
+                    console.log('Credentials loaded from .env file. Click "Continue" to proceed.');
+                }
+                
             } catch (error) {
                 console.error('Error checking config status:', error);
                 // Show login page on error
@@ -823,7 +833,8 @@
                     }
                 }
 
-                const prs = await response.json();
+                const data = await response.json();
+                const prs = data.pullRequests || [];
 
                 const prList = document.getElementById('prList');
                 prList.innerHTML = '';

@@ -46,15 +46,25 @@ public class AdoConfigurationService
         {
             _logger.LogInformation("Validating PAT for organization: {Organization}", organization);
 
-            // Test the PAT by making a simple API call
-            using var httpClient = new HttpClient();
-            httpClient.BaseAddress = new Uri($"https://dev.azure.com/{organization}/");
+            // Test the PAT by making a simple API call - use SocketsHttpHandler for better proxy support
+            var handler = new SocketsHttpHandler
+            {
+                UseProxy = true,
+                DefaultProxyCredentials = System.Net.CredentialCache.DefaultCredentials,
+                PreAuthenticate = true,
+                PooledConnectionLifetime = TimeSpan.FromMinutes(2),
+                PooledConnectionIdleTimeout = TimeSpan.FromMinutes(1)
+            };
+            
+            using var httpClient = new HttpClient(handler);
+            httpClient.Timeout = TimeSpan.FromSeconds(30);
             var authToken = Convert.ToBase64String(Encoding.ASCII.GetBytes($":{pat}"));
             httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Basic", authToken);
             httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+            httpClient.DefaultRequestHeaders.Add("User-Agent", "CodeReviewAgent/1.0");
 
-            // Try to get projects to validate the PAT
-            var response = await httpClient.GetAsync("_apis/projects?api-version=7.1");
+            // Try to get projects to validate the PAT - use full URL
+            var response = await httpClient.GetAsync($"https://dev.azure.com/{organization}/_apis/projects?api-version=7.1");
 
             if (response.IsSuccessStatusCode)
             {

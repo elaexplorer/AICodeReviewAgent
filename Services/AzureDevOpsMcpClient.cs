@@ -171,32 +171,17 @@ public class AzureDevOpsMcpClient : IAsyncDisposable
             _logger.LogInformation("Fetching files for PR {PullRequestId} from repository {Repository}",
                 pullRequestId, repository);
 
-            // Get repository ID first
-            var client = await GetMcpClientAsync();
-            var repoResult = await client.CallToolAsync("repo_get_repo_by_name_or_id", new Dictionary<string, object?>
+            // Use REST API directly to get repository ID and file changes
+            // Get repository info first to extract repository ID
+            var repoInfo = await _restClient.GetRepositoryAsync(project, repository);
+            if (repoInfo == null)
             {
-                ["project"] = project,
-                ["repositoryNameOrId"] = repository
-            });
-
-            string? repositoryId = null;
-            if (repoResult.Content?.Count > 0)
-            {
-                var repoContent = JsonSerializer.Serialize(repoResult.Content[0]);
-                var repoData = JsonSerializer.Deserialize<JsonElement>(repoContent);
-                var textValue = repoData.TryGetProperty("text", out var textProp) ? textProp.GetString() : repoContent;
-                var repo = JsonSerializer.Deserialize<JsonElement>(textValue!);
-                repositoryId = repo.GetProperty("id").GetString();
-            }
-
-            if (string.IsNullOrEmpty(repositoryId))
-            {
-                _logger.LogError("Repository {Repository} not found", repository);
+                _logger.LogError("Repository {Repository} not found in project {Project}", repository, project);
                 return new List<PullRequestFile>();
             }
 
-            // Use REST API to get file changes (MCP doesn't support this yet)
-            var files = await _restClient.GetPullRequestChangesAsync(project, repositoryId, pullRequestId);
+            // Use REST API to get file changes
+            var files = await _restClient.GetPullRequestChangesAsync(project, repoInfo.Id, pullRequestId);
 
             _logger.LogInformation("Found {FileCount} changed files in PR {PullRequestId}", files.Count, pullRequestId);
             return files;
