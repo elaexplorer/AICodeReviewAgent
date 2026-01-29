@@ -16,3 +16,9 @@
 **/*.user
 **/*.suo
 **/launchSettings.json
+nul
+.env
+azure-subscriptions.txt
+deploy-to-azure.ps1
+update-container-app.ps1
+test-agent.sh

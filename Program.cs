@@ -286,8 +286,10 @@ var codeReviewAgent = app.Services.GetRequiredService<CodeReviewAgentService>();
 if (args.Length == 0 || args.Contains("--web"))
 {
     logger.LogInformation("Starting Code Review Agent in Web UI mode");
-    logger.LogInformation("Open http://localhost:5001 in your browser");
-    app.Run("http://localhost:5001");
+    // Use ASPNETCORE_URLS environment variable or default to http://localhost:5001
+    var urls = Environment.GetEnvironmentVariable("ASPNETCORE_URLS") ?? "http://localhost:5001";
+    logger.LogInformation("Listening on: {Urls}", urls);
+    app.Run();
     return;
 }
 
