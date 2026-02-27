@@ -1,0 +1,21 @@
+{
+  "mcpServers": {
+    "azure-devops": {
+      "type": "stdio",
+      "command": "cmd",
+      "args": [
+        "/c",
+        "npx",
+        "-y",
+        "@azure-devops/mcp",
+        "Skype",
+        "-a",
+        "env"
+      ],
+      "env": {
+        "AZURE_DEVOPS_EXT_PAT": "YOUR_PAT_TOKEN_HERE",
+        "AZURE_DEVOPS_ORGANIZATION": "Skype"
+      }
+    }
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "preferences": {
+    "sidebarMode": "chat",
+    "coworkScheduledTasksEnabled": false
+  },
+  "mcpServers": {
+    "azure-devops": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@azure-devops/mcp",
+        "Skype",
+        "-a",
+        "env"
+      ],
+      "env": {
+        "AZURE_DEVOPS_EXT_PAT": "YOUR_PAT_TOKEN_HERE",
+        "AZURE_DEVOPS_ORGANIZATION": "Skype"
+      }
+    }
+  }
+}

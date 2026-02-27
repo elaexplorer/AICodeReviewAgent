@@ -52,6 +52,7 @@ public class AdoConfigurationService
                 UseProxy = true,
                 DefaultProxyCredentials = System.Net.CredentialCache.DefaultCredentials,
                 PreAuthenticate = true,
+                ConnectTimeout = TimeSpan.FromSeconds(10),
                 PooledConnectionLifetime = TimeSpan.FromMinutes(2),
                 PooledConnectionIdleTimeout = TimeSpan.FromMinutes(1)
             };

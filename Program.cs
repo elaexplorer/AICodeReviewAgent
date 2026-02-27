@@ -84,8 +84,19 @@ if ((!hasOpenAI && !hasAzureOpenAI) || string.IsNullOrEmpty(adoPat))
     return;
 }
 
-// Add services
-builder.Services.AddLogging(config => config.AddConsole().SetMinimumLevel(LogLevel.Information));
+// Add runtime logger service first
+builder.Services.AddSingleton<RuntimeLoggerService>();
+builder.Services.AddHostedService<RuntimeLoggerService>(provider => provider.GetRequiredService<RuntimeLoggerService>());
+
+// Add services with both console and runtime file logging
+builder.Services.AddLogging(config => 
+{
+    config.AddConsole().SetMinimumLevel(LogLevel.Information);
+    
+    // Add runtime file logging
+    config.Services.AddSingleton<ILoggerProvider>(provider =>
+        new RuntimeFileLoggerProvider(provider.GetRequiredService<RuntimeLoggerService>()));
+});
 
 // Add OpenTelemetry for observability
 builder.Services.AddOpenTelemetry()
@@ -198,6 +209,7 @@ builder.Services.AddSingleton<AdoConfigurationService>();
 // Add embedding inspection and visualization services
 builder.Services.AddEmbeddingInspection();
 builder.Services.AddEmbeddingVisualization();
+builder.Services.AddMemoryInspection();
 
 builder.Services.AddSingleton(provider =>
     new AzureDevOpsRestClient(
@@ -252,16 +264,30 @@ if (!string.IsNullOrEmpty(adoOrganization) && !string.IsNullOrEmpty(adoPat))
     
     startupLogger.LogInformation("Initializing ADO clients with credentials from environment...");
     
-    var (isValid, errorMessage) = await adoConfig.ValidateAndConfigureAsync(adoOrganization, adoPat);
-    if (isValid)
+    var validationTask = adoConfig.ValidateAndConfigureAsync(adoOrganization, adoPat);
+    var timeoutTask = Task.Delay(TimeSpan.FromSeconds(15));
+    var completed = await Task.WhenAny(validationTask, timeoutTask);
+
+    if (completed == timeoutTask)
     {
+        startupLogger.LogWarning("⚠️  ADO PAT validation timed out after 15s - app will start anyway");
+        startupLogger.LogWarning("   ADO connectivity will be retried on first PR review request");
+        // Still configure with the credentials so the client can use them
         adoClient.UpdateConfiguration(adoOrganization, adoPat);
-        startupLogger.LogInformation("✅ ADO clients initialized successfully for organization: {Organization}", adoOrganization);
     }
     else
     {
-        startupLogger.LogWarning("⚠️  ADO PAT validation failed: {Error}", errorMessage);
-        startupLogger.LogWarning("   You will need to log in manually through the web UI");
+        var (isValid, errorMessage) = await validationTask;
+        if (isValid)
+        {
+            adoClient.UpdateConfiguration(adoOrganization, adoPat);
+            startupLogger.LogInformation("✅ ADO clients initialized successfully for organization: {Organization}", adoOrganization);
+        }
+        else
+        {
+            startupLogger.LogWarning("⚠️  ADO PAT validation failed: {Error}", errorMessage);
+            startupLogger.LogWarning("   You will need to log in manually through the web UI");
+        }
     }
 }
 
@@ -299,6 +325,14 @@ if (args.Contains("--visualize-embeddings"))
 {
     logger.LogInformation("Starting Embedding Visualizer mode");
     await EmbeddingVisualizationExtensions.RunEmbeddingVisualizationAsync(app.Services, args);
+    return;
+}
+
+// Check for memory inspection mode
+if (args.Contains("--inspect-memory"))
+{
+    logger.LogInformation("Starting Memory Inspector mode");
+    await MemoryInspectionExtensions.RunMemoryInspectionAsync(app.Services, args);
     return;
 }
 

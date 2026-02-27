@@ -642,6 +642,60 @@ public class AzureDevOpsRestClient
     }
 
     /// <summary>
+    /// Get all branches in the repository
+    /// </summary>
+    public async Task<List<string>> GetRepositoryBranchesAsync(string project, string repositoryId)
+    {
+        try
+        {
+            _logger.LogInformation("🌿 FETCHING REPOSITORY BRANCHES:");
+            _logger.LogInformation("   Repository ID: {RepositoryId}", repositoryId);
+            
+            var url = $"https://dev.azure.com/{_organization}/{project}/_apis/git/repositories/{repositoryId}/refs/heads?api-version=7.1";
+            _logger.LogInformation("   API URL: {Url}", url);
+            
+            var response = await _httpClient.GetAsync(url);
+            _logger.LogInformation("   Response Status: {StatusCode}", response.StatusCode);
+            
+            if (!response.IsSuccessStatusCode)
+            {
+                var errorContent = await response.Content.ReadAsStringAsync();
+                _logger.LogError("❌ Error fetching branches: {Error}", errorContent);
+                return new List<string>();
+            }
+            
+            var content = await response.Content.ReadAsStringAsync();
+            var data = JsonSerializer.Deserialize<JsonElement>(content);
+            
+            var branches = new List<string>();
+            if (data.TryGetProperty("value", out var refs))
+            {
+                foreach (var refItem in refs.EnumerateArray())
+                {
+                    if (refItem.TryGetProperty("name", out var name))
+                    {
+                        var fullName = name.GetString();
+                        if (fullName?.StartsWith("refs/heads/") == true)
+                        {
+                            var branchName = fullName.Substring("refs/heads/".Length);
+                            branches.Add(branchName);
+                            _logger.LogInformation("   🌿 Found branch: {Branch}", branchName);
+                        }
+                    }
+                }
+            }
+            
+            _logger.LogInformation("✅ Found {Count} branches total", branches.Count);
+            return branches;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "❌ Error fetching repository branches");
+            return new List<string>();
+        }
+    }
+
+    /// <summary>
     /// Get repository items (file tree) for understanding codebase structure
     /// </summary>
     public async Task<List<string>> GetRepositoryItemsAsync(
@@ -652,93 +706,141 @@ public class AzureDevOpsRestClient
     {
         try
         {
-            _logger.LogInformation("========================================");
-            _logger.LogInformation("RAG INDEXING: Fetching repository structure");
+            _logger.LogInformation("╔════════════════════════════════════════════════════════════╗");
+            _logger.LogInformation("║ RAG INDEXING: Fetching repository structure (with pagination) ║");
+            _logger.LogInformation("╚════════════════════════════════════════════════════════════╝");
             _logger.LogInformation("Repository ID: {RepositoryId}", repositoryId);
             _logger.LogInformation("Branch: {Branch}", branch);
             _logger.LogInformation("Scope Path: {ScopePath}", scopePath);
 
-            var url = $"https://dev.azure.com/{_organization}/{project}/_apis/git/repositories/{repositoryId}/items?scopePath={Uri.EscapeDataString(scopePath)}&recursionLevel=Full&versionDescriptor.version={branch}&api-version=7.1";
-            _logger.LogInformation("API URL: {Url}", url);
-
-            _logger.LogInformation("Calling Azure DevOps API...");
-            var response = await _httpClient.GetAsync(url);
-
-            _logger.LogInformation("Response Status: {StatusCode}", response.StatusCode);
-
-            if (!response.IsSuccessStatusCode)
-            {
-                var errorContent = await response.Content.ReadAsStringAsync();
-                _logger.LogError("API Error Response: {Error}", errorContent);
-                response.EnsureSuccessStatusCode();
-            }
-
-            var content = await response.Content.ReadAsStringAsync();
-            _logger.LogInformation("Response Content Length: {Length} bytes", content.Length);
-
-            var data = JsonSerializer.Deserialize<JsonElement>(content);
-
-            var files = new List<string>();
+            var allFiles = new List<string>();
             int totalItems = 0;
             int folders = 0;
+            int pageCount = 0;
+            string? continuationToken = null;
 
-            if (data.TryGetProperty("value", out var items))
+            do
             {
-                foreach (var item in items.EnumerateArray())
+                pageCount++;
+                var baseUrl = $"https://dev.azure.com/{_organization}/{project}/_apis/git/repositories/{repositoryId}/items?scopePath={Uri.EscapeDataString(scopePath)}&recursionLevel=Full&versionDescriptor.version={branch}&api-version=7.1";
+                
+                var url = !string.IsNullOrEmpty(continuationToken) 
+                    ? $"{baseUrl}&continuationToken={Uri.EscapeDataString(continuationToken)}"
+                    : baseUrl;
+
+                _logger.LogInformation("📄 PAGE {PageCount}: Fetching repository items...", pageCount);
+                _logger.LogInformation("   API URL: {Url}", url);
+
+                var response = await _httpClient.GetAsync(url);
+                _logger.LogInformation("   Response Status: {StatusCode}", response.StatusCode);
+
+                if (!response.IsSuccessStatusCode)
                 {
-                    totalItems++;
+                    var errorContent = await response.Content.ReadAsStringAsync();
+                    _logger.LogError("❌ API Error Response: {Error}", errorContent);
+                    response.EnsureSuccessStatusCode();
+                }
 
-                    // Check if it's a folder - items without isFolder property are treated as files
-                    bool isFolderValue = false;
-                    if (item.TryGetProperty("isFolder", out var isFolder))
-                    {
-                        isFolderValue = isFolder.GetBoolean();
-                    }
+                var content = await response.Content.ReadAsStringAsync();
+                _logger.LogInformation("   Response Content Length: {Length} bytes", content.Length);
+                
+                // Log the full API response to see what we're actually getting
+                _logger.LogInformation("   🔍 FULL API RESPONSE DEBUG:");
+                _logger.LogInformation("   Response: {Content}", content.Length > 5000 ? content.Substring(0, 5000) + "... [TRUNCATED]" : content);
 
-                    if (isFolderValue)
+                // Check for continuation token in response headers
+                var responseHeaders = response.Headers;
+                continuationToken = null;
+                
+                if (responseHeaders.TryGetValues("x-ms-continuationtoken", out var tokenValues))
+                {
+                    continuationToken = tokenValues.FirstOrDefault();
+                    _logger.LogInformation("   📄 Continuation token found: {Token}", continuationToken?.Substring(0, Math.Min(50, continuationToken?.Length ?? 0)) + "...");
+                }
+
+                var data = JsonSerializer.Deserialize<JsonElement>(content);
+                int pageItems = 0;
+                int pageFiles = 0;
+                int pageFolders = 0;
+
+                if (data.TryGetProperty("value", out var items))
+                {
+                    foreach (var item in items.EnumerateArray())
                     {
-                        folders++;
-                        if (item.TryGetProperty("path", out var folderPath))
+                        pageItems++;
+                        totalItems++;
+
+                        // Check if it's a folder - items without isFolder property are treated as files
+                        bool isFolderValue = false;
+                        if (item.TryGetProperty("isFolder", out var isFolder))
                         {
-                            _logger.LogDebug("Found folder: {Path}", folderPath.GetString());
+                            isFolderValue = isFolder.GetBoolean();
                         }
-                    }
-                    else
-                    {
-                        // It's a file - get its path
-                        if (item.TryGetProperty("path", out var pathProp))
+
+                        if (isFolderValue)
                         {
-                            var path = pathProp.GetString() ?? string.Empty;
-                            if (!string.IsNullOrEmpty(path))
+                            folders++;
+                            pageFolders++;
+                            if (item.TryGetProperty("path", out var folderPath))
                             {
-                                files.Add(path);
-                                _logger.LogDebug("Found file: {Path}", path);
+                                _logger.LogDebug("   📁 Found folder: {Path}", folderPath.GetString());
+                            }
+                        }
+                        else
+                        {
+                            // It's a file - get its path
+                            if (item.TryGetProperty("path", out var pathProp))
+                            {
+                                var path = pathProp.GetString() ?? string.Empty;
+                                if (!string.IsNullOrEmpty(path))
+                                {
+                                    allFiles.Add(path);
+                                    pageFiles++;
+                                    _logger.LogDebug("   📄 Found file: {Path}", path);
+                                }
                             }
                         }
                     }
+
+                    _logger.LogInformation("   ✅ Page {PageCount} Summary:", pageCount);
+                    _logger.LogInformation("      Items on page: {PageItems}", pageItems);
+                    _logger.LogInformation("      Files on page: {PageFiles}", pageFiles);
+                    _logger.LogInformation("      Folders on page: {PageFolders}", pageFolders);
+                    _logger.LogInformation("      Total files so far: {TotalFiles}", allFiles.Count);
                 }
-            }
-            else
+                else
+                {
+                    _logger.LogWarning("   ⚠️  Response does not contain 'value' property");
+                    _logger.LogWarning("   Response preview: {Response}", content.Length > 500 ? content.Substring(0, 500) + "..." : content);
+                }
+
+            } while (!string.IsNullOrEmpty(continuationToken) && pageCount < 100); // Safety limit
+
+            _logger.LogInformation("╔════════════════════════════════════════════════════════════╗");
+            _logger.LogInformation("║ RAG INDEXING: Repository Structure Complete                ║");
+            _logger.LogInformation("╚════════════════════════════════════════════════════════════╝");
+            _logger.LogInformation("📊 FINAL SUMMARY:");
+            _logger.LogInformation("   Total pages fetched: {PageCount}", pageCount);
+            _logger.LogInformation("   Total items: {Total}", totalItems);
+            _logger.LogInformation("   Total folders: {Folders}", folders);
+            _logger.LogInformation("   Total files: {Files}", allFiles.Count);
+            
+            if (pageCount >= 100)
             {
-                _logger.LogWarning("Response does not contain 'value' property");
-                _logger.LogWarning("Response: {Response}", content.Length > 500 ? content.Substring(0, 500) + "..." : content);
+                _logger.LogWarning("⚠️  Hit pagination safety limit (100 pages) - repository may have more files");
             }
+            
+            _logger.LogInformation("════════════════════════════════════════════════════════════");
 
-            _logger.LogInformation("RAG INDEXING: Summary");
-            _logger.LogInformation("  Total items: {Total}", totalItems);
-            _logger.LogInformation("  Folders: {Folders}", folders);
-            _logger.LogInformation("  Files: {Files}", files.Count);
-            _logger.LogInformation("========================================");
-
-            return files;
+            return allFiles;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "RAG INDEXING ERROR: Failed to fetch repository items");
-            _logger.LogError("  Repository: {RepositoryId}", repositoryId);
-            _logger.LogError("  Branch: {Branch}", branch);
-            _logger.LogError("  Error: {Message}", ex.Message);
-            _logger.LogError("========================================");
+            _logger.LogError(ex, "❌ RAG INDEXING ERROR: Failed to fetch repository items");
+            _logger.LogError("   Repository: {RepositoryId}", repositoryId);
+            _logger.LogError("   Branch: {Branch}", branch);
+            _logger.LogError("   Error: {Message}", ex.Message);
+            _logger.LogError("════════════════════════════════════════════════════════════");
             return new List<string>();
         }
     }

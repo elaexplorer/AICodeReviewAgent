@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Embedding Search Visualization</title>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .header { background: #f5f5f5; padding: 20px; border-radius: 8px; margin-bottom: 20px; }
+        .query-section { margin: 30px 0; padding: 20px; border: 1px solid #ddd; border-radius: 8px; }
+        .query-title { color: #2d3748; margin-bottom: 15px; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🔍 Embedding Search Visualization</h1>
+        <p>This shows how different search queries match against code embeddings using semantic similarity.</p>
+    </div>
+    
+    <div id="searchPlots"></div>
+    
+    <div class="query-section">
+        <h3>💡 Understanding Search Results:</h3>
+        <ul>
+            <li><strong>Higher bars = better matches</strong> - Similarity scores range from 0 to 1</li>
+            <li><strong>Semantic understanding</strong> - "authentication" matches "login", "JWT", "permissions"</li>
+            <li><strong>Cross-language matching</strong> - Concepts work across programming languages</li>
+            <li><strong>Context awareness</strong> - Related concepts cluster together</li>
+        </ul>
+    </div>
+
+    <script>
+        const searchData = [{"query":"user authentication","results":[{"name":"Auth_Login","similarity":0.3222},{"name":"HTTP_API","similarity":0.1908},{"name":"Auth_Permissions","similarity":0.178},{"name":"Auth_JWT","similarity":0.173},{"name":"Database_Query","similarity":0.1433},{"name":"Database_Connection","similarity":0.0906},{"name":"HTTP_Client","similarity":0.0774},{"name":"Task_Processing","similarity":0.0276},{"name":"Async_Method","similarity":0.0108}]},{"query":"database connection","results":[{"name":"Database_Connection","similarity":0.3562},{"name":"HTTP_Client","similarity":0.0847},{"name":"HTTP_API","similarity":0.0714},{"name":"Auth_Login","similarity":0.0705},{"name":"Database_Query","similarity":0.0551},{"name":"Task_Processing","similarity":0.0505},{"name":"Auth_Permissions","similarity":0.0451},{"name":"Async_Method","similarity":0.029},{"name":"Auth_JWT","similarity":-0.007}]},{"query":"HTTP API request","results":[{"name":"HTTP_Client","similarity":0.3244},{"name":"HTTP_API","similarity":0.2109},{"name":"Async_Method","similarity":0.1103},{"name":"Auth_Permissions","similarity":0.1063},{"name":"Auth_Login","similarity":0.1007},{"name":"Database_Query","similarity":0.092},{"name":"Task_Processing","similarity":0.0852},{"name":"Auth_JWT","similarity":0.0647},{"name":"Database_Connection","similarity":0.0296}]},{"query":"async await pattern","results":[{"name":"Task_Processing","similarity":0.2631},{"name":"Database_Connection","similarity":0.2447},{"name":"Async_Method","similarity":0.2273},{"name":"Auth_Login","similarity":0.2107},{"name":"Database_Query","similarity":0.2003},{"name":"HTTP_API","similarity":0.1832},{"name":"HTTP_Client","similarity":0.1821},{"name":"Auth_Permissions","similarity":0.106},{"name":"Auth_JWT","similarity":0.074}]}];
+        
+        searchData.forEach((search, index) => {
+            // Create container for this query
+            const container = document.createElement('div');
+            container.id = `search-${index}`;
+            container.style.height = '400px';
+            container.style.marginBottom = '30px';
+            document.getElementById('searchPlots').appendChild(container);
+            
+            // Add query title
+            const title = document.createElement('div');
+            title.className = 'query-title';
+            title.innerHTML = `<h3>🔍 Query: "${search.query}"</h3>`;
+            container.parentNode.insertBefore(title, container);
+            
+            // Create bar chart for this query
+            const trace = {
+                x: search.results.map(r => r.name),
+                y: search.results.map(r => r.similarity),
+                type: 'bar',
+                marker: {
+                    color: search.results.map(r => {
+                        if (r.similarity > 0.8) return '#48BB78';
+                        if (r.similarity > 0.6) return '#ED8936';
+                        return '#E53E3E';
+                    }),
+                    line: { width: 1, color: '#2D3748' }
+                }
+            };
+            
+            const layout = {
+                title: `Similarity Scores for "${search.query}"`,
+                xaxis: { 
+                    title: 'Code Samples',
+                    tickangle: -45
+                },
+                yaxis: { 
+                    title: 'Cosine Similarity',
+                    range: [0, 1]
+                },
+                showlegend: false,
+                margin: { t: 50, b: 100 }
+            };
+            
+            Plotly.newPlot(container, [trace], layout);
+        });
+    </script>
+</body>
+</html>

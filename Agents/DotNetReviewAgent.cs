@@ -127,7 +127,7 @@ public class DotNetReviewAgent : ILanguageReviewAgent
             _logger.LogInformation("   File content length: {ContentLength} chars", file.Content?.Length ?? 0);
             _logger.LogInformation("   Codebase context included: {HasContext}", !string.IsNullOrEmpty(codebaseContext));
             _logger.LogInformation("   Codebase context length: {ContextLength} chars", codebaseContext?.Length ?? 0);
-            _logger.LogDebug("📝 FULL PROMPT:\n{Prompt}", prompt);
+            _logger.LogInformation("📝 FULL PROMPT:\n{Prompt}", prompt);
 
             // Use AIAgent.RunAsync to execute the agent
             var stopwatch = Stopwatch.StartNew();
@@ -165,7 +165,7 @@ public class DotNetReviewAgent : ILanguageReviewAgent
                 _logger.LogInformation("📊 TOKEN USAGE: Not available from agent response");
             }
 
-            _logger.LogDebug("📝 FULL LLM RESPONSE:\n{Response}", responseText);
+            _logger.LogInformation("📝 FULL LLM RESPONSE:\n{Response}", responseText);
             _logger.LogInformation("════════════════════════════════════════════════════════════");
 
             // Parse the JSON response

@@ -89,10 +89,36 @@ public class CodebaseContextService
         _logger.LogInformation("Project: {Project}", project);
         _logger.LogInformation("Branch: {Branch}", branch);
 
-        // Get all files in repository
-        _logger.LogInformation("Step 1: Fetching repository file tree...");
-        var files = await _adoClient.GetRepositoryItemsAsync(
-            project, repositoryId, branch);
+        // Step 1: Check available branches first
+        _logger.LogInformation("Step 1: Checking available branches...");
+        var branches = await _adoClient.GetRepositoryBranchesAsync(project, repositoryId);
+        _logger.LogInformation("Available branches: {Branches}", string.Join(", ", branches));
+        
+        // Try to find the branch with the most files
+        string bestBranch = branch;
+        int maxFiles = 0;
+        
+        var branchesToTry = branches.Any() ? branches : new List<string> { "main", "master", "develop" };
+        
+        foreach (var tryBranch in branchesToTry.Take(3)) // Try up to 3 branches
+        {
+            _logger.LogInformation("🔍 Checking branch '{Branch}' for files...", tryBranch);
+            var testFiles = await _adoClient.GetRepositoryItemsAsync(project, repositoryId, tryBranch);
+            _logger.LogInformation("   Branch '{Branch}' has {FileCount} files", tryBranch, testFiles.Count);
+            
+            if (testFiles.Count > maxFiles)
+            {
+                maxFiles = testFiles.Count;
+                bestBranch = tryBranch;
+                _logger.LogInformation("   ⭐ Branch '{Branch}' is now the best candidate with {FileCount} files", tryBranch, testFiles.Count);
+            }
+        }
+        
+        _logger.LogInformation("✅ Selected branch '{Branch}' with {FileCount} files for indexing", bestBranch, maxFiles);
+        
+        // Get all files from the best branch
+        _logger.LogInformation("Step 2: Fetching repository file tree from branch '{Branch}'...", bestBranch);
+        var files = await _adoClient.GetRepositoryItemsAsync(project, repositoryId, bestBranch);
 
         _logger.LogInformation("Found {FileCount} total files in repository", files.Count);
 
@@ -111,9 +137,9 @@ public class CodebaseContextService
         int failed = 0;
         var chunks = new List<CodeChunk>();
 
-        _logger.LogInformation("Step 2: Processing files (limit: 50 files to control costs)...");
+        _logger.LogInformation("Step 3: Processing all {FileCount} files (no artificial limits)...", files.Count);
 
-        foreach (var filePath in files.Take(50)) // Limit to 50 files for now to control costs
+        foreach (var filePath in files) // Process ALL files found
         {
             // Skip binary files, tests, generated code
             if (ShouldSkipFile(filePath))
@@ -154,16 +180,31 @@ public class CodebaseContextService
 
                 foreach (var chunk in fileChunks)
                 {
-                    _logger.LogDebug("  Generating embedding for chunk {Index} (lines {Start}-{End})...",
+                    _logger.LogInformation("  🔤 CHUNK CONTENT for chunk {Index} (lines {Start}-{End}):",
                         chunk.ChunkIndex, chunk.StartLine, chunk.EndLine);
+                    _logger.LogInformation("     Preview (first 200 chars): {Content}",
+                        chunk.Content.Length > 200 ? chunk.Content.Substring(0, 200).Replace("\n", "\\n") + "..." : chunk.Content.Replace("\n", "\\n"));
+                    _logger.LogInformation("     Full content length: {Length} characters", chunk.Content.Length);
+
+                    _logger.LogInformation("  🧮 Generating embedding for chunk {Index}...", chunk.ChunkIndex);
 
                     // Generate embedding for the chunk
                     var embeddingResponse = await _embeddingGenerator.GenerateAsync(chunk.Content);
                     chunk.Embedding = embeddingResponse.Vector.ToArray();
+                    
+                    _logger.LogInformation("  📊 EMBEDDING VECTOR DETAILS for chunk {Index}:", chunk.ChunkIndex);
+                    _logger.LogInformation("     Dimension: {Dim}", chunk.Embedding.Length);
+                    _logger.LogInformation("     First 5 values: [{Values}]", 
+                        string.Join(", ", chunk.Embedding.Take(5).Select(v => v.ToString("F6"))));
+                    _logger.LogInformation("     Last 5 values: [{Values}]", 
+                        string.Join(", ", chunk.Embedding.TakeLast(5).Select(v => v.ToString("F6"))));
+                    _logger.LogInformation("     Min/Max: [{Min:F6}, {Max:F6}]", chunk.Embedding.Min(), chunk.Embedding.Max());
+                    _logger.LogInformation("     Mean: {Mean:F6}", chunk.Embedding.Average());
+                    
                     chunks.Add(chunk);
                     indexed++;
 
-                    _logger.LogDebug("  ✅ Embedding generated (dimension: {Dim})", chunk.Embedding.Length);
+                    _logger.LogInformation("  ✅ Chunk {Index} indexed successfully", chunk.ChunkIndex);
                 }
 
                 _logger.LogInformation("✅ Indexed {FilePath} ({ChunkCount} chunks)",
@@ -295,15 +336,15 @@ public class CodebaseContextService
             _logger.LogInformation("   Min similarity: {Min:F4}", allSimilarities.Last().Similarity);
             _logger.LogInformation("   Mean similarity: {Mean:F4}", allSimilarities.Average(s => s.Similarity));
 
-            var aboveThreshold = allSimilarities.Count(s => s.Similarity > 0.7);
-            var above06 = allSimilarities.Count(s => s.Similarity > 0.6 && s.Similarity <= 0.7);
-            var above05 = allSimilarities.Count(s => s.Similarity > 0.5 && s.Similarity <= 0.6);
-            var below05 = allSimilarities.Count(s => s.Similarity <= 0.5);
+            var aboveThreshold = allSimilarities.Count(s => s.Similarity > 0.4);
+            var above03 = allSimilarities.Count(s => s.Similarity > 0.3 && s.Similarity <= 0.4);
+            var above02 = allSimilarities.Count(s => s.Similarity > 0.2 && s.Similarity <= 0.3);
+            var below02 = allSimilarities.Count(s => s.Similarity <= 0.2);
 
-            _logger.LogInformation("   Chunks with similarity > 0.7 (threshold): {Count}", aboveThreshold);
-            _logger.LogInformation("   Chunks with similarity 0.6-0.7: {Count}", above06);
-            _logger.LogInformation("   Chunks with similarity 0.5-0.6: {Count}", above05);
-            _logger.LogInformation("   Chunks with similarity <= 0.5: {Count}", below05);
+            _logger.LogInformation("   Chunks with similarity > 0.4 (threshold): {Count}", aboveThreshold);
+            _logger.LogInformation("   Chunks with similarity 0.3-0.4: {Count}", above03);
+            _logger.LogInformation("   Chunks with similarity 0.2-0.3: {Count}", above02);
+            _logger.LogInformation("   Chunks with similarity <= 0.2: {Count}", below02);
 
             // Top 10 matches regardless of threshold (for debugging)
             _logger.LogInformation("🔝 TOP 10 MATCHES (before threshold filter):");
@@ -314,13 +355,13 @@ public class CodebaseContextService
             }
 
             var results = allSimilarities
-                .Where(r => r.Similarity > 0.7) // Relevance threshold
+                .Where(r => r.Similarity > 0.4) // Lowered threshold for better context retrieval
                 .Take(maxResults)
                 .ToList();
 
             if (results.Count == 0)
             {
-                _logger.LogInformation("❌ No chunks passed the 0.7 similarity threshold for {FilePath}", file.Path);
+                _logger.LogInformation("❌ No chunks passed the 0.4 similarity threshold for {FilePath}", file.Path);
                 _logger.LogInformation("   Closest match was: {Similarity:F4} at {Location}",
                     allSimilarities.First().Similarity, allSimilarities.First().Chunk.Metadata);
                 return string.Empty;
@@ -335,14 +376,40 @@ public class CodebaseContextService
             int resultIndex = 1;
             foreach (var result in results)
             {
-                _logger.LogInformation("📄 RETRIEVED CHUNK {Index}:", resultIndex);
+                _logger.LogInformation("📄 RETRIEVED CHUNK {Index} - DETAILED ANALYSIS:", resultIndex);
                 _logger.LogInformation("   File: {FilePath}", result.Chunk.FilePath);
                 _logger.LogInformation("   Lines: {Start} to {End}", result.Chunk.StartLine, result.Chunk.EndLine);
-                _logger.LogInformation("   Similarity: {Similarity:F4}", result.Similarity);
-                _logger.LogInformation("   Content preview: {Preview}",
-                    result.Chunk.Content.Length > 100
-                        ? result.Chunk.Content.Substring(0, 100).Replace("\n", "\\n") + "..."
-                        : result.Chunk.Content.Replace("\n", "\\n"));
+                _logger.LogInformation("   Similarity Score: {Similarity:F4}", result.Similarity);
+                
+                _logger.LogInformation("   🔤 CHUNK CONTENT ({Length} chars):", result.Chunk.Content.Length);
+                _logger.LogInformation("   Full content: {Content}", result.Chunk.Content.Replace("\n", "\\n"));
+                
+                _logger.LogInformation("   📊 VECTOR DETAILS:");
+                _logger.LogInformation("     Chunk vector first 5: [{Values}]", 
+                    string.Join(", ", result.Chunk.Embedding.Take(5).Select(v => v.ToString("F6"))));
+                _logger.LogInformation("     Chunk vector last 5: [{Values}]", 
+                    string.Join(", ", result.Chunk.Embedding.TakeLast(5).Select(v => v.ToString("F6"))));
+                _logger.LogInformation("     Chunk vector range: [{Min:F6}, {Max:F6}]", 
+                    result.Chunk.Embedding.Min(), result.Chunk.Embedding.Max());
+                
+                _logger.LogInformation("   🧮 SIMILARITY CALCULATION:");
+                var dotProduct = 0.0;
+                var queryMagnitude = 0.0;
+                var chunkMagnitude = 0.0;
+                
+                for (int i = 0; i < Math.Min(queryVector.Length, result.Chunk.Embedding.Length); i++)
+                {
+                    dotProduct += queryVector[i] * result.Chunk.Embedding[i];
+                    queryMagnitude += queryVector[i] * queryVector[i];
+                    chunkMagnitude += result.Chunk.Embedding[i] * result.Chunk.Embedding[i];
+                }
+                queryMagnitude = Math.Sqrt(queryMagnitude);
+                chunkMagnitude = Math.Sqrt(chunkMagnitude);
+                
+                _logger.LogInformation("     Dot product: {DotProduct:F6}", dotProduct);
+                _logger.LogInformation("     Query magnitude: {QueryMag:F6}", queryMagnitude);
+                _logger.LogInformation("     Chunk magnitude: {ChunkMag:F6}", chunkMagnitude);
+                _logger.LogInformation("     Cosine similarity: {Cosine:F6}", dotProduct / (queryMagnitude * chunkMagnitude));
 
                 context.AppendLine($"### Similar code (relevance: {result.Similarity:F2})");
                 context.AppendLine($"Location: {result.Chunk.Metadata}");
@@ -489,10 +556,20 @@ public class CodebaseContextService
         }
 
         var finalContext = context.ToString();
-        _logger.LogInformation("========================================");
-        _logger.LogInformation("FINAL RAG CONTEXT ({Length} chars total):", finalContext.Length);
+        _logger.LogInformation("╔════════════════════════════════════════════════════════════╗");
+        _logger.LogInformation("║ FINAL RAG CONTEXT SENT TO LLM                             ║");
+        _logger.LogInformation("╚════════════════════════════════════════════════════════════╝");
+        _logger.LogInformation("📏 Context Statistics:");
+        _logger.LogInformation("   Total length: {Length} characters", finalContext.Length);
+        _logger.LogInformation("   Line count: {Lines}", finalContext.Split('\n').Length);
+        _logger.LogInformation("   Word count: ~{Words}", finalContext.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length);
+        
+        _logger.LogInformation("📄 COMPLETE CONTEXT BEING SENT TO LLM:");
+        _logger.LogInformation("────────────────────────────────────────────────────────────");
         _logger.LogInformation("{Context}", finalContext);
-        _logger.LogInformation("========================================");
+        _logger.LogInformation("────────────────────────────────────────────────────────────");
+        _logger.LogInformation("✅ Context successfully prepared for code review LLM");
+        _logger.LogInformation("════════════════════════════════════════════════════════════");
 
         return finalContext;
     }

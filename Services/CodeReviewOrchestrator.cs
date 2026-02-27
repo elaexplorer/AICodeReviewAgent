@@ -160,7 +160,7 @@ public class CodeReviewOrchestrator
             _logger.LogInformation("   User prompt length: {Length} chars", prompt.Length);
             _logger.LogInformation("   Total prompt length: {Length} chars", (messages[0].Text?.Length ?? 0) + prompt.Length);
             _logger.LogInformation("   Codebase context included: {HasContext}", !string.IsNullOrEmpty(codebaseContext));
-            _logger.LogDebug("📝 FULL USER PROMPT:\n{Prompt}", prompt);
+            _logger.LogInformation("📝 FULL USER PROMPT:\n{Prompt}", prompt);
 
             var stopwatch = Stopwatch.StartNew();
             ChatResponse response = await _chatClient.GetResponseAsync(messages);
@@ -197,7 +197,7 @@ public class CodeReviewOrchestrator
                 _logger.LogInformation("📊 TOKEN USAGE: Not available from response");
             }
 
-            _logger.LogDebug("📝 FULL LLM RESPONSE:\n{Response}", responseText);
+            _logger.LogInformation("📝 FULL LLM RESPONSE:\n{Response}", responseText);
             _logger.LogInformation("════════════════════════════════════════════════════════════");
 
             return ParseReviewComments(responseText, file.Path);

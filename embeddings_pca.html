@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Embedding PCA Visualization</title>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .header { background: #f5f5f5; padding: 20px; border-radius: 8px; margin-bottom: 20px; }
+        .explanation { margin: 20px 0; padding: 15px; background: #e8f4f8; border-radius: 5px; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🎯 Embedding Visualization: 1536D → 2D Projection</h1>
+        <p>This shows how your 1536-dimensional code embeddings look when projected onto 2D space using Principal Component Analysis (PCA).</p>
+    </div>
+    
+    <div id="pca-plot" style="width:100%;height:600px;"></div>
+    
+    <div class="explanation">
+        <h3>💡 How to Read This:</h3>
+        <ul>
+            <li><strong>Similar code clusters together</strong> - Authentication code should be near other auth code</li>
+            <li><strong>Distance represents similarity</strong> - Closer points have higher cosine similarity</li>
+            <li><strong>Axes capture most variance</strong> - PC1 and PC2 represent the dimensions with most variation</li>
+            <li><strong>Hover for details</strong> - Mouse over points to see code names and coordinates</li>
+        </ul>
+    </div>
+
+    <script>
+        const data = [
+  {
+    "name": "Auth_Login",
+    "x": 0.017429596,
+    "y": -0.009123795
+  },
+  {
+    "name": "Auth_JWT",
+    "x": -0.0028256848,
+    "y": 0.025441745
+  },
+  {
+    "name": "Auth_Permissions",
+    "x": 0.062982686,
+    "y": -0.054583393
+  },
+  {
+    "name": "Database_Connection",
+    "x": -0.01955731,
+    "y": 0.0010166876
+  },
+  {
+    "name": "Database_Query",
+    "x": -0.03663359,
+    "y": -0.017369207
+  },
+  {
+    "name": "HTTP_Client",
+    "x": 0.024233198,
+    "y": 0.041234836
+  },
+  {
+    "name": "HTTP_API",
+    "x": -0.0111430995,
+    "y": -0.010144718
+  },
+  {
+    "name": "Async_Method",
+    "x": -0.021284701,
+    "y": 0.003324302
+  },
+  {
+    "name": "Task_Processing",
+    "x": -0.0132011045,
+    "y": 0.020203546
+  }
+];
+        
+        const trace = {
+            x: data.map(d => d.x),
+            y: data.map(d => d.y),
+            text: data.map(d => d.name),
+            mode: 'markers+text',
+            type: 'scatter',
+            marker: {
+                size: 12,
+                color: data.map((d, i) => {
+                    if (d.name.includes('Auth')) return '#FF6B6B';
+                    if (d.name.includes('Database')) return '#4ECDC4';
+                    if (d.name.includes('HTTP')) return '#45B7D1';
+                    if (d.name.includes('Async')) return '#96CEB4';
+                    return '#FFEAA7';
+                }),
+                line: { width: 2, color: '#DDD' }
+            },
+            textposition: 'top center',
+            textfont: { size: 10 }
+        };
+
+        const layout = {
+            title: 'Code Embeddings in 2D Space (PCA Projection)',
+            xaxis: { title: 'Principal Component 1 (Most Variation)' },
+            yaxis: { title: 'Principal Component 2 (Second Most Variation)' },
+            hovermode: 'closest',
+            showlegend: false
+        };
+
+        Plotly.newPlot('pca-plot', [trace], layout);
+    </script>
+</body>
+</html>

@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Embedding Dimension Analysis</title>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .header { background: #f5f5f5; padding: 20px; border-radius: 8px; margin-bottom: 20px; }
+        .explanation { margin: 20px 0; padding: 15px; background: #e8f4f8; border-radius: 5px; }
+        .dimension-table { width: 100%; border-collapse: collapse; margin: 20px 0; }
+        .dimension-table th, .dimension-table td { padding: 10px; text-align: left; border-bottom: 1px solid #ddd; }
+        .dimension-table th { background-color: #f8f9fa; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>📊 Embedding Dimension Analysis</h1>
+        <p>This shows which of the 1536 dimensions are most active for different types of code.</p>
+    </div>
+    
+    <div id="dimension-plot" style="width:100%;height:400px;"></div>
+    
+    <div class="explanation">
+        <h3>💡 Understanding Dimensions:</h3>
+        <ul>
+            <li><strong>Each dimension captures different aspects</strong> - Some for "authentication", others for "async patterns"</li>
+            <li><strong>High activation</strong> - Dimension strongly responds to certain code types</li>
+            <li><strong>Patterns reveal specialization</strong> - Related concepts activate similar dimensions</li>
+        </ul>
+    </div>
+    
+    <h3>📋 Most Important Dimensions</h3>
+    <table class="dimension-table">
+        <thead>
+            <tr>
+                <th>Dimension</th>
+                <th>Max Activation</th>
+                <th>Avg Activation</th>
+                <th>Most Responsive Code</th>
+            </tr>
+        </thead>
+        <tbody id="dimension-table-body">
+        </tbody>
+    </table>
+
+    <script>
+        const data = [];
+        
+        // Create bar chart of dimension importance
+        const trace = {
+            x: data.map(d => `Dim ${d.dimension}`),
+            y: data.map(d => d.maxActivation),
+            type: 'bar',
+            marker: {
+                color: data.map(d => d.maxActivation),
+                colorscale: 'Viridis',
+                showscale: true,
+                colorbar: { title: 'Activation Level' }
+            }
+        };
+
+        const layout = {
+            title: 'Most Active Dimensions (Top 20)',
+            xaxis: { title: 'Dimension Index' },
+            yaxis: { title: 'Maximum Activation Value' }
+        };
+
+        Plotly.newPlot('dimension-plot', [trace], layout);
+        
+        // Populate dimension table
+        const tableBody = document.getElementById('dimension-table-body');
+        data.forEach(d => {
+            const row = tableBody.insertRow();
+            row.insertCell(0).textContent = d.dimension;
+            row.insertCell(1).textContent = d.maxActivation.toFixed(4);
+            row.insertCell(2).textContent = d.avgActivation.toFixed(4);
+            row.insertCell(3).textContent = d.topActivators.map(t => `${t.Name} (${t.Activation.toFixed(3)})`).join(', ');
+        });
+    </script>
+</body>
+</html>

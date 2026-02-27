@@ -8,21 +8,81 @@ The landscape of AI development has evolved dramatically with the introduction o
 
 We'll walk through a real-world example: an **intelligent code review agent** that automatically analyzes Azure DevOps pull requests, leverages semantic search across codebases, and provides context-aware feedback using multiple specialized language agents.
 
-## The Challenge: Building Context-Aware Agents
+## System Flow Overview
 
-Traditional AI agents suffer from several limitations:
-- **Limited Context Window**: Can only process small amounts of data at once
-- **No External System Integration**: Cannot interact with APIs or databases
-- **Static Knowledge**: No awareness of dynamic, evolving codebases
-- **Generic Responses**: Lack domain-specific expertise
+Let's first understand how the system works end-to-end with visual diagrams:
 
-Modern enterprise applications require agents that can:
-- **Access External Data**: Pull information from APIs, databases, and services
-- **Maintain Context**: Understand relationships across large codebases
-- **Specialize**: Route tasks to domain-specific expert agents
-- **Scale**: Handle enterprise-grade workloads efficiently
+### High-Level System Flow
 
-## Architecture Overview
+```mermaid
+flowchart TD
+    A[User Requests PR Review] --> B[Code Review Orchestrator]
+    B --> C{Determine File Types}
+    
+    C -->|.cs files| D[DotNet Agent]
+    C -->|.py files| E[Python Agent] 
+    C -->|.rs files| F[Rust Agent]
+    C -->|Other files| G[General Agent]
+    
+    D --> H[RAG Context Service]
+    E --> H
+    F --> H
+    G --> H
+    
+    H --> I[Vector Store Search]
+    H --> J[Azure DevOps MCP]
+    
+    I --> K[Semantic Context]
+    J --> L[PR Metadata]
+    
+    K --> M[Enhanced Review Context]
+    L --> M
+    
+    M --> N[Specialized Language Review]
+    N --> O[Structured Comments]
+    O --> P[Post to Azure DevOps]
+```
+
+### Sequence Diagram: PR Review Process
+
+```mermaid
+sequenceDiagram
+    participant U as User/CLI
+    participant O as Orchestrator
+    participant M as MCP Client
+    participant R as RAG Service
+    participant A as Language Agent
+    participant V as Vector Store
+    participant ADO as Azure DevOps
+
+    U->>O: Request PR Review (project, repo, PR#)
+    O->>M: Get PR Details
+    M->>ADO: Fetch PR via MCP
+    ADO-->>M: PR metadata & files
+    M-->>O: PR data
+    
+    O->>R: Index Repository (if needed)
+    R->>ADO: Fetch repository files
+    R->>V: Generate & store embeddings
+    V-->>R: Confirm indexing
+    
+    loop For each changed file
+        O->>R: Get semantic context for file
+        R->>V: Search similar code
+        V-->>R: Related code chunks
+        R-->>O: Enhanced context
+        
+        O->>A: Review file with context
+        A->>A: Analyze code with domain expertise
+        A-->>O: Review comments
+    end
+    
+    O->>ADO: Post review comments
+    ADO-->>O: Confirmation
+    O-->>U: Review complete
+```
+
+## Architecture Deep Dive
 
 Our Code Review Agent demonstrates all these capabilities through a sophisticated multi-layered architecture:
 
@@ -277,12 +337,14 @@ public async Task<PullRequest?> GetPullRequestAsync(string project, string repos
 
 ## Part 3: RAG Implementation and Context Management
 
+> 📖 **Deep Dive Available**: For comprehensive technical details on RAG implementation, including advanced chunking algorithms, multi-language support, and performance optimization, see our [RAG Deep Dive Guide](deep-dive-rag-implementation.md).
+
 ### The RAG Architecture
 
 Our RAG implementation consists of three key components:
 
 1. **Embedding Generation**: Convert code to semantic vectors
-2. **Vector Storage**: Store and index code chunks
+2. **Vector Storage**: Store and index code chunks  
 3. **Semantic Search**: Find relevant context using similarity
 
 ```csharp
@@ -461,7 +523,8 @@ private string BuildSearchQuery(PullRequestFile file)
     var fileName = Path.GetFileNameWithoutExtension(file.Path);
     queryParts.Add($"file {fileName}");
     
-    return string.Join(' ', queryParts).Substring(0, Math.Min(1000, result.Length));
+    var query = string.Join(' ', queryParts);
+    return query.Length > 1000 ? query.Substring(0, 1000) : query;
 }
 ```
 
@@ -691,6 +754,8 @@ services:
 
 ## Performance and Cost Analysis
 
+> 💡 **For Detailed Analysis**: See [RAG Performance Benchmarks](deep-dive-rag-implementation.md#performance-metrics-and-benchmarks) for comprehensive metrics on large repositories, memory optimization strategies, and cost management techniques.
+
 ### RAG Performance Metrics
 
 **Indexing Phase:**
@@ -741,7 +806,36 @@ private string TruncateContext(string context, int maxTokens = 8000)
 }
 ```
 
-## Best Practices and Lessons Learned
+## Challenges Overcome and Lessons Learned
+
+Building this enterprise AI agent revealed several key challenges that modern systems must address:
+
+### Traditional AI Agent Limitations We Solved
+
+**❌ Limited Context Window**
+- *Problem*: Standard agents can only process small amounts of data at once
+- *Solution*: RAG system with semantic search across entire codebase
+
+**❌ No External System Integration** 
+- *Problem*: Cannot interact with APIs or databases
+- *Solution*: MCP integration with fallback REST API patterns
+
+**❌ Static Knowledge**
+- *Problem*: No awareness of dynamic, evolving codebases  
+- *Solution*: Real-time repository indexing and context assembly
+
+**❌ Generic Responses**
+- *Problem*: Lack domain-specific expertise
+- *Solution*: Specialized language agents with expert knowledge
+
+### Key Requirements We Addressed
+
+✅ **Access External Data**: Pull information from APIs, databases, and services  
+✅ **Maintain Context**: Understand relationships across large codebases  
+✅ **Specialize**: Route tasks to domain-specific expert agents  
+✅ **Scale**: Handle enterprise-grade workloads efficiently
+
+## Best Practices and Implementation Patterns
 
 ### 1. Agent Specialization Strategy
 
@@ -859,4 +953,10 @@ The future of AI agents lies in these sophisticated, context-aware systems that 
 
 ---
 
+## Additional Resources
+
+📚 **Deep Dive Articles:**
+- [RAG Implementation Deep Dive](deep-dive-rag-implementation.md) - Comprehensive technical guide to advanced RAG patterns, chunking algorithms, and performance optimization
+
+🔧 **Source Code:**
 *This article demonstrates real production code from an enterprise code review agent. The complete source code and implementation details are available in the accompanying repository.*

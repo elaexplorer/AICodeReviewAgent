@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Interactive Embedding Explorer</title>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .header { background: #f5f5f5; padding: 20px; border-radius: 8px; margin-bottom: 20px; }
+        .controls { display: flex; gap: 20px; margin: 20px 0; }
+        .control-group { flex: 1; }
+        select, input { width: 100%; padding: 8px; margin: 5px 0; }
+        .stats { background: #f8f9fa; padding: 15px; margin: 10px 0; border-radius: 5px; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🎛️ Interactive Embedding Explorer</h1>
+        <p>Explore individual embedding vectors and compare them interactively.</p>
+    </div>
+    
+    <div class="controls">
+        <div class="control-group">
+            <label>Select Code Sample:</label>
+            <select id="codeSelect">
+                <option value="">Choose a code sample...</option>
+            </select>
+        </div>
+        <div class="control-group">
+            <label>Compare With:</label>
+            <select id="compareSelect">
+                <option value="">Choose another sample...</option>
+            </select>
+        </div>
+    </div>
+    
+    <div id="vector-plot" style="width:100%;height:400px;"></div>
+    
+    <div class="stats" id="stats" style="display:none;">
+        <h3>📊 Vector Statistics</h3>
+        <div id="statsContent"></div>
+    </div>
+    
+    <div class="stats" id="comparison" style="display:none;">
+        <h3>🔍 Comparison Results</h3>
+        <div id="comparisonContent"></div>
+    </div>
+
+    <script>
+        const embeddings = {"Auth_Login":[-0.009271157,0.030540284,-0.01419102,-0.007739502,-0.010205235,-0.029426351,0.024483282,0.00951483,0.005555152,-0.008725795,0.013958951,-0.0024686342,-0.004771919,-0.028010732,-0.007310174,0.019575022,0.0134483995,-0.001563565,0.048038285,-0.01617521,0.0018783086,0.02494742,0.010443106,-0.010501123,0.029635213,-0.005793023,-0.004359997,0.006509536,0.0072115446,-0.019087676,0.0070607,-0.008099209,0.016975848,0.0029168176,0.039498147,-0.028869387,0.012670969,-0.038407423,-0.016917832,-0.0027587204,-0.014214228,-0.0028675029,0.022916816,0.036806148,0.02273116,-0.03409094,-0.00887664,0.015896728,0.018414676,0.040356804],"Auth_JWT":[-0.014529825,-0.013046994,0.00096227595,-0.010514625,-0.009349543,-0.02222322,0.027133895,0.0041066734,-0.0035554261,0.020778902,-0.03244898,-0.022723915,0.014837946,-0.0007624788,0.01347066,0.028289348,0.010504996,-0.011872282,0.0055269185,0.0013901547,-0.015877854,0.034548055,-0.02049004,0.0016188382,0.026652455,-0.0076452494,-0.015656393,0.0066968147,-0.010610913,-0.005401744,-0.024553383,0.011121238,0.009075123,-0.051687278,0.032911163,-0.0053391573,0.014346879,-0.0038418823,-0.027345728,-0.019007206,-0.025689578,-0.0008100209,0.02235802,0.021915097,0.009778024,-0.03568425,0.022569854,0.004299249,0.010090959,0.021799553],"Auth_Permissions":[-0.024604177,0.022204565,-0.0056190034,0.034832392,-0.011531172,-0.012454101,0.01283413,0.019240336,0.018697439,-0.0049159494,0.015385754,0.043084458,-0.006395349,0.01744877,0.012084929,-0.011390019,0.00070237543,-0.017307617,-0.0034772675,-0.0180351,-0.0032791093,0.03937103,0.015874363,0.007220555,0.03153157,-0.037503455,0.0133770285,-0.0070468276,-0.01363762,-0.010597386,-0.017926522,-0.0006776057,0.00295337,-0.011346587,0.042889014,-0.053290956,0.0016056235,-0.08386702,-0.013268449,-0.028491333,-0.062151067,0.01659099,0.010743969,0.0509022,0.04152091,-0.025364237,-0.013116437,-0.017698504,0.027839856,0.026276307],"Database_Connection":[-0.003916963,-0.009797174,-0.010368993,-0.006385317,-0.01176042,-0.023597082,0.026055906,0.04269585,-0.016659006,0.005356042,0.02704706,-0.03945554,0.015229458,-0.003633436,-0.016811492,0.011379207,-0.001791701,-0.0014414615,0.0071953945,-0.03964615,0.034537893,-0.015820337,-0.01911783,-0.014104879,0.013552121,-0.012370361,0.022034109,0.0119510265,-0.011207661,-0.0053655724,0.0037144439,0.006623575,0.012989832,0.0053369813,0.054589696,-0.039798632,-0.04589804,-0.02826694,-0.019861195,-0.014314546,0.011617465,0.02941058,0.029563066,0.02144323,0.05737255,-0.017707342,-0.041361608,-0.013018423,-0.02350178,0.042009667],"Database_Query":[-0.026782183,0.0061133243,-0.004953577,0.003404117,-0.018537177,0.010339125,0.0074233226,0.0109119555,0.0031904792,-0.023533013,-0.035834786,-0.056531817,0.02080972,0.029449133,0.024716238,0.012592885,-0.018509006,0.032303896,-0.006052285,0.007963286,0.040041804,0.051723797,0.012696182,0.0033102103,0.042821445,-0.0180113,-0.00032573877,-0.00081581424,-0.0015905444,0.0038008727,-0.016875029,-0.008869485,0.014602488,-0.009728732,-0.005742393,-0.030294294,-0.026782183,-0.046652835,-0.045525957,-0.013325357,-0.019213306,0.0032186513,-0.006991352,0.01633037,0.04894416,-0.03251049,-0.014104783,0.015278616,0.0071791653,0.011052815],"HTTP_Client":[-0.02410365,0.015405766,-0.01633369,-0.00730041,-0.022896232,-0.038346715,-0.018312514,0.022169545,-0.00035286247,0.018178357,0.025422867,0.0043349676,-0.022158366,0.009933253,-0.01403065,-0.024282528,0.0031247544,0.027122198,-0.00050204294,-0.0049107275,0.0084463395,0.050666858,0.02189005,-0.0016909449,0.023231626,-0.015528743,-0.0027390511,-0.0028787986,-0.030476138,0.029447595,-0.0026579977,0.014287786,0.0449428,-0.023231626,0.03709458,0.0068308585,0.021096284,0.011951207,0.008524599,-0.043958977,-0.024930956,0.010995334,0.022024209,0.014544921,0.011319549,0.003650205,0.02358938,0.006076222,0.034858618,0.045054596],"HTTP_API":[-0.013400483,-0.0035931803,-0.010226068,-0.0146069955,-0.03565653,-0.013986168,0.012685947,0.01752371,0.0049519707,0.011485292,-0.008498296,-0.03104133,0.017593991,0.008246452,0.041888226,0.026613547,-0.044512097,-0.00089902716,-0.0060149897,0.0004776997,0.03158016,0.027363224,-4.683196E-05,0.0005223582,0.02687125,0.0013009538,0.010337348,0.0057660732,-0.013552762,-0.045730323,-0.011092883,0.031791005,0.026824394,-0.028745443,0.01837881,-0.004632772,0.007830614,-0.039428346,0.009335826,-0.013623044,-0.03729645,0.045589756,0.02478621,0.057022337,0.021471228,-0.039147217,0.0153801,0.0073854937,-0.0054175905,0.025254758],"Async_Method":[-0.03885099,0.005541106,-0.02503535,-0.0041358927,-0.02158144,-0.029347237,-0.023033401,0.025387341,0.038521,-0.03346113,0.01077422,-0.04118293,-0.0004351762,0.015366601,-2.7219996E-05,-0.01653257,-0.012330679,0.008948267,-0.025959326,-0.044504844,-0.00032999142,0.041424923,-0.004116643,0.0043338872,0.03962097,0.0021421944,-0.016323576,-0.0076063024,-0.009003266,0.0045181327,0.0016485822,0.031635176,-0.0013605271,-0.033769123,0.042898886,-0.0036354056,0.012055687,-0.025959326,0.027015299,-0.04107293,0.0053321114,0.010944716,-0.025321342,0.020217475,0.017104555,-0.00845878,-0.015751591,-0.014079634,-0.0076833004,0.013705644],"Task_Processing":[-0.016141033,-0.020167276,-0.019914886,-0.0053933645,0.0038940392,0.020864358,-0.03374834,0.030599456,-0.011862397,0.020455724,0.008190703,-0.033099335,-0.017114542,-0.018064015,0.0026816588,-0.0053062295,-0.035839584,0.03622418,0.0015909674,-0.021297028,0.013136373,0.040286478,-0.015564138,0.039781697,0.009338483,-0.010546356,-0.009032007,0.0016901211,-0.04586313,-0.020960508,0.016008828,0.026128521,-0.0068866806,-0.020503798,0.06398723,-0.002508891,-0.013749324,-0.009080082,-0.024686286,-0.07033308,-0.011387661,0.027402498,0.0055706394,0.03523865,0.061246987,0.022715228,0.011033111,-0.0070729693,-0.0008510699,0.01686215]};
+        
+        // Populate dropdowns
+        const codeSelect = document.getElementById('codeSelect');
+        const compareSelect = document.getElementById('compareSelect');
+        
+        Object.keys(embeddings).forEach(name => {
+            const option1 = new Option(name, name);
+            const option2 = new Option(name, name);
+            codeSelect.add(option1);
+            compareSelect.add(option2);
+        });
+        
+        // Event handlers
+        codeSelect.addEventListener('change', updateVisualization);
+        compareSelect.addEventListener('change', updateVisualization);
+        
+        function updateVisualization() {
+            const selected = codeSelect.value;
+            const compared = compareSelect.value;
+            
+            if (!selected) return;
+            
+            const vector = embeddings[selected];
+            const traces = [{
+                x: Array.from({length: vector.length}, (_, i) => i),
+                y: vector,
+                type: 'scatter',
+                mode: 'lines+markers',
+                name: selected,
+                line: { color: '#FF6B6B' }
+            }];
+            
+            if (compared && compared !== selected) {
+                const compareVector = embeddings[compared];
+                traces.push({
+                    x: Array.from({length: compareVector.length}, (_, i) => i),
+                    y: compareVector,
+                    type: 'scatter',
+                    mode: 'lines+markers',
+                    name: compared,
+                    line: { color: '#4ECDC4' }
+                });
+            }
+            
+            const layout = {
+                title: `Embedding Vector Components (first 50 dimensions)`,
+                xaxis: { title: 'Dimension Index' },
+                yaxis: { title: 'Activation Value' },
+                showlegend: true
+            };
+            
+            Plotly.newPlot('vector-plot', traces, layout);
+            
+            // Update stats
+            updateStats(selected, vector);
+            
+            if (compared && compared !== selected) {
+                updateComparison(selected, compared, vector, embeddings[compared]);
+            }
+        }
+        
+        function updateStats(name, vector) {
+            const stats = document.getElementById('stats');
+            const content = document.getElementById('statsContent');
+            
+            const min = Math.min(...vector);
+            const max = Math.max(...vector);
+            const mean = vector.reduce((a, b) => a + b, 0) / vector.length;
+            const magnitude = Math.sqrt(vector.reduce((a, b) => a + b * b, 0));
+            
+            content.innerHTML = `
+                <p><strong>Name:</strong> ${name}</p>
+                <p><strong>Dimensions:</strong> ${vector.length} (showing first 50)</p>
+                <p><strong>Range:</strong> [${min.toFixed(4)}, ${max.toFixed(4)}]</p>
+                <p><strong>Mean:</strong> ${mean.toFixed(4)}</p>
+                <p><strong>Magnitude:</strong> ${magnitude.toFixed(4)}</p>
+            `;
+            
+            stats.style.display = 'block';
+        }
+        
+        function updateComparison(name1, name2, vector1, vector2) {
+            const comparison = document.getElementById('comparison');
+            const content = document.getElementById('comparisonContent');
+            
+            const similarity = cosineSimilarity(vector1, vector2);
+            const euclideanDistance = euclideanDistance(vector1, vector2);
+            
+            content.innerHTML = `
+                <p><strong>Comparing:</strong> ${name1} vs ${name2}</p>
+                <p><strong>Cosine Similarity:</strong> ${similarity.toFixed(4)}</p>
+                <p><strong>Euclidean Distance:</strong> ${euclideanDistance.toFixed(4)}</p>
+                <p><strong>Interpretation:</strong> ${interpretSimilarity(similarity)}</p>
+            `;
+            
+            comparison.style.display = 'block';
+        }
+        
+        function cosineSimilarity(a, b) {
+            const dotProduct = a.reduce((sum, ai, i) => sum + ai * b[i], 0);
+            const magnitudeA = Math.sqrt(a.reduce((sum, ai) => sum + ai * ai, 0));
+            const magnitudeB = Math.sqrt(b.reduce((sum, bi) => sum + bi * bi, 0));
+            return dotProduct / (magnitudeA * magnitudeB);
+        }
+        
+        function euclideanDistance(a, b) {
+            return Math.sqrt(a.reduce((sum, ai, i) => sum + Math.pow(ai - b[i], 2), 0));
+        }
+        
+        function interpretSimilarity(sim) {
+            if (sim > 0.9) return "Nearly identical concepts";
+            if (sim > 0.8) return "Very similar concepts";
+            if (sim > 0.7) return "Related concepts";
+            if (sim > 0.5) return "Somewhat related";
+            return "Different concepts";
+        }
+    </script>
+</body>
+</html>

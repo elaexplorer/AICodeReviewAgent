@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Embedding Similarity Heatmap</title>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .header { background: #f5f5f5; padding: 20px; border-radius: 8px; margin-bottom: 20px; }
+        .explanation { margin: 20px 0; padding: 15px; background: #e8f4f8; border-radius: 5px; }
+        .stats { display: flex; justify-content: space-around; margin: 20px 0; }
+        .stat { text-align: center; padding: 15px; background: white; border-radius: 5px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🔥 Embedding Similarity Heatmap</h1>
+        <p>This heatmap shows cosine similarity between all pairs of code embeddings. Values range from 0 (completely different) to 1 (identical).</p>
+    </div>
+    
+    <div id="heatmap" style="width:100%;height:600px;"></div>
+    
+    <div class="stats">
+        <div class="stat">
+            <h3>🟢 High Similarity</h3>
+            <p>>0.8</p>
+            <p>Same domain/concept</p>
+        </div>
+        <div class="stat">
+            <h3>🟡 Medium Similarity</h3>
+            <p>0.6 - 0.8</p>
+            <p>Related concepts</p>
+        </div>
+        <div class="stat">
+            <h3>🔴 Low Similarity</h3>
+            <p><0.6</p>
+            <p>Different domains</p>
+        </div>
+    </div>
+    
+    <div class="explanation">
+        <h3>💡 How to Read This:</h3>
+        <ul>
+            <li><strong>Diagonal is always 1.0</strong> - Each code sample is identical to itself</li>
+            <li><strong>Matrix is symmetric</strong> - Similarity(A,B) = Similarity(B,A)</li>
+            <li><strong>Color intensity</strong> - Darker red = higher similarity</li>
+            <li><strong>Expected patterns</strong> - Authentication code should be similar to other auth code</li>
+            <li><strong>Hover for exact values</strong> - Mouse over cells for precise similarity scores</li>
+        </ul>
+    </div>
+
+    <script>
+        const matrix = [[1,0.387,0.509,0.37,0.395,0.365,0.467,0.271,0.26],[0.387,1,0.263,0.243,0.25,0.211,0.353,0.147,0.15],[0.509,0.263,1,0.244,0.366,0.273,0.369,0.234,0.208],[0.37,0.243,0.244,1,0.337,0.322,0.289,0.292,0.301],[0.395,0.25,0.366,0.337,1,0.277,0.462,0.287,0.275],[0.365,0.211,0.273,0.322,0.277,1,0.333,0.363,0.323],[0.467,0.353,0.369,0.289,0.462,0.333,1,0.226,0.267],[0.271,0.147,0.234,0.292,0.287,0.363,0.226,1,0.301],[0.26,0.15,0.208,0.301,0.275,0.323,0.267,0.301,1]];
+        const labels = ["Auth_Login","Auth_JWT","Auth_Permissions","Database_Connection","Database_Query","HTTP_Client","HTTP_API","Async_Method","Task_Processing"];
+        
+        const trace = {
+            z: matrix,
+            x: labels,
+            y: labels,
+            type: 'heatmap',
+            colorscale: [
+                [0, '#FFF5F5'],
+                [0.5, '#FED7D7'], 
+                [0.7, '#FEB2B2'],
+                [0.8, '#FC8181'],
+                [0.9, '#F56565'],
+                [1, '#E53E3E']
+            ],
+            showscale: true,
+            colorbar: {
+                title: 'Cosine Similarity',
+                titleside: 'right'
+            }
+        };
+
+        const layout = {
+            title: 'Code Embedding Similarity Matrix',
+            xaxis: { title: 'Code Samples', tickangle: -45 },
+            yaxis: { title: 'Code Samples' },
+            width: 800,
+            height: 600
+        };
+
+        Plotly.newPlot('heatmap', [trace], layout);
+    </script>
+</body>
+</html>
