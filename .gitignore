@@ -33,3 +33,6 @@ TestResults/
 
 # Claude settings with secrets
 .claude/settings.local.json
+
+# Temporary repository clones
+temp_repos/

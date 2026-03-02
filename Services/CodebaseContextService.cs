@@ -16,6 +16,7 @@ public class CodebaseContextService
     private readonly ILogger<CodebaseContextService> _logger;
     private readonly Dictionary<string, List<CodeChunk>> _inMemoryStore;
     private const string COLLECTION_NAME = "codebase";
+    private const int CloneTimeoutSeconds = 60;
 
     public CodebaseContextService(
         IEmbeddingGenerator<string, Embedding<float>> embeddingGenerator,
@@ -74,192 +75,398 @@ public class CodebaseContextService
     }
 
     /// <summary>
-    /// Index the entire repository for semantic search
-    /// Run this once when PR is opened, or periodically
+    /// Index the entire repository using git clone for comprehensive file discovery
+    /// This method clones the repository locally and indexes all files
     /// </summary>
-    public async Task<int> IndexRepositoryAsync(
+    public async Task<int> IndexRepositoryWithCloneAsync(
         string project,
         string repositoryId,
-        string branch = "main")
+        string branch = "master",
+        string? repositoryUrl = null)
     {
         _logger.LogInformation("╔════════════════════════════════════════════════════════════╗");
-        _logger.LogInformation("║ RAG INDEXING: Starting Repository Indexing                ║");
+        _logger.LogInformation("║ RAG INDEXING: Starting Git Clone-Based Repository Indexing ║");
         _logger.LogInformation("╚════════════════════════════════════════════════════════════╝");
         _logger.LogInformation("Repository ID: {RepositoryId}", repositoryId);
         _logger.LogInformation("Project: {Project}", project);
         _logger.LogInformation("Branch: {Branch}", branch);
 
-        // Step 1: Check available branches first
-        _logger.LogInformation("Step 1: Checking available branches...");
-        var branches = await _adoClient.GetRepositoryBranchesAsync(project, repositoryId);
-        _logger.LogInformation("Available branches: {Branches}", string.Join(", ", branches));
+        // Step 1: Prepare clone directory (in current codebase for easy access)
+        var currentDir = Directory.GetCurrentDirectory();
+        var tempReposDir = Path.Combine(currentDir, "temp_repos");
+        var tempDir = Path.Combine(tempReposDir, repositoryId);
+        var cloneDir = Path.Combine(tempDir, "repo");
         
-        // Try to find the branch with the most files
-        string bestBranch = branch;
-        int maxFiles = 0;
-        
-        var branchesToTry = branches.Any() ? branches : new List<string> { "main", "master", "develop" };
-        
-        foreach (var tryBranch in branchesToTry.Take(3)) // Try up to 3 branches
+        try
         {
-            _logger.LogInformation("🔍 Checking branch '{Branch}' for files...", tryBranch);
-            var testFiles = await _adoClient.GetRepositoryItemsAsync(project, repositoryId, tryBranch);
-            _logger.LogInformation("   Branch '{Branch}' has {FileCount} files", tryBranch, testFiles.Count);
+            _logger.LogInformation("Step 1: Preparing clone directory: {CloneDir}", cloneDir);
             
-            if (testFiles.Count > maxFiles)
+            // Check if directory already exists and is valid
+            if (Directory.Exists(cloneDir))
             {
-                maxFiles = testFiles.Count;
-                bestBranch = tryBranch;
-                _logger.LogInformation("   ⭐ Branch '{Branch}' is now the best candidate with {FileCount} files", tryBranch, testFiles.Count);
+                _logger.LogInformation("   📁 Clone directory already exists: {CloneDir}", cloneDir);
+                _logger.LogInformation("   🔍 Checking if existing clone is valid...");
+                
+                // Check if it's a valid git repo with files
+                var gitDir = Path.Combine(cloneDir, ".git");
+                if (Directory.Exists(gitDir))
+                {
+                    var fileCount = Directory.GetFiles(cloneDir, "*.*", SearchOption.AllDirectories)
+                        .Where(f => !IsGitFile(f))
+                        .Count();
+                    
+                    if (fileCount > 0)
+                    {
+                        _logger.LogInformation("   ✅ Existing clone is valid with {FileCount} files, reusing it", fileCount);
+                        _logger.LogInformation("   ⚡ Skipping git clone - using existing repository");
+                        goto ProcessFiles; // Skip cloning, go directly to file processing
+                    }
+                }
+                
+                _logger.LogInformation("   🧹 Existing clone is invalid, cleaning up...");
+                await ForceDeleteDirectoryAsync(tempDir);
             }
+            Directory.CreateDirectory(tempDir);
+
+            // Step 2: Construct repository URL and clone
+            var repoUrl = repositoryUrl ?? $"https://dev.azure.com/{_adoClient.Organization}/{project}/_git/{repositoryId}";
+            repoUrl = BuildAuthenticatedCloneUrl(repoUrl);
+            var adoPat = _adoClient.PersonalAccessToken;
+            var logUrl = !string.IsNullOrEmpty(adoPat) ? repoUrl.Replace(adoPat, "***") : repoUrl;
+            _logger.LogInformation("Step 2: Cloning repository from: {RepoUrl}", logUrl);
+            _logger.LogInformation("   Requested branch: {Branch} (will auto-detect if this fails)", branch);
+
+            // Try cloning the specified branch first, fallback to default branch if it fails
+            _logger.LogInformation("🔧 Attempting to clone branch '{Branch}' (shallow clone only)...", branch);
+            _logger.LogInformation("   Using --depth 1 --single-branch for optimized shallow clone");
+            _logger.LogInformation("   Using {TimeoutSeconds}-second timeout for shallow clone", CloneTimeoutSeconds);
+            var cloneResult = await RunGitCommandAsync($"clone --depth 1 --single-branch --branch {branch} \"{repoUrl}\" \"{cloneDir}\"", tempDir, CloneTimeoutSeconds);
+            
+            if (!cloneResult.Success)
+            {
+                _logger.LogWarning("⚠️ Failed to clone branch '{Branch}': {Error}", branch, cloneResult.Error);
+                
+                // Clean up any partial/empty directories left by failed clone
+                if (Directory.Exists(cloneDir))
+                {
+                    _logger.LogInformation("   🧹 Cleaning up partial clone directory from failed attempt...");
+                    await CleanupCloneDirectoryAsync(tempDir);
+                    Directory.CreateDirectory(tempDir);
+                }
+                
+                _logger.LogInformation("🔧 Attempting to clone default branch (no branch specified)...");
+                
+                // Try cloning without specifying branch (uses default branch)
+                cloneResult = await RunGitCommandAsync($"clone --depth 1 --single-branch \"{repoUrl}\" \"{cloneDir}\"", tempDir, CloneTimeoutSeconds);
+            }
+            
+            if (!cloneResult.Success)
+            {
+                _logger.LogError("❌ Git clone failed: {Error}", cloneResult.Error);
+                return 0;
+            }
+
+            _logger.LogInformation("✅ Repository cloned successfully");
+
+            ProcessFiles:
+            // Step 3: Discover all files using file system
+            _logger.LogInformation("Step 3: Discovering files using file system traversal...");
+            var allFiles = Directory.GetFiles(cloneDir, "*.*", SearchOption.AllDirectories)
+                .Where(f => !IsGitFile(f)) // Skip .git directory files
+                .Select(f => Path.GetRelativePath(cloneDir, f).Replace('\\', '/')) // Normalize to forward slashes
+                .ToList();
+
+            _logger.LogInformation("Found {FileCount} total files via file system (vs API discovery)", allFiles.Count);
+
+            // Step 4: Process files with actual content from disk
+            var chunks = await ProcessFilesFromDiskAsync(cloneDir, allFiles);
+
+            // Step 5: Store in memory index
+            _inMemoryStore[repositoryId] = chunks;
+            
+            _logger.LogInformation("╔════════════════════════════════════════════════════════════╗");
+            _logger.LogInformation("║ RAG INDEXING: Git Clone-Based Indexing Complete            ║");
+            _logger.LogInformation("╚════════════════════════════════════════════════════════════╝");
+            _logger.LogInformation("📊 FINAL SUMMARY:");
+            _logger.LogInformation("   Files discovered: {FileCount}", allFiles.Count);
+            _logger.LogInformation("   Chunks created: {ChunkCount}", chunks.Count);
+            _logger.LogInformation("   Files indexed: {IndexedCount}", chunks.Select(c => c.FilePath).Distinct().Count());
+            _logger.LogInformation("════════════════════════════════════════════════════════════");
+
+            return chunks.Count;
         }
-        
-        _logger.LogInformation("✅ Selected branch '{Branch}' with {FileCount} files for indexing", bestBranch, maxFiles);
-        
-        // Get all files from the best branch
-        _logger.LogInformation("Step 2: Fetching repository file tree from branch '{Branch}'...", bestBranch);
-        var files = await _adoClient.GetRepositoryItemsAsync(project, repositoryId, bestBranch);
-
-        _logger.LogInformation("Found {FileCount} total files in repository", files.Count);
-
-        if (files.Count == 0)
+        catch (Exception ex)
         {
-            _logger.LogWarning("⚠️  No files found in repository. Indexing cannot proceed.");
-            _logger.LogWarning("This could be due to:");
-            _logger.LogWarning("  - Invalid branch name (currently: {Branch})", branch);
-            _logger.LogWarning("  - Permissions issue with PAT");
-            _logger.LogWarning("  - Repository is empty");
+            _logger.LogError(ex, "❌ Git clone-based indexing failed");
             return 0;
         }
-
-        int indexed = 0;
-        int skipped = 0;
-        int failed = 0;
-        var chunks = new List<CodeChunk>();
-
-        _logger.LogInformation("Step 3: Processing all {FileCount} files (no artificial limits)...", files.Count);
-
-        foreach (var filePath in files) // Process ALL files found
+        finally
         {
-            // Skip binary files, tests, generated code
-            if (ShouldSkipFile(filePath))
-            {
-                skipped++;
-                _logger.LogDebug("⏭️  Skipped (pattern match): {FilePath}", filePath);
-                continue;
-            }
-
+            // Cleanup
             try
             {
-                _logger.LogInformation("📄 Processing file: {FilePath}", filePath);
-
-                // Fetch file content
-                var content = await _adoClient.GetFileContentAsync(
-                    project, repositoryId, filePath, branch);
-
-                if (string.IsNullOrEmpty(content))
+                if (Directory.Exists(tempDir))
                 {
-                    skipped++;
-                    _logger.LogDebug("⏭️  Skipped (empty file): {FilePath}", filePath);
-                    continue;
+                    _logger.LogInformation("🧹 Cleaning up clone directory...");
+                    await CleanupCloneDirectoryAsync(tempDir);
                 }
-
-                if (content.Length < 50)
-                {
-                    skipped++;
-                    _logger.LogDebug("⏭️  Skipped (too small, {Length} chars): {FilePath}",
-                        content.Length, filePath);
-                    continue;
-                }
-
-                _logger.LogInformation("  File size: {Size} bytes", content.Length);
-
-                // Split large files into chunks
-                var fileChunks = SplitIntoChunks(content, filePath);
-                _logger.LogInformation("  Created {ChunkCount} chunks", fileChunks.Count);
-
-                foreach (var chunk in fileChunks)
-                {
-                    _logger.LogInformation("  🔤 CHUNK CONTENT for chunk {Index} (lines {Start}-{End}):",
-                        chunk.ChunkIndex, chunk.StartLine, chunk.EndLine);
-                    _logger.LogInformation("     Preview (first 200 chars): {Content}",
-                        chunk.Content.Length > 200 ? chunk.Content.Substring(0, 200).Replace("\n", "\\n") + "..." : chunk.Content.Replace("\n", "\\n"));
-                    _logger.LogInformation("     Full content length: {Length} characters", chunk.Content.Length);
-
-                    _logger.LogInformation("  🧮 Generating embedding for chunk {Index}...", chunk.ChunkIndex);
-
-                    // Generate embedding for the chunk
-                    var embeddingResponse = await _embeddingGenerator.GenerateAsync(chunk.Content);
-                    chunk.Embedding = embeddingResponse.Vector.ToArray();
-                    
-                    _logger.LogInformation("  📊 EMBEDDING VECTOR DETAILS for chunk {Index}:", chunk.ChunkIndex);
-                    _logger.LogInformation("     Dimension: {Dim}", chunk.Embedding.Length);
-                    _logger.LogInformation("     First 5 values: [{Values}]", 
-                        string.Join(", ", chunk.Embedding.Take(5).Select(v => v.ToString("F6"))));
-                    _logger.LogInformation("     Last 5 values: [{Values}]", 
-                        string.Join(", ", chunk.Embedding.TakeLast(5).Select(v => v.ToString("F6"))));
-                    _logger.LogInformation("     Min/Max: [{Min:F6}, {Max:F6}]", chunk.Embedding.Min(), chunk.Embedding.Max());
-                    _logger.LogInformation("     Mean: {Mean:F6}", chunk.Embedding.Average());
-                    
-                    chunks.Add(chunk);
-                    indexed++;
-
-                    _logger.LogInformation("  ✅ Chunk {Index} indexed successfully", chunk.ChunkIndex);
-                }
-
-                _logger.LogInformation("✅ Indexed {FilePath} ({ChunkCount} chunks)",
-                    filePath, fileChunks.Count);
             }
             catch (Exception ex)
             {
-                failed++;
-                _logger.LogWarning(ex, "❌ Failed to index {FilePath}: {Error}",
-                    filePath, ex.Message);
+                _logger.LogWarning(ex, "⚠️  Failed to cleanup clone directory: {TempDir}", tempDir);
             }
         }
+    }
 
-        // Store all chunks in memory
-        _inMemoryStore[repositoryId] = chunks;
-
+    /// <summary>
+    /// Index the entire repository for semantic search using Git Clone only
+    /// Run this once when PR is opened, or periodically
+    /// </summary>
+    public async Task<int> IndexRepositoryAsync(
+        string project,
+        string repositoryId,
+        string branch = "master")
+    {
         _logger.LogInformation("╔════════════════════════════════════════════════════════════╗");
-        _logger.LogInformation("║ RAG INDEXING: Completed                                    ║");
+        _logger.LogInformation("║ RAG INDEXING: Starting Repository Indexing (Git Clone Only) ║");
         _logger.LogInformation("╚════════════════════════════════════════════════════════════╝");
-        _logger.LogInformation("📊 Indexing Statistics:");
-        _logger.LogInformation("  Total files found: {Total}", files.Count);
-        _logger.LogInformation("  Files processed: {Processed}", indexed > 0 ? indexed / chunks.Count * files.Count : 0);
-        _logger.LogInformation("  Files skipped: {Skipped}", skipped);
-        _logger.LogInformation("  Files failed: {Failed}", failed);
-        _logger.LogInformation("  Code chunks created: {Chunks}", chunks.Count);
-        _logger.LogInformation("  Embeddings generated: {Embeddings}", indexed);
-        _logger.LogInformation("  Vector dimension: {Dim}", chunks.Any() ? chunks[0].Embedding.Length : 0);
-        _logger.LogInformation("════════════════════════════════════════════════════════════");
+        _logger.LogInformation("Repository ID: {RepositoryId}", repositoryId);
+        _logger.LogInformation("Project: {Project}", project);
+        _logger.LogInformation("Branch: {Branch}", branch);
 
-        // Log storage details
-        _logger.LogInformation("📦 STORAGE DETAILS:");
-        _logger.LogInformation("  Storage type: In-Memory Dictionary<string, List<CodeChunk>>");
-        _logger.LogInformation("  Storage key: Repository ID = '{RepositoryId}'", repositoryId);
-        _logger.LogInformation("  Total repositories in store: {Count}", _inMemoryStore.Count);
-        _logger.LogInformation("  Memory estimate: ~{Size} KB (embeddings only)",
-            chunks.Sum(c => c.Embedding.Length * sizeof(float)) / 1024);
-
-        // Log sample embedding vector
-        if (chunks.Any() && chunks[0].Embedding.Length > 0)
+        // Use Git Clone approach only - no API fallback
+        _logger.LogInformation("🚀 Using Git Clone approach for comprehensive repository indexing...");
+        _logger.LogInformation("   This ensures we get ALL files from the repository");
+        _logger.LogInformation("   Using shallow clone to avoid large binary files and improve performance");
+        
+        try
         {
-            var sampleEmbedding = chunks[0].Embedding;
-            _logger.LogInformation("📐 SAMPLE EMBEDDING VECTOR (first chunk):");
-            _logger.LogInformation("  File: {FilePath}", chunks[0].FilePath);
-            _logger.LogInformation("  Vector dimension: {Dim}", sampleEmbedding.Length);
-            _logger.LogInformation("  First 10 values: [{Values}]",
-                string.Join(", ", sampleEmbedding.Take(10).Select(v => v.ToString("F6"))));
-            _logger.LogInformation("  Last 10 values: [{Values}]",
-                string.Join(", ", sampleEmbedding.TakeLast(10).Select(v => v.ToString("F6"))));
-            _logger.LogInformation("  Min value: {Min:F6}", sampleEmbedding.Min());
-            _logger.LogInformation("  Max value: {Max:F6}", sampleEmbedding.Max());
-            _logger.LogInformation("  Mean value: {Mean:F6}", sampleEmbedding.Average());
-        }
-        _logger.LogInformation("════════════════════════════════════════════════════════════");
+            var cloneResult = await IndexRepositoryWithCloneAsync(project, repositoryId, branch);
+            if (cloneResult > 0)
+            {
+                _logger.LogInformation("✅ Git Clone approach succeeded: {ChunkCount} chunks indexed", cloneResult);
+                return cloneResult;
+            }
+            else
+            {
+                _logger.LogWarning("⚠️ Git Clone approach returned 0 chunks - attempting API fallback indexing...");
 
-        return indexed;
+                var (apiSuccess, apiIndexedCount) = await TryIndexWithApiAsync(project, repositoryId, branch);
+                if (apiSuccess && apiIndexedCount > 0)
+                {
+                    _logger.LogInformation("✅ API fallback succeeded: {ChunkCount} chunks indexed", apiIndexedCount);
+                    return apiIndexedCount;
+                }
+
+                _logger.LogError("❌ Both Git Clone and API fallback indexing failed");
+                return 0;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "❌ Git Clone approach failed - attempting API fallback...");
+
+            var (apiSuccess, apiIndexedCount) = await TryIndexWithApiAsync(project, repositoryId, branch);
+            if (apiSuccess && apiIndexedCount > 0)
+            {
+                _logger.LogInformation("✅ API fallback succeeded after clone exception: {ChunkCount} chunks indexed", apiIndexedCount);
+                return apiIndexedCount;
+            }
+
+            _logger.LogError("❌ API fallback also failed after clone exception");
+            return 0;
+        }
+    }
+
+    /// <summary>
+    /// Try indexing using Azure DevOps REST API
+    /// </summary>
+    private async Task<(bool Success, int IndexedCount)> TryIndexWithApiAsync(
+        string project,
+        string repositoryId, 
+        string branch)
+    {
+        try
+        {
+            // Use the specified branch directly - no need to discover all branches
+            _logger.LogInformation("API Method: Using specified branch '{Branch}' directly", branch);
+            
+            // Get all files from the specified branch
+            _logger.LogInformation("API Method: Fetching repository file tree from branch '{Branch}'...", branch);
+            var files = await _adoClient.GetRepositoryItemsAsync(project, repositoryId, branch);
+
+            _logger.LogInformation("Found {FileCount} total files in repository", files.Count);
+
+            if (files.Count == 0)
+            {
+                _logger.LogWarning("⚠️  No files found in repository using API method");
+                return (false, 0);
+            }
+
+            int indexed = 0;
+            int skipped = 0;
+            int failed = 0;
+            var chunks = new List<CodeChunk>();
+
+            _logger.LogInformation("API Method: Processing {FileCount} files...", files.Count);
+
+            // Process first 20 files to test API reliability
+            var apiTestFiles = files.Take(20).ToList();
+            int apiErrors = 0;
+            
+            _logger.LogInformation("📄 BATCH 1/2: Processing first 20 files for API validation...");
+            
+            foreach (var filePath in apiTestFiles)
+            {
+                // Skip binary files, tests, generated code
+                if (ShouldSkipFile(filePath))
+                {
+                    skipped++;
+                    continue;
+                }
+
+                try
+                {
+                    _logger.LogInformation("📄 Processing file {FileIndex}/{TotalFiles}: {FilePath}", 
+                        apiTestFiles.IndexOf(filePath) + 1, apiTestFiles.Count, filePath);
+                    
+                    // Fetch file content
+                    var content = await _adoClient.GetFileContentAsync(
+                        project, repositoryId, filePath, branch);
+
+                    if (string.IsNullOrEmpty(content))
+                    {
+                        apiErrors++;
+                        continue;
+                    }
+
+                    if (content.Length < 50)
+                    {
+                        skipped++;
+                        continue;
+                    }
+
+                    // Split large files into chunks
+                    var fileChunks = SplitIntoChunks(content, filePath);
+                    
+                    // Generate embeddings for each chunk
+                    _logger.LogInformation("   🧩 Generating embeddings for {ChunkCount} chunks...", fileChunks.Count);
+                    foreach (var chunk in fileChunks)
+                    {
+                        var embeddingResponse = await _embeddingGenerator.GenerateAsync(chunk.Content);
+                        chunk.Embedding = embeddingResponse.Vector.ToArray();
+                        chunks.Add(chunk);
+                        indexed++;
+                        
+                        if (indexed % 10 == 0) // Log every 10 chunks
+                        {
+                            _logger.LogInformation("   ✅ {IndexedCount} chunks embedded so far...", indexed);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    apiErrors++;
+                    failed++;
+                    _logger.LogDebug("API error for {FilePath}: {Error}", filePath, ex.Message);
+                }
+            }
+            
+            // If too many API errors (>50% of test files), consider API approach failed
+            if (apiErrors > apiTestFiles.Count * 0.5)
+            {
+                _logger.LogWarning("⚠️  API approach has too many errors ({Errors}/{Total} files failed)", 
+                    apiErrors, apiTestFiles.Count);
+                return (false, 0);
+            }
+            
+            // If API is working, continue with all files
+            _logger.LogInformation("✅ API approach is working, continuing with all {FileCount} files", files.Count);
+            
+            var remainingFiles = files.Skip(20).ToList();
+            _logger.LogInformation("📄 BATCH 2/2: Processing remaining {FileCount} files...", remainingFiles.Count);
+            
+            foreach (var filePath in remainingFiles) // Process remaining files
+            {
+                // Skip binary files, tests, generated code
+                if (ShouldSkipFile(filePath))
+                {
+                    skipped++;
+                    continue;
+                }
+
+                try
+                {
+                    var currentIndex = remainingFiles.IndexOf(filePath) + 1;
+                    var totalRemaining = remainingFiles.Count;
+                    var overallIndex = currentIndex + 20; // Add the 20 from first batch
+                    var overallTotal = files.Count;
+                    
+                    _logger.LogInformation("📄 Processing file {CurrentIndex}/{TotalRemaining} (overall {OverallIndex}/{OverallTotal}): {FilePath}", 
+                        currentIndex, totalRemaining, overallIndex, overallTotal, filePath);
+                    
+                    // Fetch file content
+                    var content = await _adoClient.GetFileContentAsync(
+                        project, repositoryId, filePath, branch);
+
+                    if (string.IsNullOrEmpty(content))
+                    {
+                        skipped++;
+                        continue;
+                    }
+
+                    if (content.Length < 50)
+                    {
+                        skipped++;
+                        continue;
+                    }
+
+                    // Split large files into chunks
+                    var fileChunks = SplitIntoChunks(content, filePath);
+                    
+                    // Generate embeddings for each chunk
+                    _logger.LogInformation("   🧩 Generating embeddings for {ChunkCount} chunks...", fileChunks.Count);
+                    foreach (var chunk in fileChunks)
+                    {
+                        try
+                        {
+                            var embedding = await GenerateEmbeddingWithRetryAsync(chunk.Content);
+                            chunk.Embedding = ((dynamic)embedding).Vector.ToArray();
+                            chunks.Add(chunk);
+                            indexed++;
+                        }
+                        catch (Exception ex)
+                        {
+                            failed++;
+                            _logger.LogError("❌ Failed to generate embedding for chunk {Index} from {FilePath}: {Error}", 
+                                chunk.ChunkIndex, filePath, ex.Message);
+                            _logger.LogInformation("⏭️  Skipping problematic chunk and continuing...");
+                        }
+                        
+                        if ((indexed + failed) % 10 == 0) // Log every 10 chunks
+                        {
+                            _logger.LogInformation("   ✅ {IndexedCount} chunks embedded so far...", indexed);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    failed++;
+                    _logger.LogDebug("API error for {FilePath}: {Error}", filePath, ex.Message);
+                }
+            }
+            
+            // Store all chunks in memory
+            _inMemoryStore[repositoryId] = chunks;
+
+            _logger.LogInformation("✅ API Method: Indexed {Count} chunks from {Files} files", indexed, files.Count);
+            return (true, indexed);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "❌ API indexing method failed");
+            return (false, 0);
+        }
     }
 
     /// <summary>
@@ -307,14 +514,14 @@ public class CodebaseContextService
         {
             // Generate embedding for the search query
             _logger.LogInformation("Step 2: Generating embedding for search query...");
-            var queryEmbeddingResponse = await _embeddingGenerator.GenerateAsync(searchQuery);
-            var queryVector = queryEmbeddingResponse.Vector.ToArray();
+            var queryEmbeddingResponse = await GenerateEmbeddingWithRetryAsync(searchQuery);
+            var queryVector = ((dynamic)queryEmbeddingResponse).Vector.ToArray();
 
             _logger.LogInformation("📐 QUERY EMBEDDING GENERATED:");
-            _logger.LogInformation("   Vector dimension: {Dim}", queryVector.Length);
+            _logger.LogInformation("   Vector dimension: {Dim}", (int)queryVector.Length);
             _logger.LogInformation("   First 5 values: [{Values}]",
-                string.Join(", ", queryVector.Take(5).Select(v => v.ToString("F6"))));
-            _logger.LogInformation("   Vector range: [{Min:F6} to {Max:F6}]", queryVector.Min(), queryVector.Max());
+                string.Join(", ", ((float[])queryVector).Take(5).Select(v => v.ToString("F6"))));
+            _logger.LogInformation("   Vector range: [{Min:F6} to {Max:F6}]", ((float[])queryVector).Min(), ((float[])queryVector).Max());
 
             // Semantic search for similar code using cosine similarity
             var chunks = _inMemoryStore[repositoryId];
@@ -332,8 +539,8 @@ public class CodebaseContextService
 
             // Log similarity distribution
             _logger.LogInformation("📊 SIMILARITY DISTRIBUTION:");
-            _logger.LogInformation("   Max similarity: {Max:F4}", allSimilarities.First().Similarity);
-            _logger.LogInformation("   Min similarity: {Min:F4}", allSimilarities.Last().Similarity);
+            _logger.LogInformation("   Max similarity: {Max:F4}", (double)allSimilarities.First().Similarity);
+            _logger.LogInformation("   Min similarity: {Min:F4}", (double)allSimilarities.Last().Similarity);
             _logger.LogInformation("   Mean similarity: {Mean:F4}", allSimilarities.Average(s => s.Similarity));
 
             var aboveThreshold = allSimilarities.Count(s => s.Similarity > 0.4);
@@ -351,7 +558,7 @@ public class CodebaseContextService
             foreach (var match in allSimilarities.Take(10))
             {
                 _logger.LogInformation("   {Similarity:F4} - {Location}",
-                    match.Similarity, match.Chunk.Metadata);
+                    (double)match.Similarity, (string)match.Chunk.Metadata);
             }
 
             var results = allSimilarities
@@ -363,7 +570,7 @@ public class CodebaseContextService
             {
                 _logger.LogInformation("❌ No chunks passed the 0.4 similarity threshold for {FilePath}", file.Path);
                 _logger.LogInformation("   Closest match was: {Similarity:F4} at {Location}",
-                    allSimilarities.First().Similarity, allSimilarities.First().Chunk.Metadata);
+                    (double)allSimilarities.First().Similarity, (string)allSimilarities.First().Chunk.Metadata);
                 return string.Empty;
             }
 
@@ -379,7 +586,7 @@ public class CodebaseContextService
                 _logger.LogInformation("📄 RETRIEVED CHUNK {Index} - DETAILED ANALYSIS:", resultIndex);
                 _logger.LogInformation("   File: {FilePath}", result.Chunk.FilePath);
                 _logger.LogInformation("   Lines: {Start} to {End}", result.Chunk.StartLine, result.Chunk.EndLine);
-                _logger.LogInformation("   Similarity Score: {Similarity:F4}", result.Similarity);
+                _logger.LogInformation("   Similarity Score: {Similarity:F4}", (double)result.Similarity);
                 
                 _logger.LogInformation("   🔤 CHUNK CONTENT ({Length} chars):", result.Chunk.Content.Length);
                 _logger.LogInformation("   Full content: {Content}", result.Chunk.Content.Replace("\n", "\\n"));
@@ -509,11 +716,12 @@ public class CodebaseContextService
         string project,
         string repositoryId)
     {
+        var overallStopwatch = System.Diagnostics.Stopwatch.StartNew();
         var context = new StringBuilder();
 
-        _logger.LogInformation("========================================");
-        _logger.LogInformation("Building RAG context for file: {FilePath}", file.Path);
-        _logger.LogInformation("========================================");
+        _logger.LogInformation("╔════════════════════════════════════════════════════════════╗");
+        _logger.LogInformation("║ RAG CONTEXT BUILDING: Starting for {File}", file.Path.Length > 35 ? "..." + file.Path.Substring(file.Path.Length - 32) : file.Path);
+        _logger.LogInformation("╚════════════════════════════════════════════════════════════╝");
 
         // 1. PR-level context
         context.AppendLine($"# Pull Request Context");
@@ -528,37 +736,55 @@ public class CodebaseContextService
             pr.Title, pr.Description ?? "(none)");
 
         // 2. Semantic context (similar code)
-        _logger.LogInformation("Searching for semantically similar code...");
+        _logger.LogInformation("Step 1: Searching for semantically similar code...");
+        var semanticStopwatch = System.Diagnostics.Stopwatch.StartNew();
         var semanticContext = await GetRelevantContextAsync(file, repositoryId, maxResults: 3);
+        semanticStopwatch.Stop();
+        
         if (!string.IsNullOrEmpty(semanticContext))
         {
             context.AppendLine(semanticContext);
-            _logger.LogInformation("Semantic Context Added ({Length} chars):\n{Context}",
-                semanticContext.Length, semanticContext);
+            _logger.LogInformation("✅ Semantic Context Added in {ElapsedMs}ms:", semanticStopwatch.ElapsedMilliseconds);
+            _logger.LogInformation("   Length: {Length} chars", semanticContext.Length);
+            _logger.LogInformation("   Content Preview:\n{Preview}", 
+                semanticContext.Length > 500 ? semanticContext.Substring(0, 500) + "\n... [TRUNCATED]" : semanticContext);
         }
         else
         {
-            _logger.LogInformation("No semantic context found");
+            _logger.LogInformation("❌ No semantic context found ({ElapsedMs}ms)", semanticStopwatch.ElapsedMilliseconds);
         }
 
         // 3. Dependency context (related files)
-        _logger.LogInformation("Searching for dependency context...");
+        _logger.LogInformation("Step 2: Searching for dependency context...");
+        var depStopwatch = System.Diagnostics.Stopwatch.StartNew();
         var depContext = await GetDependencyContextAsync(file, project, repositoryId);
+        depStopwatch.Stop();
+        
         if (!string.IsNullOrEmpty(depContext))
         {
             context.AppendLine(depContext);
-            _logger.LogInformation("Dependency Context Added ({Length} chars):\n{Context}",
-                depContext.Length, depContext);
+            _logger.LogInformation("✅ Dependency Context Added in {ElapsedMs}ms:", depStopwatch.ElapsedMilliseconds);
+            _logger.LogInformation("   Length: {Length} chars", depContext.Length);
+            _logger.LogInformation("   Content Preview:\n{Preview}", 
+                depContext.Length > 500 ? depContext.Substring(0, 500) + "\n... [TRUNCATED]" : depContext);
         }
         else
         {
-            _logger.LogInformation("No dependency context found");
+            _logger.LogInformation("❌ No dependency context found ({ElapsedMs}ms)", depStopwatch.ElapsedMilliseconds);
         }
 
+        overallStopwatch.Stop();
         var finalContext = context.ToString();
+        
         _logger.LogInformation("╔════════════════════════════════════════════════════════════╗");
         _logger.LogInformation("║ FINAL RAG CONTEXT SENT TO LLM                             ║");
         _logger.LogInformation("╚════════════════════════════════════════════════════════════╝");
+        _logger.LogInformation("⏱️  RAG TIMING BREAKDOWN:");
+        _logger.LogInformation("   Semantic search: {SemanticMs}ms", semanticStopwatch?.ElapsedMilliseconds ?? 0);
+        _logger.LogInformation("   Dependency search: {DepMs}ms", depStopwatch?.ElapsedMilliseconds ?? 0);
+        _logger.LogInformation("   Total RAG time: {TotalMs}ms ({TotalSec:F2} seconds)", 
+            overallStopwatch.ElapsedMilliseconds, overallStopwatch.Elapsed.TotalSeconds);
+        
         _logger.LogInformation("📏 Context Statistics:");
         _logger.LogInformation("   Total length: {Length} characters", finalContext.Length);
         _logger.LogInformation("   Line count: {Lines}", finalContext.Split('\n').Length);
@@ -568,10 +794,518 @@ public class CodebaseContextService
         _logger.LogInformation("────────────────────────────────────────────────────────────");
         _logger.LogInformation("{Context}", finalContext);
         _logger.LogInformation("────────────────────────────────────────────────────────────");
-        _logger.LogInformation("✅ Context successfully prepared for code review LLM");
+        _logger.LogInformation("✅ RAG context prepared in {TotalMs}ms - ready for LLM", overallStopwatch.ElapsedMilliseconds);
         _logger.LogInformation("════════════════════════════════════════════════════════════");
 
         return finalContext;
+    }
+
+    // Helper methods for git clone-based indexing
+
+    /// <summary>
+    /// Configure git authentication for Azure DevOps using PAT token
+    /// </summary>
+    private async Task<bool> ConfigureGitAuthAsync(string workingDirectory)
+    {
+        try
+        {
+            var pat = Environment.GetEnvironmentVariable("ADO_PAT");
+            if (string.IsNullOrEmpty(pat))
+            {
+                _logger.LogWarning("⚠️ ADO_PAT environment variable not set. Git clone may require authentication.");
+                return false;
+            }
+
+            // Configure git credential helper to use the PAT token for Azure DevOps
+            var configResult = await RunGitCommandAsync(
+                $"config credential.https://dev.azure.com.helper store", 
+                workingDirectory, 
+                30
+            );
+
+            if (!configResult.Success)
+            {
+                _logger.LogWarning("⚠️ Failed to configure git credential helper: {Error}", configResult.Error);
+                return false;
+            }
+
+            _logger.LogInformation("✅ Git authentication configured for Azure DevOps");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "⚠️ Exception configuring git authentication");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Build authenticated clone URL for Azure DevOps
+    /// </summary>
+    private string BuildAuthenticatedCloneUrl(string originalUrl)
+    {
+        var pat = _adoClient.PersonalAccessToken;
+        if (string.IsNullOrEmpty(pat))
+        {
+            return originalUrl; // Return original URL if no PAT available
+        }
+
+        try
+        {
+            var uri = new Uri(originalUrl);
+            if (uri.Host.Contains("dev.azure.com"))
+            {
+                // Convert dev.azure.com URL to visualstudio.com format for better compatibility
+                // Original: https://dev.azure.com/organization/project/_git/repository
+                // Target:   https://git:pat@organization.visualstudio.com/DefaultCollection/project/_git/repository
+                
+                var pathParts = uri.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+                if (pathParts.Length >= 3)
+                {
+                    var organization = pathParts[0]; // "organization"
+                    var project = pathParts[1]; // "project"
+                    var repoPath = string.Join("/", pathParts.Skip(2)); // "_git/repository"
+                    
+                    // Use visualstudio.com format with username and DefaultCollection
+                    var authenticatedUrl = $"https://git:{pat}@{organization.ToLower()}.visualstudio.com/DefaultCollection/{project}/{repoPath}";
+                    _logger.LogDebug("🔐 Using authenticated clone URL for Azure DevOps (visualstudio.com format)");
+                    return authenticatedUrl;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "⚠️ Failed to build authenticated URL, using original");
+        }
+
+        return originalUrl;
+    }
+
+    /// <summary>
+    /// Enhanced directory cleanup that handles git objects and locks properly
+    /// </summary>
+    private async Task<bool> CleanupCloneDirectoryAsync(string cloneDirectory)
+    {
+        try
+        {
+            if (!Directory.Exists(cloneDirectory))
+            {
+                _logger.LogDebug("🧹 Clone directory doesn't exist, nothing to clean");
+                return true;
+            }
+
+            _logger.LogInformation("🧹 Cleaning up clone directory: {Directory}", cloneDirectory);
+
+            // First, try to remove git locks if they exist
+            await RemoveGitLocksAsync(cloneDirectory);
+
+            // Try normal deletion first
+            try
+            {
+                Directory.Delete(cloneDirectory, recursive: true);
+                _logger.LogInformation("✅ Successfully deleted clone directory");
+                return true;
+            }
+            catch (UnauthorizedAccessException)
+            {
+                // Fall back to PowerShell force removal for git objects
+                await ForceDeleteDirectoryAsync(cloneDirectory);
+                return true;
+            }
+            catch (DirectoryNotFoundException)
+            {
+                _logger.LogDebug("🧹 Directory already deleted");
+                return true;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "⚠️ Exception during directory cleanup");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Remove git lock files that might prevent directory deletion
+    /// </summary>
+    private async Task RemoveGitLocksAsync(string directory)
+    {
+        try
+        {
+            var gitDir = Path.Combine(directory, ".git");
+            if (!Directory.Exists(gitDir))
+                return;
+
+            // Common git lock files
+            var lockFiles = new[]
+            {
+                Path.Combine(gitDir, "index.lock"),
+                Path.Combine(gitDir, "HEAD.lock"),
+                Path.Combine(gitDir, "config.lock"),
+                Path.Combine(gitDir, "refs", "heads", "master.lock"),
+                Path.Combine(gitDir, "refs", "heads", "main.lock")
+            };
+
+            foreach (var lockFile in lockFiles)
+            {
+                if (File.Exists(lockFile))
+                {
+                    try
+                    {
+                        File.Delete(lockFile);
+                        _logger.LogDebug("🔓 Removed git lock file: {LockFile}", lockFile);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogDebug(ex, "⚠️ Failed to remove lock file: {LockFile}", lockFile);
+                    }
+                }
+            }
+
+            await Task.Delay(100); // Brief pause to let filesystem settle
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "⚠️ Exception removing git locks");
+        }
+    }
+
+    private async Task<(bool Success, string Error)> RunGitCommandAsync(string arguments, string workingDirectory, int timeoutSeconds = 180)
+    {
+        try
+        {
+            var safeArguments = RedactSecrets(arguments);
+
+            var process = new System.Diagnostics.Process
+            {
+                StartInfo = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = "git",
+                    Arguments = arguments,
+                    WorkingDirectory = workingDirectory,
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                }
+            };
+
+            _logger.LogInformation("🔧 Running git command: git {Arguments}", safeArguments);
+            _logger.LogInformation("   Timeout: {TimeoutSeconds} seconds", timeoutSeconds);
+            
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+            process.Start();
+
+            // Create cancellation token for timeout
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
+            
+            try
+            {
+                // Use Task.WhenAny for proper timeout handling
+                var processTask = process.WaitForExitAsync();
+                var timeoutTask = Task.Delay(TimeSpan.FromSeconds(timeoutSeconds));
+                
+                var completedTask = await Task.WhenAny(processTask, timeoutTask);
+                stopwatch.Stop();
+
+                if (completedTask == timeoutTask)
+                {
+                    // Timeout occurred
+                    _logger.LogWarning("⚠️ Git command timed out after {TimeoutSeconds} seconds", timeoutSeconds);
+                    
+                    try
+                    {
+                        if (!process.HasExited)
+                        {
+                            process.Kill(entireProcessTree: true);
+                            await process.WaitForExitAsync();
+                            _logger.LogInformation("🔪 Killed git process due to timeout");
+                        }
+                    }
+                    catch (Exception killEx)
+                    {
+                        _logger.LogWarning(killEx, "⚠️ Failed to kill git process");
+                    }
+                    
+                    return (false, $"Git command timed out after {timeoutSeconds} seconds");
+                }
+
+                // Process completed within timeout
+                var output = await process.StandardOutput.ReadToEndAsync();
+                var error = await process.StandardError.ReadToEndAsync();
+
+                if (process.ExitCode != 0)
+                {
+                    _logger.LogError("❌ Git command failed with exit code {ExitCode} after {ElapsedMs}ms", 
+                        process.ExitCode, stopwatch.ElapsedMilliseconds);
+                    _logger.LogError("Error output: {Error}", error);
+                    return (false, error);
+                }
+
+                _logger.LogInformation("✅ Git command completed successfully in {ElapsedMs}ms", stopwatch.ElapsedMilliseconds);
+                if (!string.IsNullOrEmpty(output))
+                {
+                    _logger.LogDebug("Command output: {Output}", output);
+                }
+
+                return (true, string.Empty);
+            }
+            catch (OperationCanceledException)
+            {
+                _logger.LogWarning("⚠️ Git command timed out after {TimeoutSeconds} seconds", timeoutSeconds);
+                
+                // Kill the process if it's still running
+                try
+                {
+                    if (!process.HasExited)
+                    {
+                        process.Kill(entireProcessTree: true);
+                        await process.WaitForExitAsync();
+                        _logger.LogInformation("🔪 Killed git process due to timeout");
+                    }
+                }
+                catch (Exception killEx)
+                {
+                    _logger.LogWarning(killEx, "⚠️ Failed to kill git process");
+                }
+                
+                return (false, $"Git command timed out after {timeoutSeconds} seconds");
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "❌ Exception running git command: git {Arguments}", RedactSecrets(arguments));
+            return (false, ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// Redact sensitive values (PATs/passwords) from logged command arguments.
+    /// </summary>
+    private string RedactSecrets(string text)
+    {
+        if (string.IsNullOrEmpty(text))
+        {
+            return text;
+        }
+
+        var redacted = text;
+
+        // Redact credential section in URLs: https://user:secret@host -> https://user:***@host
+        redacted = Regex.Replace(redacted, @"(https?://[^:/\s]+:)([^@\s]+)(@)", "$1***$3", RegexOptions.IgnoreCase);
+
+        // Redact current PAT explicitly if present.
+        var pat = _adoClient.PersonalAccessToken;
+        if (!string.IsNullOrEmpty(pat))
+        {
+            redacted = redacted.Replace(pat, "***", StringComparison.Ordinal);
+        }
+
+        return redacted;
+    }
+
+    private bool IsGitFile(string filePath)
+    {
+        return filePath.Contains(".git" + Path.DirectorySeparatorChar) || 
+               filePath.Contains(".git" + Path.AltDirectorySeparatorChar);
+    }
+
+    /// <summary>
+    /// Generate embedding with exponential backoff retry for rate limits
+    /// </summary>
+    private async Task<object> GenerateEmbeddingWithRetryAsync(string content, int maxRetries = 3)
+    {
+        int attempt = 0;
+        Exception lastException = null!;
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+
+        _logger.LogInformation("🤖 CALLING AI EMBEDDING API (attempt {Attempt}/{MaxRetries})", 1, maxRetries);
+        _logger.LogInformation("   Content length: {Length} chars", content.Length);
+        _logger.LogInformation("   Content preview: {Preview}", 
+            content.Length > 100 ? content.Substring(0, 100).Replace("\n", "\\n") + "..." : content.Replace("\n", "\\n"));
+
+        while (attempt < maxRetries)
+        {
+            try
+            {
+                attempt++;
+                _logger.LogInformation("🔄 AI Embedding API call #{Attempt} starting...", attempt);
+                var result = await _embeddingGenerator.GenerateAsync(content);
+                stopwatch.Stop();
+                
+                _logger.LogInformation("✅ AI Embedding API call #{Attempt} succeeded in {ElapsedMs}ms", attempt, stopwatch.ElapsedMilliseconds);
+                var vectorLength = ((dynamic)result).Vector.Length;
+                _logger.LogInformation("   Vector dimension: {Dim}", (int)vectorLength);
+                return result;
+            }
+            catch (Exception ex) when (IsRateLimitException(ex) && attempt < maxRetries)
+            {
+                lastException = ex;
+                var delayMs = Math.Min(1000 * (int)Math.Pow(2, attempt - 1), 30000); // Cap at 30 seconds
+                
+                _logger.LogWarning("⏳ AI Embedding API rate limit hit (attempt {Attempt}/{MaxRetries}). Waiting {DelayMs}ms before retry...", 
+                    attempt, maxRetries, delayMs);
+                _logger.LogWarning("   Error: {Error}", ex.Message);
+                    
+                await Task.Delay(delayMs);
+            }
+            catch (Exception ex) when (IsInvalidRequestException(ex))
+            {
+                stopwatch.Stop();
+                _logger.LogError("❌ AI Embedding API invalid request (attempt {Attempt}): {Error}", attempt, ex.Message);
+                _logger.LogError("   Failed after {ElapsedMs}ms", stopwatch.ElapsedMilliseconds);
+                throw;
+            }
+            catch (Exception ex)
+            {
+                lastException = ex;
+                _logger.LogError("❌ AI Embedding API call #{Attempt} failed: {Error}", attempt, ex.Message);
+                if (attempt >= maxRetries)
+                {
+                    stopwatch.Stop();
+                    _logger.LogError("   All {MaxRetries} attempts failed after {ElapsedMs}ms", maxRetries, stopwatch.ElapsedMilliseconds);
+                }
+            }
+        }
+
+        throw lastException;
+    }
+
+    private static bool IsRateLimitException(Exception ex)
+    {
+        var message = ex.Message?.ToLowerInvariant() ?? "";
+        return message.Contains("rate limit") || 
+               message.Contains("429") || 
+               message.Contains("ratelimitreached") ||
+               message.Contains("quota");
+    }
+
+    private static bool IsInvalidRequestException(Exception ex)
+    {
+        var message = ex.Message?.ToLowerInvariant() ?? "";
+        return message.Contains("400") || message.Contains("invalid_request_error");
+    }
+
+    private async Task<List<CodeChunk>> ProcessFilesFromDiskAsync(string cloneDir, List<string> filePaths)
+    {
+        var chunks = new List<CodeChunk>();
+        int indexed = 0;
+        int skipped = 0;
+        int failed = 0;
+
+        _logger.LogInformation("📁 Processing {FileCount} files from disk...", filePaths.Count);
+
+        foreach (var relativePath in filePaths)
+        {
+            // Skip binary files, tests, generated code
+            if (ShouldSkipFile(relativePath))
+            {
+                skipped++;
+                _logger.LogDebug("⏭️  Skipped (pattern match): {FilePath}", relativePath);
+                continue;
+            }
+
+            var fullPath = Path.Combine(cloneDir, relativePath);
+            
+            try
+            {
+                // Check file size - skip very large files (>1MB)
+                var fileInfo = new FileInfo(fullPath);
+                if (fileInfo.Length > 1024 * 1024) // 1MB
+                {
+                    skipped++;
+                    _logger.LogDebug("⏭️  Skipped (too large {Size} bytes): {FilePath}", fileInfo.Length, relativePath);
+                    continue;
+                }
+
+                _logger.LogInformation("📄 Processing file: {FilePath} ({Size} bytes)", relativePath, fileInfo.Length);
+
+                // Read file content from disk
+                string content;
+                try
+                {
+                    content = await File.ReadAllTextAsync(fullPath);
+                }
+                catch (Exception readEx)
+                {
+                    // Try with different encoding if UTF-8 fails
+                    _logger.LogWarning("⚠️  UTF-8 read failed for {FilePath}, trying with default encoding: {Error}", relativePath, readEx.Message);
+                    content = File.ReadAllText(fullPath, System.Text.Encoding.Default);
+                }
+
+                if (string.IsNullOrWhiteSpace(content) || content.Length < 10)
+                {
+                    skipped++;
+                    _logger.LogDebug("⏭️  Skipped (empty or too small): {FilePath}", relativePath);
+                    continue;
+                }
+
+                _logger.LogInformation("   📊 File analysis: {Length} characters, {Lines} lines", 
+                    content.Length, content.Split('\n').Length);
+
+                // Split into chunks
+                var fileChunks = SplitIntoChunks(content, relativePath);
+                _logger.LogInformation("   📦 Created {ChunkCount} chunks", fileChunks.Count);
+
+                // Generate embeddings for each chunk
+                foreach (var chunk in fileChunks)
+                {
+                    _logger.LogInformation("  🔤 CHUNK CONTENT for chunk {Index} (lines {Start}-{End}):",
+                        chunk.ChunkIndex, chunk.StartLine, chunk.EndLine);
+                    _logger.LogInformation("     Preview (first 200 chars): {Content}",
+                        chunk.Content.Length > 200 ? chunk.Content.Substring(0, 200).Replace("\n", "\\n") + "..." : chunk.Content.Replace("\n", "\\n"));
+                    _logger.LogInformation("     Full content length: {Length} characters", chunk.Content.Length);
+
+                    _logger.LogInformation("  🧮 Generating embedding for chunk {Index}...", chunk.ChunkIndex);
+
+                    try
+                    {
+                        // Generate embedding for the chunk with retry logic
+                        var embeddingResponse = await GenerateEmbeddingWithRetryAsync(chunk.Content);
+                        chunk.Embedding = ((dynamic)embeddingResponse).Vector.ToArray();
+                        
+                        _logger.LogInformation("  📊 EMBEDDING VECTOR DETAILS for chunk {Index}:", chunk.ChunkIndex);
+                        _logger.LogInformation("     Dimension: {Dim}", chunk.Embedding.Length);
+                        _logger.LogInformation("     First 5 values: [{Values}]", 
+                            string.Join(", ", chunk.Embedding.Take(5).Select(v => v.ToString("F6"))));
+                        _logger.LogInformation("     Last 5 values: [{Values}]", 
+                            string.Join(", ", chunk.Embedding.TakeLast(5).Select(v => v.ToString("F6"))));
+                        _logger.LogInformation("     Min/Max: [{Min:F6}, {Max:F6}]", chunk.Embedding.Min(), chunk.Embedding.Max());
+                        _logger.LogInformation("     Mean: {Mean:F6}", chunk.Embedding.Average());
+                        
+                        chunks.Add(chunk);
+                        indexed++;
+                    }
+                    catch (Exception ex)
+                    {
+                        failed++;
+                        _logger.LogError("❌ Failed to generate embedding for chunk {Index} from {FilePath}: {Error}", 
+                            chunk.ChunkIndex, relativePath, ex.Message);
+                        _logger.LogInformation("⏭️  Skipping problematic chunk and continuing with next file...");
+                        continue; // Skip to next chunk
+                    }
+
+                    _logger.LogInformation("  ✅ Chunk {Index} indexed successfully", chunk.ChunkIndex);
+                }
+
+                _logger.LogInformation("✅ Indexed {FilePath} ({ChunkCount} chunks)",
+                    relativePath, fileChunks.Count);
+            }
+            catch (Exception ex)
+            {
+                failed++;
+                _logger.LogError(ex, "❌ Error processing file: {FilePath}", relativePath);
+            }
+        }
+
+        _logger.LogInformation("📊 FILE PROCESSING SUMMARY (Git Clone Method):");
+        _logger.LogInformation("   Files discovered: {Total}", filePaths.Count);
+        _logger.LogInformation("   Files indexed: {Indexed}", indexed > 0 ? chunks.Select(c => c.FilePath).Distinct().Count() : 0);
+        _logger.LogInformation("   Files skipped: {Skipped}", skipped);
+        _logger.LogInformation("   Files failed: {Failed}", failed);
+        _logger.LogInformation("   Total chunks created: {ChunkCount}", chunks.Count);
+
+        return chunks;
     }
 
     // Helper methods
@@ -594,24 +1328,63 @@ public class CodebaseContextService
     {
         var chunks = new List<CodeChunk>();
         var lines = content.Split('\n');
-        const int CHUNK_SIZE = 100; // lines per chunk
-        const int OVERLAP = 10; // overlap between chunks
+        
+        // Conservative token limits to stay well under 8192 token limit
+        const int MAX_TOKENS_PER_CHUNK = 6000; // Leave buffer for prompt overhead
+        const int ESTIMATED_TOKENS_PER_CHAR = 4; // Conservative estimate: ~4 chars per token
+        const int MAX_CHARS_PER_CHUNK = MAX_TOKENS_PER_CHUNK / ESTIMATED_TOKENS_PER_CHAR; // ~1500 chars
+        const int OVERLAP_LINES = 5; // Reduced overlap for larger files
 
-        for (int i = 0; i < lines.Length; i += (CHUNK_SIZE - OVERLAP))
+        int startLine = 0;
+        while (startLine < lines.Length)
         {
-            var chunkLines = lines.Skip(i).Take(CHUNK_SIZE).ToArray();
-            if (chunkLines.Length == 0) break;
-
+            var chunkLines = new List<string>();
+            var currentChars = 0;
+            var currentLineIndex = startLine;
+            
+            // Build chunk within character/token limit
+            while (currentLineIndex < lines.Length && currentChars < MAX_CHARS_PER_CHUNK)
+            {
+                var line = lines[currentLineIndex];
+                // Check if adding this line would exceed limit
+                if (currentChars + line.Length + 1 > MAX_CHARS_PER_CHUNK && chunkLines.Count > 0)
+                    break;
+                    
+                chunkLines.Add(line);
+                currentChars += line.Length + 1; // +1 for newline
+                currentLineIndex++;
+            }
+            
+            // Ensure we make progress even with very long lines
+            if (chunkLines.Count == 0 && currentLineIndex < lines.Length)
+            {
+                // Take just this one long line, but truncate it if necessary
+                var longLine = lines[currentLineIndex];
+                if (longLine.Length > MAX_CHARS_PER_CHUNK)
+                {
+                    longLine = longLine.Substring(0, MAX_CHARS_PER_CHUNK) + "... [TRUNCATED]";
+                }
+                chunkLines.Add(longLine);
+                currentLineIndex++;
+            }
+            
+            if (chunkLines.Count == 0) break; // Safety check
+            
+            var chunkContent = string.Join('\n', chunkLines);
             chunks.Add(new CodeChunk
             {
-                Content = string.Join('\n', chunkLines),
+                Content = chunkContent,
                 ChunkIndex = chunks.Count,
-                StartLine = i + 1,
-                EndLine = i + chunkLines.Length,
-                Metadata = $"{filePath}:L{i + 1}-L{i + chunkLines.Length}",
+                StartLine = startLine + 1,
+                EndLine = startLine + chunkLines.Count,
+                Metadata = $"{filePath}:L{startLine + 1}-L{startLine + chunkLines.Count} ({chunkContent.Length} chars, ~{chunkContent.Length * ESTIMATED_TOKENS_PER_CHAR} tokens)",
                 FilePath = filePath,
                 Embedding = Array.Empty<float>() // Will be filled during indexing
             });
+            
+            // Next chunk starts with overlap
+            startLine = Math.Max(currentLineIndex - OVERLAP_LINES, currentLineIndex);
+            if (startLine >= currentLineIndex) break; // Prevent infinite loop
         }
 
         return chunks;
@@ -741,6 +1514,65 @@ public class CodebaseContextService
             return 0;
 
         return dotProduct / (magnitudeA * magnitudeB);
+    }
+
+    /// <summary>
+    /// Force delete directory including Git objects with read-only permissions
+    /// </summary>
+    private async Task ForceDeleteDirectoryAsync(string directoryPath)
+    {
+        if (!Directory.Exists(directoryPath))
+        {
+            return;
+        }
+
+        const int maxAttempts = 5;
+        for (int attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            try
+            {
+                await RemoveGitLocksAsync(directoryPath);
+
+                // First try normal deletion
+                Directory.Delete(directoryPath, true);
+                return;
+            }
+            catch (UnauthorizedAccessException) when (attempt < maxAttempts)
+            {
+                _logger.LogDebug("🔒 Delete attempt {Attempt}/{MaxAttempts} hit access issue, retrying...", attempt, maxAttempts);
+            }
+            catch (IOException) when (attempt < maxAttempts)
+            {
+                _logger.LogDebug("🔒 Delete attempt {Attempt}/{MaxAttempts} hit IO lock issue, retrying...", attempt, maxAttempts);
+            }
+
+            // Git objects or lock files may still be releasing handles; try force remove then retry.
+            using (var process = new System.Diagnostics.Process())
+            {
+                process.StartInfo = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = "powershell.exe",
+                    Arguments = $"-Command \"Remove-Item '{directoryPath}' -Recurse -Force -ErrorAction SilentlyContinue\"",
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true
+                };
+
+                process.Start();
+                await process.WaitForExitAsync();
+            }
+
+            if (!Directory.Exists(directoryPath))
+            {
+                return;
+            }
+
+            await Task.Delay(250 * attempt);
+        }
+
+        // Final attempt throws if deletion still fails so callers can log accurately.
+        Directory.Delete(directoryPath, true);
     }
 }
 

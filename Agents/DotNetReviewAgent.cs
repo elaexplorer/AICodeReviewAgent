@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.Diagnostics;
 using CodeReviewAgent.Models;
+using CodeReviewAgent.Services;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.AI;
 using Microsoft.Agents.AI;
@@ -179,7 +180,15 @@ public class DotNetReviewAgent : ILanguageReviewAgent
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error reviewing .NET file {FilePath}", file.Path);
-            return new List<CodeReviewComment>();
+
+            if (ReviewExceptionClassifier.IsAuthenticationError(ex))
+            {
+                throw new InvalidOperationException(
+                    "LLM authentication failed during code review. Verify AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, and AZURE_OPENAI_DEPLOYMENT for the chat model.",
+                    ex);
+            }
+
+            throw new InvalidOperationException($"Code review failed for file '{file.Path}'.", ex);
         }
     }
 

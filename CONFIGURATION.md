@@ -173,11 +173,11 @@ pwd  # Should show project root
 ```env
 # Azure OpenAI Configuration
 AZURE_OPENAI_ENDPOINT=https://mycompany-openai.openai.azure.com/
-AZURE_OPENAI_API_KEY=abc123def456ghi789jkl012mno345pqr678stu901
+AZURE_OPENAI_API_KEY=your-azure-openai-api-key
 AZURE_OPENAI_DEPLOYMENT=gpt-4-turbo
 
 # Azure DevOps Configuration
-ADO_PAT=a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0u1v2w3x4y5z6
+ADO_PAT=your-azure-devops-pat
 ADO_ORGANIZATION=mycompany
 
 # Optional: Custom embedding configuration
@@ -188,10 +188,10 @@ AZURE_OPENAI_EMBEDDING_DEPLOYMENT=text-embedding-3-large
 
 ```env
 # OpenAI Configuration (alternative to Azure)
-OPENAI_API_KEY=sk-proj-abc123def456ghi789jkl012mno345pqr678stu901
+OPENAI_API_KEY=your-openai-api-key
 
 # Azure DevOps Configuration
-ADO_PAT=a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0u1v2w3x4y5z6
+ADO_PAT=your-azure-devops-pat
 ADO_ORGANIZATION=mycompany
 ```
 

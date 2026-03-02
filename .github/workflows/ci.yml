@@ -1,0 +1,108 @@
+name: CI - Code Review Agent Tests
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macOS-latest]
+        dotnet-version: ['9.0.x']
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ matrix.dotnet-version }}
+
+    - name: Restore dependencies
+      run: dotnet restore
+
+    - name: Build
+      run: dotnet build --no-restore --configuration Release
+
+    - name: Test
+      run: dotnet test --no-build --configuration Release --verbosity normal --collect:"XPlat Code Coverage" --results-directory ./TestResults
+
+    - name: Upload coverage reports to Codecov
+      if: matrix.os == 'ubuntu-latest'
+      uses: codecov/codecov-action@v4
+      with:
+        directory: ./TestResults
+        files: '**/coverage.cobertura.xml'
+        flags: unittests
+        name: codecov-umbrella
+        verbose: true
+
+    - name: Generate coverage report
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        dotnet tool install -g dotnet-reportgenerator-globaltool
+        reportgenerator "-reports:TestResults/**/coverage.cobertura.xml" "-targetdir:TestResults/CoverageReport" "-reporttypes:Html;Badges"
+
+    - name: Upload coverage report
+      if: matrix.os == 'ubuntu-latest'  
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-report
+        path: TestResults/CoverageReport
+
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '9.0.x'
+
+    - name: Restore dependencies
+      run: dotnet restore
+
+    - name: Security scan
+      run: |
+        dotnet list package --vulnerable --include-transitive 2>&1 | tee security-report.txt
+        if grep -q "has the following vulnerable packages" security-report.txt; then
+          echo "❌ Vulnerable packages found!"
+          cat security-report.txt
+          exit 1
+        else
+          echo "✅ No vulnerable packages found"
+        fi
+
+  performance-test:
+    runs-on: ubuntu-latest
+    needs: test
+    
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '9.0.x'
+
+    - name: Restore dependencies
+      run: dotnet restore
+
+    - name: Build
+      run: dotnet build --no-restore --configuration Release
+
+    - name: Performance Tests
+      run: |
+        echo "🚀 Running performance benchmarks..."
+        # Note: Add actual performance tests when benchmarking framework is added
+        timeout 60s dotnet run --configuration Release --project . -- --test-git-clone-rag || echo "Performance test completed or timed out"
+      env:
+        AZURE_OPENAI_ENDPOINT: https://mock.openai.azure.com/
+        AZURE_OPENAI_API_KEY: mock-key-for-testing
+        ADO_ORGANIZATION: MockOrg
+        ADO_PAT: mock-pat-for-testing

@@ -16,6 +16,9 @@ public class AzureDevOpsRestClient
     private string _organization;
     private string _personalAccessToken;
 
+    public string Organization => _organization;
+    public string PersonalAccessToken => _personalAccessToken;
+
     public AzureDevOpsRestClient(
         ILogger<AzureDevOpsRestClient> logger,
         string organization,
@@ -456,7 +459,7 @@ public class AzureDevOpsRestClient
         string project,
         string repositoryId,
         string path,
-        string versionOrBranch = "main")
+        string versionOrBranch = "master")
     {
         try
         {

@@ -35,15 +35,11 @@ public class CodeReviewService
     {
         _logger.LogInformation("Starting code review for PR {PullRequestId}: {Title}", pullRequest.Id, pullRequest.Title);
 
-        // Fetch and cache repository structure for context
-        var branch = pullRequest.TargetBranch.Replace("refs/heads/", "");
-        var repoStructure = await _adoClient.GetRepositoryStructureAsync(project, repository, branch);
+        // Build basic codebase context from changed files only (no REST API calls)
+        var basicContext = BuildCodebaseContextFromChangedFiles(files);
 
-        // Build basic codebase context summary
-        var basicContext = BuildCodebaseContext(repoStructure, files);
-
-        _logger.LogInformation("Basic codebase context built with {FileCount} total files, reviewing {ChangedFileCount} changed files",
-            repoStructure.Count, files.Count);
+        _logger.LogInformation("Basic codebase context built for {ChangedFileCount} changed files",
+            files.Count);
 
         // Check if RAG indexing is available
         string codebaseContext;
@@ -95,48 +91,42 @@ public class CodeReviewService
         return comments;
     }
 
-    private string BuildCodebaseContext(List<string> repoStructure, List<PullRequestFile> changedFiles)
+    private string BuildCodebaseContextFromChangedFiles(List<PullRequestFile> changedFiles)
     {
         var context = new StringBuilder();
 
-        context.AppendLine("=== Codebase Structure ===");
-        context.AppendLine($"Total files in repository: {repoStructure.Count}");
-        context.AppendLine();
-
-        // Group files by directory
-        var directories = repoStructure
-            .Select(f => Path.GetDirectoryName(f) ?? "/")
-            .Distinct()
-            .OrderBy(d => d)
-            .Take(50); // Limit to avoid huge context
-
-        context.AppendLine("Key directories:");
-        foreach (var dir in directories)
+        context.AppendLine("=== Files Changed in This PR ===");
+        foreach (var file in changedFiles)
         {
-            var fileCount = repoStructure.Count(f => (Path.GetDirectoryName(f) ?? "/") == dir);
-            context.AppendLine($"  {dir}: {fileCount} files");
+            context.AppendLine($"  - {file.Path} ({file.ChangeType})");
         }
         context.AppendLine();
 
-        // Language distribution
-        var languageStats = repoStructure
-            .Select(f => Path.GetExtension(f))
+        // Language distribution from changed files only
+        var languageStats = changedFiles
+            .Select(f => Path.GetExtension(f.Path))
             .Where(ext => !string.IsNullOrEmpty(ext))
             .GroupBy(ext => ext)
-            .OrderByDescending(g => g.Count())
-            .Take(10);
+            .OrderByDescending(g => g.Count());
 
-        context.AppendLine("Language distribution:");
+        context.AppendLine("Languages in this PR:");
         foreach (var lang in languageStats)
         {
             context.AppendLine($"  {lang.Key}: {lang.Count()} files");
         }
         context.AppendLine();
 
-        context.AppendLine("=== Files Changed in This PR ===");
-        foreach (var file in changedFiles)
+        // Directory distribution from changed files only
+        var directories = changedFiles
+            .Select(f => Path.GetDirectoryName(f.Path) ?? "/")
+            .Distinct()
+            .OrderBy(d => d);
+
+        context.AppendLine("Directories affected:");
+        foreach (var dir in directories)
         {
-            context.AppendLine($"  - {file.Path} ({file.ChangeType})");
+            var fileCount = changedFiles.Count(f => (Path.GetDirectoryName(f.Path) ?? "/") == dir);
+            context.AppendLine($"  {dir}: {fileCount} files");
         }
 
         return context.ToString();

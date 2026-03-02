@@ -262,7 +262,7 @@ nano .env
 **Working Configuration Example:**
 ```bash
 # Azure OpenAI Configuration (tested working)
-AZURE_OPENAI_ENDPOINT=https://ela-azureopenai.openai.azure.com/
+AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com/
 AZURE_OPENAI_DEPLOYMENT=gpt-5-mini
 # Note: Ensure your deployment name matches exactly what exists in your Azure OpenAI resource
 ```

@@ -7,7 +7,6 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.AI;
 using Azure.AI.OpenAI;
 using Azure;
-using OpenAI;
 using System.ClientModel;
 using OpenTelemetry.Trace;
 using OpenTelemetry.Resources;
@@ -39,50 +38,9 @@ var azureOpenAiDeployment = GetEnvVar("AZURE_OPENAI_DEPLOYMENT") ?? "gpt-4";
 var azureOpenAiEmbeddingDeployment = GetEnvVar("AZURE_OPENAI_EMBEDDING_DEPLOYMENT") ?? "text-embedding-ada-002";
 // Support separate endpoint for embeddings (some orgs have different resources for chat vs embeddings)
 var azureOpenAiEmbeddingEndpoint = GetEnvVar("AZURE_OPENAI_EMBEDDING_ENDPOINT") ?? azureOpenAiEndpoint;
-var azureOpenAiEmbeddingApiKey = GetEnvVar("AZURE_OPENAI_EMBEDDING_API_KEY") ?? azureOpenAiApiKey;
 var adoOrganization = GetEnvVar("ADO_ORGANIZATION") ?? "SPOOL";
 var adoPat = GetEnvVar("ADO_PAT");
 var mcpServerUrl = GetEnvVar("MCP_SERVER_URL") ?? "http://localhost:3000";
-
-// Check if either OpenAI or Azure OpenAI is configured
-var hasOpenAI = !string.IsNullOrEmpty(openAiApiKey);
-var hasAzureOpenAI = !string.IsNullOrEmpty(azureOpenAiEndpoint) && !string.IsNullOrEmpty(azureOpenAiApiKey);
-
-if ((!hasOpenAI && !hasAzureOpenAI) || string.IsNullOrEmpty(adoPat))
-{
-    Console.WriteLine("❌ Missing required environment variables:");
-    if (!hasOpenAI && !hasAzureOpenAI)
-    {
-        Console.WriteLine("   Either configure OpenAI:");
-        Console.WriteLine("     - OPENAI_API_KEY");
-        Console.WriteLine("   Or configure Azure OpenAI:");
-        Console.WriteLine("     - AZURE_OPENAI_ENDPOINT");
-        Console.WriteLine("     - AZURE_OPENAI_API_KEY");
-        Console.WriteLine("     - AZURE_OPENAI_DEPLOYMENT (optional, defaults to 'gpt-4')");
-    }
-    if (string.IsNullOrEmpty(adoPat)) Console.WriteLine("   - ADO_PAT");
-    Console.WriteLine();
-    Console.WriteLine("Usage: CodeReviewAgent <repository> <pullRequestId>");
-    Console.WriteLine("       CodeReviewAgent <project> <repository> <pullRequestId>");
-    Console.WriteLine("Example: CodeReviewAgent my-repo 123");
-    Console.WriteLine("Example: CodeReviewAgent SCC my-repo 123");
-    Console.WriteLine();
-    Console.WriteLine("Required environment variables:");
-    Console.WriteLine();
-    Console.WriteLine("Option 1 - OpenAI:");
-    Console.WriteLine("- OPENAI_API_KEY: Your OpenAI API key");
-    Console.WriteLine();
-    Console.WriteLine("Option 2 - Azure OpenAI:");
-    Console.WriteLine("- AZURE_OPENAI_ENDPOINT: Your Azure OpenAI endpoint (e.g., https://your-resource.openai.azure.com/)");
-    Console.WriteLine("- AZURE_OPENAI_API_KEY: Your Azure OpenAI API key");
-    Console.WriteLine("- AZURE_OPENAI_DEPLOYMENT: Your deployment name (optional, defaults to 'gpt-4')");
-    Console.WriteLine();
-    Console.WriteLine("Common:");
-    Console.WriteLine("- ADO_ORGANIZATION: Your Azure DevOps organization name (optional, defaults to 'SPOOL')");
-    Console.WriteLine("- ADO_PAT: Your Azure DevOps Personal Access Token");
-    Console.WriteLine("- MCP_SERVER_URL: MCP server URL (optional, defaults to http://localhost:3000)");
-    return;
-}
 
 // Add runtime logger service first
 builder.Services.AddSingleton<RuntimeLoggerService>();
@@ -91,7 +49,7 @@ builder.Services.AddHostedService<RuntimeLoggerService>(provider => provider.Get
 // Add services with both console and runtime file logging
 builder.Services.AddLogging(config => 
 {
-    config.AddConsole().SetMinimumLevel(LogLevel.Information);
+    config.AddConsole().SetMinimumLevel(LogLevel.Debug);
     
     // Add runtime file logging
     config.Services.AddSingleton<ILoggerProvider>(provider =>
@@ -106,98 +64,18 @@ builder.Services.AddOpenTelemetry()
         .AddHttpClientInstrumentation()
         .AddConsoleExporter());
 
-// Register IChatClient with middleware pipeline
-if (hasAzureOpenAI)
-{
-    Console.WriteLine($"Using Azure OpenAI with deployment: {azureOpenAiDeployment}");
+// Register chat and embedding providers with runtime configuration.
+builder.Services.AddSingleton<ChatConfigurationService>();
+builder.Services.AddSingleton<IChatClient, DynamicChatClient>();
 
-    builder.Services.AddSingleton<IChatClient>(provider =>
-    {
-        // Check if this is a Claude endpoint
-        if (azureOpenAiEndpoint!.Contains("anthropic", StringComparison.OrdinalIgnoreCase))
-        {
-            Console.WriteLine("Detected Claude endpoint, using ClaudeChatClient");
-            var httpClient = new HttpClient();
-            var logger = provider.GetRequiredService<ILogger<CodeReviewAgent.Services.ClaudeChatClient>>();
-            return new CodeReviewAgent.Services.ClaudeChatClient(
-                httpClient,
-                azureOpenAiEndpoint!,
-                azureOpenAiApiKey!,
-                azureOpenAiDeployment,
-                logger);
-        }
-        else
-        {
-            // Use standard Azure OpenAI client
-            var azureClient = new AzureOpenAIClient(
-                new Uri(azureOpenAiEndpoint!),
-                new AzureKeyCredential(azureOpenAiApiKey!));
+Console.WriteLine($"Configured default chat deployment: {azureOpenAiDeployment}");
+Console.WriteLine($"Configured default embedding model: {azureOpenAiEmbeddingDeployment}");
+Console.WriteLine($"Configured default embedding endpoint: {azureOpenAiEmbeddingEndpoint}");
 
-            // Get ChatClient and convert to IChatClient using AsIChatClient()
-            var chatClient = azureClient.GetChatClient(azureOpenAiDeployment);
-            return chatClient.AsIChatClient();
-        }
-    });
-
-    // Register embedding generator for RAG
-    Console.WriteLine($"Using embedding model: {azureOpenAiEmbeddingDeployment}");
-    Console.WriteLine($"Embedding endpoint: {azureOpenAiEmbeddingEndpoint}");
-    builder.Services.AddSingleton<IEmbeddingGenerator<string, Embedding<float>>>(provider =>
-    {
-        // Check if this is a Claude endpoint - but still try Azure OpenAI for embeddings since the endpoint supports both
-        if (azureOpenAiEmbeddingEndpoint!.Contains("anthropic", StringComparison.OrdinalIgnoreCase))
-        {
-            Console.WriteLine("Claude endpoint detected, attempting to use Azure OpenAI embedding client");
-            // Even though this is a Claude endpoint, it should support Azure OpenAI embeddings
-            try
-            {
-                var azureClient = new AzureOpenAIClient(
-                    new Uri(azureOpenAiEmbeddingEndpoint!),
-                    new AzureKeyCredential(azureOpenAiEmbeddingApiKey!));
-
-                // Get EmbeddingClient and convert to IEmbeddingGenerator
-                var embeddingClient = azureClient.GetEmbeddingClient(azureOpenAiEmbeddingDeployment);
-                return embeddingClient.AsIEmbeddingGenerator();
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Failed to create Azure OpenAI embedding client: {ex.Message}");
-                Console.WriteLine("Falling back to dummy embeddings - RAG features disabled");
-                return new DummyEmbeddingGenerator();
-            }
-        }
-        else
-        {
-            var azureClient = new AzureOpenAIClient(
-                new Uri(azureOpenAiEmbeddingEndpoint!),
-                new AzureKeyCredential(azureOpenAiEmbeddingApiKey!));
-
-            // Get EmbeddingClient and convert to IEmbeddingGenerator
-            var embeddingClient = azureClient.GetEmbeddingClient(azureOpenAiEmbeddingDeployment);
-            return embeddingClient.AsIEmbeddingGenerator();
-        }
-    });
-}
-else if (hasOpenAI)
-{
-    Console.WriteLine("Using OpenAI with model: gpt-4");
-
-    builder.Services.AddSingleton<IChatClient>(provider =>
-    {
-        var openAIClient = new OpenAIClient(openAiApiKey!);
-        // Get ChatClient and convert to IChatClient using AsIChatClient()
-        var chatClient = openAIClient.GetChatClient("gpt-4");
-        return chatClient.AsIChatClient();
-    });
-
-    builder.Services.AddSingleton<IEmbeddingGenerator<string, Embedding<float>>>(provider =>
-    {
-        var openAIClient = new OpenAIClient(openAiApiKey!);
-        // Get EmbeddingClient and convert to IEmbeddingGenerator
-        var embeddingClient = openAIClient.GetEmbeddingClient("text-embedding-ada-002");
-        return embeddingClient.AsIEmbeddingGenerator();
-    });
-}
+builder.Services.AddSingleton<IEmbeddingGenerator<string, Embedding<float>>>(provider =>
+    new DynamicAzureEmbeddingGenerator(
+        provider.GetRequiredService<EmbeddingConfigurationService>(),
+        provider.GetRequiredService<ILogger<DynamicAzureEmbeddingGenerator>>()));
 
 // Add distributed cache for response caching (in-memory for now)
 builder.Services.AddDistributedMemoryCache();
@@ -205,6 +83,7 @@ builder.Services.AddDistributedMemoryCache();
 // Add custom services
 builder.Services.AddSingleton<CodebaseCache>();
 builder.Services.AddSingleton<AdoConfigurationService>();
+builder.Services.AddSingleton<EmbeddingConfigurationService>();
 
 // Add embedding inspection and visualization services
 builder.Services.AddEmbeddingInspection();
@@ -254,6 +133,9 @@ builder.Services.AddCors(options =>
 });
 
 var app = builder.Build();
+
+// Clean up any existing temp clone directories from previous runs
+CleanupTempCloneDirectories(app.Services.GetRequiredService<ILogger<Program>>());
 
 // Initialize ADO configuration on startup if credentials are available
 if (!string.IsNullOrEmpty(adoOrganization) && !string.IsNullOrEmpty(adoPat))
@@ -328,11 +210,27 @@ if (args.Contains("--visualize-embeddings"))
     return;
 }
 
+// Check for test runner mode
+if (args.Contains("--test-runner"))
+{
+    logger.LogWarning("Test runner mode is not available in the main app build. Run tests via 'dotnet test' or the test scripts.");
+    Environment.Exit(1);
+    return;
+}
+
 // Check for memory inspection mode
 if (args.Contains("--inspect-memory"))
 {
     logger.LogInformation("Starting Memory Inspector mode");
     await MemoryInspectionExtensions.RunMemoryInspectionAsync(app.Services, args);
+    return;
+}
+
+// Check for git clone RAG test mode
+if (args.Contains("--test-git-clone-rag"))
+{
+    logger.LogInformation("Starting Git Clone RAG Test mode");
+    await TestGitCloneRagAsync(app.Services, args, logger);
     return;
 }
 
@@ -427,3 +325,168 @@ else
 }
 
 logger.LogInformation("Code Review Agent finished");
+
+/// <summary>
+/// Clean up any existing temp clone directories from previous runs to ensure fresh state
+/// </summary>
+static void CleanupTempCloneDirectories(ILogger<Program> logger)
+{
+    try
+    {
+        // Clean up old temp location
+        var oldTempPath = Path.Combine(Path.GetTempPath(), "repo_clone");
+        if (Directory.Exists(oldTempPath))
+        {
+            logger.LogInformation("🧹 Cleaning up old temp clone directories from: {TempPath}", oldTempPath);
+            ForceDeleteDirectory(oldTempPath, logger);
+            logger.LogInformation("✅ Old temp clone directories cleaned successfully");
+        }
+
+        // Clean up new temp location in codebase
+        var currentDir = Directory.GetCurrentDirectory();
+        var tempReposDir = Path.Combine(currentDir, "temp_repos");
+        if (Directory.Exists(tempReposDir))
+        {
+            logger.LogInformation("🧹 Cleaning up temp_repos from codebase: {TempPath}", tempReposDir);
+            ForceDeleteDirectory(tempReposDir, logger);
+            logger.LogInformation("✅ temp_repos cleaned successfully");
+        }
+        else
+        {
+            logger.LogDebug("ℹ️ No temp clone directories found to clean");
+        }
+    }
+    catch (Exception ex)
+    {
+        logger.LogWarning(ex, "⚠️ Failed to clean up temp clone directories - continuing anyway");
+    }
+}
+
+static void ForceDeleteDirectory(string directoryPath, ILogger<Program> logger)
+{
+    if (!Directory.Exists(directoryPath))
+    {
+        return;
+    }
+
+    const int maxAttempts = 5;
+    for (int attempt = 1; attempt <= maxAttempts; attempt++)
+    {
+        try
+        {
+            Directory.Delete(directoryPath, recursive: true);
+            return;
+        }
+        catch (UnauthorizedAccessException) when (attempt < maxAttempts)
+        {
+            logger.LogDebug("Directory cleanup access retry {Attempt}/{MaxAttempts} for {Path}", attempt, maxAttempts, directoryPath);
+        }
+        catch (IOException) when (attempt < maxAttempts)
+        {
+            logger.LogDebug("Directory cleanup IO retry {Attempt}/{MaxAttempts} for {Path}", attempt, maxAttempts, directoryPath);
+        }
+
+        try
+        {
+            using var process = new System.Diagnostics.Process();
+            process.StartInfo = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "powershell.exe",
+                Arguments = $"-Command \"Remove-Item '{directoryPath}' -Recurse -Force -ErrorAction SilentlyContinue\"",
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+
+            process.Start();
+            process.WaitForExit();
+        }
+        catch (Exception ex)
+        {
+            logger.LogDebug(ex, "Fallback force delete attempt failed for {Path}", directoryPath);
+        }
+
+        if (!Directory.Exists(directoryPath))
+        {
+            return;
+        }
+
+        Thread.Sleep(250 * attempt);
+    }
+
+    // Final attempt - let exception bubble to caller for top-level warning.
+    Directory.Delete(directoryPath, recursive: true);
+}
+
+/// <summary>
+/// Test the git clone-based RAG indexing approach
+/// </summary>
+static async Task TestGitCloneRagAsync(IServiceProvider services, string[] args, ILogger<Program> logger)
+{
+    logger.LogInformation("🧪 TESTING GIT CLONE-BASED RAG INDEXING");
+    logger.LogInformation("═══════════════════════════════════════");
+
+    try
+    {
+        var codebaseService = services.GetRequiredService<CodebaseContextService>();
+        
+        // Test parameters - use generic sample defaults
+        var project = "MyProject";
+        var repositoryId = "my-repository";
+        var branch = "master";
+        var repositoryUrl = "https://dev.azure.com/your-organization/MyProject/_git/my-repository";
+
+        logger.LogInformation("Test Parameters:");
+        logger.LogInformation("  Project: {Project}", project);
+        logger.LogInformation("  Repository: {Repository}", repositoryId);
+        logger.LogInformation("  Branch: {Branch}", branch);
+        logger.LogInformation("  Repository URL: {Url}", repositoryUrl);
+
+        // Step 1: Test API-based indexing first for comparison
+        logger.LogInformation("\n🔄 Step 1: Running API-based indexing for comparison...");
+        var apiChunkCount = await codebaseService.IndexRepositoryAsync(project, repositoryId, branch);
+        logger.LogInformation("✅ API-based indexing result: {ChunkCount} chunks", apiChunkCount);
+
+        // Step 2: Test git clone-based indexing
+        logger.LogInformation("\n🚀 Step 2: Running Git Clone-based indexing...");
+        var cloneChunkCount = await codebaseService.IndexRepositoryWithCloneAsync(project, repositoryId, branch, repositoryUrl);
+        logger.LogInformation("✅ Git Clone-based indexing result: {ChunkCount} chunks", cloneChunkCount);
+
+        // Step 3: Compare results
+        logger.LogInformation("\n📊 COMPARISON RESULTS:");
+        logger.LogInformation("═════════════════════");
+        logger.LogInformation("API-based chunks:   {ApiChunks}", apiChunkCount);
+        logger.LogInformation("Git clone chunks:   {CloneChunks}", cloneChunkCount);
+        logger.LogInformation("Improvement:        {Improvement} chunks ({Percentage:F1}% more)",
+            cloneChunkCount - apiChunkCount,
+            apiChunkCount > 0 ? ((double)(cloneChunkCount - apiChunkCount) / apiChunkCount) * 100 : 0);
+
+        if (cloneChunkCount > apiChunkCount)
+        {
+            logger.LogInformation("🎉 SUCCESS: Git clone found {MoreChunks} more chunks than API approach!",
+                cloneChunkCount - apiChunkCount);
+            logger.LogInformation("   This proves git clone discovers more files in the repository.");
+        }
+        else if (cloneChunkCount == apiChunkCount)
+        {
+            logger.LogInformation("🤔 EQUAL: Both approaches found the same number of chunks.");
+            logger.LogInformation("   Either the API pagination fix worked, or both have same coverage.");
+        }
+        else
+        {
+            logger.LogInformation("⚠️  UNEXPECTED: Git clone found fewer chunks than API approach.");
+            logger.LogInformation("   This suggests an issue with the git clone implementation.");
+        }
+
+        // Step 4: Display index summary
+        logger.LogInformation("\n📋 INDEX SUMMARY:");
+        logger.LogInformation("════════════════");
+        var summary = codebaseService.GetIndexSummary(repositoryId);
+        logger.LogInformation("{Summary}", summary);
+
+        logger.LogInformation("\n✅ Git Clone RAG test completed successfully!");
+    }
+    catch (Exception ex)
+    {
+        logger.LogError(ex, "❌ Git Clone RAG test failed");
+    }
+}

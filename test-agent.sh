@@ -63,11 +63,11 @@ echo
 # Check if repository and PR ID are provided
 if [ "$#" -eq 2 ]; then
     # Format: <repository> <pull-request-id>
-    # Use default project SCC
-    PROJECT="SCC"
+    # Use default sample project
+    PROJECT="MyProject"
     REPOSITORY=$1
     PR_ID=$2
-    echo "Using default project: SCC"
+    echo "Using default project: MyProject"
 elif [ "$#" -eq 3 ]; then
     # Format: <project> <repository> <pull-request-id>
     PROJECT=$1

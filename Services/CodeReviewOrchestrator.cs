@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using CodeReviewAgent.Agents;
 using CodeReviewAgent.Models;
@@ -49,6 +50,16 @@ public class CodeReviewOrchestrator
         List<PullRequestFile> files,
         string codebaseContext)
     {
+        _logger.LogInformation("╔════════════════════════════════════════════════════════════╗");
+        _logger.LogInformation("║ FILE PROCESSING STRATEGY                                   ║");
+        _logger.LogInformation("╚════════════════════════════════════════════════════════════╝");
+        _logger.LogInformation("📂 Processing {FileCount} files in PARALLEL for faster reviews", files.Count);
+        _logger.LogInformation("   Each file gets its own RAG context and LLM call");
+        _logger.LogInformation("   Files: {Files}", string.Join(", ", files.Select(f => Path.GetFileName(f.Path))));
+        
+        var overallStopwatch = System.Diagnostics.Stopwatch.StartNew();
+        var failures = new ConcurrentBag<string>();
+        
         // Process files in parallel for faster reviews
         var reviewTasks = files.Select(async file =>
         {
@@ -79,12 +90,42 @@ public class CodeReviewOrchestrator
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error reviewing file {FilePath}", file.Path);
+                failures.Add($"{file.Path}: {ex.Message}");
                 return new List<CodeReviewComment>();
             }
         });
 
         var results = await Task.WhenAll(reviewTasks);
-        return results.SelectMany(comments => comments).ToList();
+        overallStopwatch.Stop();
+        
+        var allComments = results.SelectMany(comments => comments).ToList();
+        
+        _logger.LogInformation("╔════════════════════════════════════════════════════════════╗");
+        _logger.LogInformation("║ PARALLEL PROCESSING COMPLETE                              ║");
+        _logger.LogInformation("╚════════════════════════════════════════════════════════════╝");
+        _logger.LogInformation("⏱️  Total parallel processing time: {TotalMs}ms ({TotalSec:F2} seconds)", 
+            overallStopwatch.ElapsedMilliseconds, overallStopwatch.Elapsed.TotalSeconds);
+        _logger.LogInformation("📊 Processing results:");
+        _logger.LogInformation("   Files processed: {FileCount}", files.Count);
+        _logger.LogInformation("   Total comments generated: {CommentCount}", allComments.Count);
+        _logger.LogInformation("   Average time per file: {AvgMs}ms", 
+            files.Count > 0 ? overallStopwatch.ElapsedMilliseconds / files.Count : 0);
+
+        if (!failures.IsEmpty)
+        {
+            _logger.LogWarning("   Files with review errors: {FailureCount}", failures.Count);
+        }
+
+        _logger.LogInformation("════════════════════════════════════════════════════════════");
+
+        if (!failures.IsEmpty && allComments.Count == 0)
+        {
+            var errorDetails = string.Join(" | ", failures.Take(3));
+            throw new InvalidOperationException(
+                $"Code review failed for all files. {errorDetails}. Check LLM chat credentials/configuration and retry.");
+        }
+        
+        return allComments;
     }
 
     /// <summary>

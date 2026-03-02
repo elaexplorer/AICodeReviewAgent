@@ -251,7 +251,7 @@ public class RuntimeFileLogger : ILogger
 
     public bool IsEnabled(LogLevel logLevel)
     {
-        return logLevel >= LogLevel.Information; // Only log Information and above to file
+        return logLevel >= LogLevel.Debug; // Log Debug and above to file
     }
 
     public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)

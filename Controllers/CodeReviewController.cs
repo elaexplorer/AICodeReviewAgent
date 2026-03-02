@@ -14,6 +14,8 @@ public class CodeReviewController : ControllerBase
     private readonly CodeReviewAgentService _codeReviewAgent;
     private readonly AzureDevOpsMcpClient _adoClient;
     private readonly AdoConfigurationService _adoConfig;
+    private readonly ChatConfigurationService _chatConfig;
+    private readonly EmbeddingConfigurationService _embeddingConfig;
     private readonly CodebaseContextService _codebaseContextService;
     private readonly ILogger<CodeReviewController> _logger;
     private static ReviewResult? _currentReview;
@@ -24,12 +26,16 @@ public class CodeReviewController : ControllerBase
         CodeReviewAgentService codeReviewAgent,
         AzureDevOpsMcpClient adoClient,
         AdoConfigurationService adoConfig,
+        ChatConfigurationService chatConfig,
+        EmbeddingConfigurationService embeddingConfig,
         CodebaseContextService codebaseContextService,
         ILogger<CodeReviewController> logger)
     {
         _codeReviewAgent = codeReviewAgent;
         _adoClient = adoClient;
         _adoConfig = adoConfig;
+        _chatConfig = chatConfig;
+        _embeddingConfig = embeddingConfig;
         _codebaseContextService = codebaseContextService;
         _logger = logger;
     }
@@ -93,10 +99,9 @@ public class CodeReviewController : ControllerBase
     [HttpGet("projects")]
     public IActionResult GetProjects()
     {
-        // Return predefined list of projects
+        // Return predefined sample list of projects
         var projects = new List<ProjectInfo>
         {
-            new ProjectInfo { Name = "SCC", DisplayName = "SCC", Repositories = new List<string> { "service-shared_framework_waimea" } },
             new ProjectInfo { Name = "MyProject", DisplayName = "My Project", Repositories = new List<string>() }
         };
 
@@ -108,13 +113,9 @@ public class CodeReviewController : ControllerBase
     {
         try
         {
-            // In a real implementation, you'd fetch repositories from ADO
-            // For now, return hardcoded list based on project
-            var repositories = project switch
-            {
-                "SCC" => new List<string> { "service-shared_framework_waimea" },
-                _ => new List<string>()
-            };
+            // In a real implementation, fetch repositories from ADO.
+            // For sample mode, return an empty list.
+            var repositories = new List<string>();
 
             return Ok(repositories);
         }
@@ -190,7 +191,7 @@ public class CodeReviewController : ControllerBase
     /// <summary>
     /// Triggers background indexing for a repository if not already indexed or in progress
     /// </summary>
-    private void TriggerBackgroundIndexing(string project, string repository, string branch = "main")
+    private void TriggerBackgroundIndexing(string project, string repository, string branch = "master")
     {
         // Skip if already indexed
         if (_codebaseContextService.IsRepositoryIndexed(repository))
@@ -231,10 +232,20 @@ public class CodeReviewController : ControllerBase
                 _logger.LogInformation("╔════════════════════════════════════════════════════════════╗");
                 _logger.LogInformation("║ AUTO-INDEX: Background Indexing Complete                   ║");
                 _logger.LogInformation("╚════════════════════════════════════════════════════════════╝");
-                _logger.LogInformation("✅ Repository '{Repository}' indexed successfully", repository);
-                _logger.LogInformation("   Chunks indexed: {ChunkCount}", chunksIndexed);
-                _logger.LogInformation("   Duration: {Duration:F1} seconds", duration.TotalSeconds);
-                _logger.LogInformation("   Embeddings are now ready for semantic search!");
+
+                if (chunksIndexed > 0)
+                {
+                    _logger.LogInformation("✅ Repository '{Repository}' indexed successfully", repository);
+                    _logger.LogInformation("   Chunks indexed: {ChunkCount}", chunksIndexed);
+                    _logger.LogInformation("   Duration: {Duration:F1} seconds", duration.TotalSeconds);
+                    _logger.LogInformation("   Embeddings are now ready for semantic search!");
+                }
+                else
+                {
+                    _logger.LogWarning("⚠️ Repository '{Repository}' indexing completed with 0 chunks", repository);
+                    _logger.LogWarning("   Duration: {Duration:F1} seconds", duration.TotalSeconds);
+                    _logger.LogWarning("   Check embedding service configuration (endpoint/key/deployment) and ADO clone access.");
+                }
             }
             catch (Exception ex)
             {
@@ -293,13 +304,27 @@ public class CodeReviewController : ControllerBase
     [HttpGet("config/status")]
     public IActionResult GetConfigStatus()
     {
-        // Get default PAT from environment variable
-        var defaultPat = Environment.GetEnvironmentVariable("ADO_PAT") ?? "";
+        var hasDefaultPat = !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("ADO_PAT"));
+        var hasDefaultChatApiKey =
+            !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("AZURE_OPENAI_API_KEY"));
+        var hasDefaultEmbeddingApiKey =
+            !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("AZURE_OPENAI_EMBEDDING_API_KEY")) ||
+            !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("AZURE_OPENAI_API_KEY"));
         
         return Ok(new {
             isConfigured = _adoConfig.IsConfigured,
             organization = _adoConfig.Organization,
-            defaultPat = defaultPat  // Send default PAT to populate the form
+            hasDefaultPat = hasDefaultPat,
+            chatIsConfigured = _chatConfig.IsConfigured,
+            chatEndpoint = _chatConfig.Endpoint,
+            chatDeployment = _chatConfig.Deployment,
+            chatApiVersion = _chatConfig.ApiVersion,
+            hasDefaultChatApiKey = hasDefaultChatApiKey,
+            embeddingIsConfigured = _embeddingConfig.IsConfigured,
+            embeddingEndpoint = _embeddingConfig.Endpoint,
+            embeddingDeployment = _embeddingConfig.Deployment,
+            embeddingApiVersion = _embeddingConfig.ApiVersion,
+            hasDefaultEmbeddingApiKey = hasDefaultEmbeddingApiKey
         });
     }
 
@@ -310,24 +335,50 @@ public class CodeReviewController : ControllerBase
         {
             var (isValid, errorMessage) = await _adoConfig.ValidateAndConfigureAsync(request.Organization, request.PersonalAccessToken);
 
-            if (isValid)
-            {
-                // Reinitialize ADO client with new credentials
-                _adoClient.UpdateConfiguration(request.Organization, request.PersonalAccessToken);
-
-                return Ok(new {
-                    success = true,
-                    message = "Configuration validated successfully",
-                    organization = request.Organization
-                });
-            }
-            else
+            if (!isValid)
             {
                 return BadRequest(new {
                     success = false,
                     error = errorMessage
                 });
             }
+
+            var (chatIsValid, chatError) = await _chatConfig.ValidateAndConfigureAsync(
+                request.ChatEndpoint,
+                request.ChatApiKey,
+                request.ChatDeployment,
+                request.ChatApiVersion);
+
+            if (!chatIsValid)
+            {
+                return BadRequest(new {
+                    success = false,
+                    error = chatError
+                });
+            }
+
+            var (embeddingIsValid, embeddingError) = await _embeddingConfig.ValidateAndConfigureAsync(
+                request.EmbeddingEndpoint,
+                request.EmbeddingApiKey,
+                request.EmbeddingDeployment,
+                request.EmbeddingApiVersion);
+
+            if (!embeddingIsValid)
+            {
+                return BadRequest(new {
+                    success = false,
+                    error = embeddingError
+                });
+            }
+
+            // Reinitialize ADO client with new credentials
+            _adoClient.UpdateConfiguration(request.Organization, request.PersonalAccessToken);
+
+            return Ok(new {
+                success = true,
+                message = "Configuration validated successfully",
+                organization = request.Organization
+            });
         }
         catch (Exception ex)
         {
@@ -343,6 +394,8 @@ public class CodeReviewController : ControllerBase
     public IActionResult ClearConfig()
     {
         _adoConfig.ClearConfiguration();
+        _chatConfig.ClearConfiguration();
+        _embeddingConfig.ClearConfiguration();
         return Ok(new { success = true, message = "Configuration cleared" });
     }
 
@@ -404,7 +457,7 @@ public class CodeReviewController : ControllerBase
 
 public class ReviewRequest
 {
-    public string Project { get; set; } = "SCC";
+    public string Project { get; set; } = "MyProject";
     public string Repository { get; set; } = "";
     public int PullRequestId { get; set; }
 }
@@ -418,13 +471,21 @@ public class ConfigRequest
 {
     public string Organization { get; set; } = "";
     public string PersonalAccessToken { get; set; } = "";
+    public string ChatEndpoint { get; set; } = "";
+    public string ChatApiKey { get; set; } = "";
+    public string ChatDeployment { get; set; } = "gpt-4";
+    public string ChatApiVersion { get; set; } = "2024-02-01";
+    public string EmbeddingEndpoint { get; set; } = "";
+    public string EmbeddingApiKey { get; set; } = "";
+    public string EmbeddingDeployment { get; set; } = "text-embedding-ada-002";
+    public string EmbeddingApiVersion { get; set; } = "2024-02-01";
 }
 
 public class IndexRequest
 {
-    public string Project { get; set; } = "SCC";
+    public string Project { get; set; } = "MyProject";
     public string Repository { get; set; } = "";
-    public string Branch { get; set; } = "main";
+    public string Branch { get; set; } = "master";
 }
 
 public class ReviewResult

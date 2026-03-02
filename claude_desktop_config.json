@@ -9,13 +9,13 @@
       "args": [
         "-y",
         "@azure-devops/mcp",
-        "Skype",
+        "your-organization",
         "-a",
         "env"
       ],
       "env": {
         "AZURE_DEVOPS_EXT_PAT": "YOUR_PAT_TOKEN_HERE",
-        "AZURE_DEVOPS_ORGANIZATION": "Skype"
+        "AZURE_DEVOPS_ORGANIZATION": "your-organization"
       }
     }
   }

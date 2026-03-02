@@ -316,7 +316,7 @@ async function indexRepository() {
 ### Step 1: Index Repository
 ```bash
 # Via API
-curl -X POST "http://localhost:5000/api/codereview/index?project=skype&repository=my-repo&branch=main"
+curl -X POST "http://localhost:5000/api/codereview/index?project=myproject&repository=my-repo&branch=main"
 
 # Via UI
 1. Open http://localhost:5000
@@ -351,7 +351,7 @@ info: CodebaseContextService[0]
 AZURE_OPENAI_API_KEY=your-key
 AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com/
 AZURE_OPENAI_DEPLOYMENT=gpt-5-mini
-ADO_ORGANIZATION=skype
+ADO_ORGANIZATION=myorganization
 ADO_PAT=your-pat
 
 # Note: text-embedding-ada-002 deployment must exist in your Azure OpenAI resource
