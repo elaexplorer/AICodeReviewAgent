@@ -583,7 +583,67 @@ public class CodebaseContextService
                         _logger.LogInformation("   Closest match was: {Similarity:F4} at {Location}",
                             (double)best.Similarity, (string)best.Chunk.Metadata);
                     }
-                    return string.Empty;
+
+                    // Hybrid fallback: enrich query with full-file/package/path signals.
+                    _logger.LogInformation("Step 3b: Retrying semantic search with hybrid full-file query...");
+                    var hybridQuery = BuildHybridSearchQuery(file, searchQuery);
+
+                    if (!string.IsNullOrWhiteSpace(hybridQuery))
+                    {
+                        _logger.LogInformation("🔍 HYBRID QUERY CONSTRUCTED:");
+                        _logger.LogInformation("   Length: {Length} characters", hybridQuery.Length);
+                        _logger.LogInformation("   Content: {Query}",
+                            hybridQuery.Length > 300 ? hybridQuery.Substring(0, 300) + "..." : hybridQuery);
+
+                        var hybridEmbeddingResponse = await GenerateEmbeddingWithRetryAsync(hybridQuery);
+                        var hybridVector = ToFloatVector(((dynamic)hybridEmbeddingResponse).Vector);
+
+                        var hybridSimilarities = chunks
+                            .Select(chunk => new SimilarityResult
+                            {
+                                Chunk = chunk,
+                                Similarity = CosineSimilarity(hybridVector, chunk.Embedding)
+                            })
+                            .OrderByDescending(r => r.Similarity)
+                            .ToList();
+
+                        var hybridBest = hybridSimilarities.FirstOrDefault();
+                        _logger.LogInformation("   Hybrid max similarity: {Max:F4}", (double)(hybridBest?.Similarity ?? 0));
+
+                        results = hybridSimilarities
+                            .Where(r => r.Similarity > 0.3)
+                            .Take(maxResults)
+                            .ToList();
+
+                        if (results.Count == 0 && hybridBest != null && hybridBest.Similarity >= 0.18)
+                        {
+                            _logger.LogInformation("⚠️ Hybrid semantic fallback selected best match {Similarity:F4}", (double)hybridBest.Similarity);
+                            results = new List<SimilarityResult> { hybridBest };
+                            queryVector = hybridVector;
+                        }
+                        else if (results.Count > 0)
+                        {
+                            _logger.LogInformation("✅ Hybrid semantic search found {Count} chunks", results.Count);
+                            queryVector = hybridVector;
+                        }
+                    }
+
+                    // Deterministic fallback: choose chunks from same package/path neighborhood.
+                    if (results.Count == 0)
+                    {
+                        _logger.LogInformation("Step 3c: Semantic retrieval still empty; using path/package fallback...");
+                        results = GetPathBasedFallbackChunks(file, chunks, maxResults);
+                        if (results.Count > 0)
+                        {
+                            _logger.LogInformation("✅ Path/package fallback provided {Count} chunks", results.Count);
+                        }
+                    }
+
+                    if (results.Count == 0)
+                    {
+                        _logger.LogInformation("❌ No semantic or fallback context found for {FilePath}", file.Path);
+                        return string.Empty;
+                    }
                 }
             }
 
@@ -1463,6 +1523,93 @@ public class CodebaseContextService
 
         _logger.LogDebug("   Final query length: {Length} chars (max 1000)", finalQuery.Length);
         return finalQuery;
+    }
+
+    private string BuildHybridSearchQuery(PullRequestFile file, string diffQuery)
+    {
+        var parts = new List<string>();
+
+        if (!string.IsNullOrWhiteSpace(diffQuery))
+        {
+            parts.Add(diffQuery);
+        }
+
+        var normalizedPath = (file.Path ?? string.Empty).Replace('\\', '/');
+        if (!string.IsNullOrWhiteSpace(normalizedPath))
+        {
+            parts.Add($"path {normalizedPath}");
+
+            var pathParts = normalizedPath
+                .Split('/', StringSplitOptions.RemoveEmptyEntries)
+                .TakeLast(5)
+                .ToList();
+
+            if (pathParts.Count > 0)
+            {
+                parts.Add($"package {string.Join(' ', pathParts)}");
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(file.Content))
+        {
+            var contentLines = file.Content
+                .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                .Select(l => l.Trim())
+                .Where(l => l.Length > 3)
+                .Take(40)
+                .ToList();
+
+            if (contentLines.Count > 0)
+            {
+                parts.Add(string.Join(' ', contentLines));
+            }
+        }
+
+        var query = string.Join(' ', parts.Where(p => !string.IsNullOrWhiteSpace(p)));
+        return query.Length > 1500 ? query.Substring(0, 1500) : query;
+    }
+
+    private List<SimilarityResult> GetPathBasedFallbackChunks(
+        PullRequestFile file,
+        List<CodeChunk> chunks,
+        int maxResults)
+    {
+        var targetPath = (file.Path ?? string.Empty).Replace('\\', '/').ToLowerInvariant();
+        var fileName = Path.GetFileNameWithoutExtension(targetPath);
+        var dir = Path.GetDirectoryName(targetPath)?.Replace('\\', '/').ToLowerInvariant() ?? string.Empty;
+
+        return chunks
+            .Select(chunk =>
+            {
+                var chunkPath = (chunk.FilePath ?? string.Empty).Replace('\\', '/').ToLowerInvariant();
+                var score = 0.0;
+
+                if (!string.IsNullOrWhiteSpace(fileName) && chunkPath.Contains(fileName))
+                {
+                    score += 3.0;
+                }
+
+                if (!string.IsNullOrWhiteSpace(dir))
+                {
+                    var dirParts = dir.Split('/', StringSplitOptions.RemoveEmptyEntries);
+                    score += dirParts.Count(part => chunkPath.Contains(part)) * 0.2;
+                }
+
+                if (chunkPath.EndsWith(".java", StringComparison.OrdinalIgnoreCase) && targetPath.EndsWith(".java", StringComparison.OrdinalIgnoreCase))
+                {
+                    score += 0.3;
+                }
+
+                return new SimilarityResult
+                {
+                    Chunk = chunk,
+                    Similarity = score
+                };
+            })
+            .Where(r => r.Similarity > 0)
+            .OrderByDescending(r => r.Similarity)
+            .Take(maxResults)
+            .ToList();
     }
 
     private List<string> ParseDependencies(string? content, string filePath)
