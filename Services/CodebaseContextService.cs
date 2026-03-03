@@ -515,7 +515,13 @@ public class CodebaseContextService
             // Generate embedding for the search query
             _logger.LogInformation("Step 2: Generating embedding for search query...");
             var queryEmbeddingResponse = await GenerateEmbeddingWithRetryAsync(searchQuery);
-            var queryVector = ToFloatVector(((dynamic)queryEmbeddingResponse).Vector);
+            var queryVector = ExtractEmbeddingVector(queryEmbeddingResponse);
+
+            if (queryVector.Length == 0)
+            {
+                _logger.LogWarning("⚠️ Query embedding vector is empty for {FilePath}; skipping semantic retrieval", file.Path);
+                return string.Empty;
+            }
 
             _logger.LogInformation("📐 QUERY EMBEDDING GENERATED:");
             _logger.LogInformation("   Vector dimension: {Dim}", (int)queryVector.Length);
@@ -596,16 +602,24 @@ public class CodebaseContextService
                             hybridQuery.Length > 300 ? hybridQuery.Substring(0, 300) + "..." : hybridQuery);
 
                         var hybridEmbeddingResponse = await GenerateEmbeddingWithRetryAsync(hybridQuery);
-                        var hybridVector = ToFloatVector(((dynamic)hybridEmbeddingResponse).Vector);
+                        var hybridVector = ExtractEmbeddingVector(hybridEmbeddingResponse);
 
-                        var hybridSimilarities = chunks
-                            .Select(chunk => new SimilarityResult
-                            {
-                                Chunk = chunk,
-                                Similarity = CosineSimilarity(hybridVector, chunk.Embedding)
-                            })
-                            .OrderByDescending(r => r.Similarity)
-                            .ToList();
+                        if (hybridVector.Length == 0)
+                        {
+                            _logger.LogWarning("⚠️ Hybrid query embedding vector is empty; skipping hybrid semantic retry");
+                            hybridVector = Array.Empty<float>();
+                        }
+
+                        var hybridSimilarities = hybridVector.Length == 0
+                            ? new List<SimilarityResult>()
+                            : chunks
+                                .Select(chunk => new SimilarityResult
+                                {
+                                    Chunk = chunk,
+                                    Similarity = CosineSimilarity(hybridVector, chunk.Embedding)
+                                })
+                                .OrderByDescending(r => r.Similarity)
+                                .ToList();
 
                         var hybridBest = hybridSimilarities.FirstOrDefault();
                         _logger.LogInformation("   Hybrid max similarity: {Max:F4}", (double)(hybridBest?.Similarity ?? 0));
@@ -1650,9 +1664,32 @@ public class CodebaseContextService
             var useMatches = Regex.Matches(content, @"use\s+(?:crate::)?([A-Za-z0-9_:]+)");
             foreach (Match match in useMatches)
             {
-                var module = match.Groups[1].Value.Replace("::", "/");
-                var potentialPath = "/src/" + module + ".rs";
-                dependencies.Add(potentialPath);
+                var raw = match.Groups[1].Value;
+                var segments = raw
+                    .Split("::", StringSplitOptions.RemoveEmptyEntries)
+                    .Where(s => !string.Equals(s, "self", StringComparison.OrdinalIgnoreCase))
+                    .Where(s => !string.Equals(s, "super", StringComparison.OrdinalIgnoreCase))
+                    .Where(s => !string.Equals(s, "crate", StringComparison.OrdinalIgnoreCase))
+                    .ToList();
+
+                if (segments.Count == 0)
+                {
+                    continue;
+                }
+
+                // If the last segment is likely a type, keep only module path parts.
+                if (segments.Count > 1 && char.IsUpper(segments[^1][0]))
+                {
+                    segments.RemoveAt(segments.Count - 1);
+                }
+
+                if (segments.Count == 0)
+                {
+                    continue;
+                }
+
+                var modulePath = string.Join("/", segments);
+                dependencies.Add($"/src/{modulePath}.rs");
             }
         }
 
@@ -1814,6 +1851,16 @@ public class CodebaseContextService
             return floatEnumerable.ToArray();
         }
 
+        if (vector is Memory<float> floatMemory)
+        {
+            return floatMemory.ToArray();
+        }
+
+        if (vector is ReadOnlyMemory<float> readOnlyFloatMemory)
+        {
+            return readOnlyFloatMemory.ToArray();
+        }
+
         if (vector is double[] doubleArray)
         {
             return doubleArray.Select(v => (float)v).ToArray();
@@ -1827,6 +1874,32 @@ public class CodebaseContextService
         try
         {
             return ((IEnumerable<object>)vector).Select(v => Convert.ToSingle(v)).ToArray();
+        }
+        catch
+        {
+            return Array.Empty<float>();
+        }
+    }
+
+    private static float[] ExtractEmbeddingVector(object embeddingResult)
+    {
+        try
+        {
+            var vector = ((dynamic)embeddingResult).Vector;
+            var asArray = ToFloatVector(vector);
+            if (asArray.Length > 0)
+            {
+                return asArray;
+            }
+        }
+        catch
+        {
+            // Fall through to additional extraction attempts.
+        }
+
+        try
+        {
+            return ToFloatVector(embeddingResult);
         }
         catch
         {
