@@ -21,6 +21,12 @@ public class EmbeddingConfigurationService
     {
         _logger = logger;
 
+        if (IsForceUiConfigEnabled())
+        {
+            _logger.LogInformation("FORCE_UI_CONFIG enabled: skipping embedding environment auto-configuration");
+            return;
+        }
+
         var baseEndpoint = Environment.GetEnvironmentVariable("AZURE_OPENAI_ENDPOINT");
         var baseApiKey = Environment.GetEnvironmentVariable("AZURE_OPENAI_API_KEY");
 
@@ -101,5 +107,18 @@ public class EmbeddingConfigurationService
         _deployment = "text-embedding-ada-002";
         _apiVersion = "2024-02-01";
         _logger.LogInformation("Embedding configuration cleared");
+    }
+
+    private static bool IsForceUiConfigEnabled()
+    {
+        var value = Environment.GetEnvironmentVariable("FORCE_UI_CONFIG");
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        return string.Equals(value, "true", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(value, "1", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(value, "yes", StringComparison.OrdinalIgnoreCase);
     }
 }

@@ -21,6 +21,12 @@ public class ChatConfigurationService
     {
         _logger = logger;
 
+        if (IsForceUiConfigEnabled())
+        {
+            _logger.LogInformation("FORCE_UI_CONFIG enabled: skipping chat environment auto-configuration");
+            return;
+        }
+
         _endpoint = Environment.GetEnvironmentVariable("AZURE_OPENAI_ENDPOINT");
         _apiKey = Environment.GetEnvironmentVariable("AZURE_OPENAI_API_KEY");
         _deployment = Environment.GetEnvironmentVariable("AZURE_OPENAI_DEPLOYMENT") ?? "gpt-4";
@@ -98,5 +104,18 @@ public class ChatConfigurationService
         _deployment = "gpt-4";
         _apiVersion = "2024-02-01";
         _logger.LogInformation("Chat configuration cleared");
+    }
+
+    private static bool IsForceUiConfigEnabled()
+    {
+        var value = Environment.GetEnvironmentVariable("FORCE_UI_CONFIG");
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        return string.Equals(value, "true", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(value, "1", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(value, "yes", StringComparison.OrdinalIgnoreCase);
     }
 }

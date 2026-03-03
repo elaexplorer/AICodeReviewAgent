@@ -515,7 +515,7 @@ public class CodebaseContextService
             // Generate embedding for the search query
             _logger.LogInformation("Step 2: Generating embedding for search query...");
             var queryEmbeddingResponse = await GenerateEmbeddingWithRetryAsync(searchQuery);
-            var queryVector = ((dynamic)queryEmbeddingResponse).Vector.ToArray();
+            var queryVector = ToFloatVector(((dynamic)queryEmbeddingResponse).Vector);
 
             _logger.LogInformation("📐 QUERY EMBEDDING GENERATED:");
             _logger.LogInformation("   Vector dimension: {Dim}", (int)queryVector.Length);
@@ -529,7 +529,7 @@ public class CodebaseContextService
 
             // Calculate all similarities for logging
             var allSimilarities = chunks
-                .Select(chunk => new
+                .Select(chunk => new SimilarityResult
                 {
                     Chunk = chunk,
                     Similarity = CosineSimilarity(queryVector, chunk.Embedding)
@@ -568,10 +568,23 @@ public class CodebaseContextService
 
             if (results.Count == 0)
             {
-                _logger.LogInformation("❌ No chunks passed the 0.4 similarity threshold for {FilePath}", file.Path);
-                _logger.LogInformation("   Closest match was: {Similarity:F4} at {Location}",
-                    (double)allSimilarities.First().Similarity, (string)allSimilarities.First().Chunk.Metadata);
-                return string.Empty;
+                var best = allSimilarities.FirstOrDefault();
+                if (best != null && best.Similarity >= 0.25)
+                {
+                    _logger.LogInformation("⚠️ No chunks passed the 0.4 threshold for {FilePath}; using best fallback match {Similarity:F4}",
+                        file.Path, (double)best.Similarity);
+                    results = new List<SimilarityResult> { best };
+                }
+                else
+                {
+                    _logger.LogInformation("❌ No chunks passed the 0.4 threshold and fallback did not qualify for {FilePath}", file.Path);
+                    if (best != null)
+                    {
+                        _logger.LogInformation("   Closest match was: {Similarity:F4} at {Location}",
+                            (double)best.Similarity, (string)best.Chunk.Metadata);
+                    }
+                    return string.Empty;
+                }
             }
 
             _logger.LogInformation("✅ RETRIEVAL RESULTS: Found {Count} relevant chunks above threshold", results.Count);
@@ -723,17 +736,13 @@ public class CodebaseContextService
         _logger.LogInformation("║ RAG CONTEXT BUILDING: Starting for {File}", file.Path.Length > 35 ? "..." + file.Path.Substring(file.Path.Length - 32) : file.Path);
         _logger.LogInformation("╚════════════════════════════════════════════════════════════╝");
 
-        // 1. PR-level context
-        context.AppendLine($"# Pull Request Context");
-        context.AppendLine($"**Title:** {pr.Title}");
-        if (!string.IsNullOrEmpty(pr.Description))
-        {
-            context.AppendLine($"**Description:** {pr.Description}");
-        }
+        // Keep per-file RAG focused on the target file and related code.
+        context.AppendLine("## File-Specific RAG Context");
+        context.AppendLine($"Target file: {file.Path}");
         context.AppendLine();
 
-        _logger.LogInformation("PR Context: Title='{Title}', Description='{Description}'",
-            pr.Title, pr.Description ?? "(none)");
+        _logger.LogInformation("File-focused RAG context for '{FilePath}' (PR title: {Title})",
+            file.Path, pr.Title);
 
         // 2. Semantic context (similar code)
         _logger.LogInformation("Step 1: Searching for semantically similar code...");
@@ -773,6 +782,23 @@ public class CodebaseContextService
             _logger.LogInformation("❌ No dependency context found ({ElapsedMs}ms)", depStopwatch.ElapsedMilliseconds);
         }
 
+        // 4. Test context (test files likely covering the target file)
+        _logger.LogInformation("Step 3: Searching for related test context...");
+        var testStopwatch = System.Diagnostics.Stopwatch.StartNew();
+        var testContext = GetRelatedTestContext(file, repositoryId, maxFiles: 2, maxChunksPerFile: 2);
+        testStopwatch.Stop();
+
+        if (!string.IsNullOrEmpty(testContext))
+        {
+            context.AppendLine(testContext);
+            _logger.LogInformation("✅ Test Context Added in {ElapsedMs}ms:", testStopwatch.ElapsedMilliseconds);
+            _logger.LogInformation("   Length: {Length} chars", testContext.Length);
+        }
+        else
+        {
+            _logger.LogInformation("❌ No related test context found ({ElapsedMs}ms)", testStopwatch.ElapsedMilliseconds);
+        }
+
         overallStopwatch.Stop();
         var finalContext = context.ToString();
         
@@ -782,6 +808,7 @@ public class CodebaseContextService
         _logger.LogInformation("⏱️  RAG TIMING BREAKDOWN:");
         _logger.LogInformation("   Semantic search: {SemanticMs}ms", semanticStopwatch?.ElapsedMilliseconds ?? 0);
         _logger.LogInformation("   Dependency search: {DepMs}ms", depStopwatch?.ElapsedMilliseconds ?? 0);
+        _logger.LogInformation("   Test search: {TestMs}ms", testStopwatch?.ElapsedMilliseconds ?? 0);
         _logger.LogInformation("   Total RAG time: {TotalMs}ms ({TotalSec:F2} seconds)", 
             overallStopwatch.ElapsedMilliseconds, overallStopwatch.Elapsed.TotalSeconds);
         
@@ -1491,6 +1518,113 @@ public class CodebaseContextService
         return string.Join('\n', lines);
     }
 
+    private string GetRelatedTestContext(
+        PullRequestFile file,
+        string repositoryId,
+        int maxFiles,
+        int maxChunksPerFile)
+    {
+        if (!_inMemoryStore.TryGetValue(repositoryId, out var allChunks) || allChunks.Count == 0)
+        {
+            return string.Empty;
+        }
+
+        var targetFileName = Path.GetFileNameWithoutExtension(file.Path).ToLowerInvariant();
+        var targetDirParts = file.Path.Split('/', StringSplitOptions.RemoveEmptyEntries)
+            .Select(p => p.ToLowerInvariant())
+            .ToHashSet();
+
+        var testFiles = allChunks
+            .Select(c => c.FilePath)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Where(IsTestFilePath)
+            .Select(path => new
+            {
+                Path = path,
+                Score = ScoreTestFileCandidate(path, targetFileName, targetDirParts)
+            })
+            .Where(x => x.Score > 0)
+            .OrderByDescending(x => x.Score)
+            .ThenBy(x => x.Path, StringComparer.OrdinalIgnoreCase)
+            .Take(maxFiles)
+            .ToList();
+
+        if (testFiles.Count == 0)
+        {
+            return string.Empty;
+        }
+
+        var context = new StringBuilder();
+        context.AppendLine("## Related Test Context");
+        context.AppendLine();
+
+        foreach (var testFile in testFiles)
+        {
+            var chunksForFile = allChunks
+                .Where(c => string.Equals(c.FilePath, testFile.Path, StringComparison.OrdinalIgnoreCase))
+                .OrderBy(c => c.ChunkIndex)
+                .Take(maxChunksPerFile)
+                .ToList();
+
+            if (chunksForFile.Count == 0)
+            {
+                continue;
+            }
+
+            context.AppendLine($"### {testFile.Path} (score: {testFile.Score})");
+            context.AppendLine("```");
+            foreach (var chunk in chunksForFile)
+            {
+                context.AppendLine(chunk.Content.Length > 400
+                    ? chunk.Content.Substring(0, 400) + "..."
+                    : chunk.Content);
+                context.AppendLine();
+            }
+            context.AppendLine("```");
+            context.AppendLine();
+        }
+
+        return context.ToString();
+    }
+
+    private static bool IsTestFilePath(string path)
+    {
+        var p = path.ToLowerInvariant();
+        return p.Contains("/test/") ||
+               p.Contains("/tests/") ||
+               p.EndsWith("test.cs") ||
+               p.EndsWith("tests.cs") ||
+               p.EndsWith("_test.cs") ||
+               p.EndsWith("_tests.cs");
+    }
+
+    private static int ScoreTestFileCandidate(string testPath, string targetFileName, HashSet<string> targetDirParts)
+    {
+        var score = 0;
+        var testLower = testPath.ToLowerInvariant();
+
+        if (testLower.Contains(targetFileName))
+        {
+            score += 5;
+        }
+
+        var normalizedTarget = targetFileName
+            .Replace("controller", "")
+            .Replace("service", "")
+            .Replace("manager", "")
+            .Trim();
+
+        if (!string.IsNullOrWhiteSpace(normalizedTarget) && testLower.Contains(normalizedTarget))
+        {
+            score += 3;
+        }
+
+        var testParts = testLower.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        score += testParts.Count(part => targetDirParts.Contains(part));
+
+        return score;
+    }
+
     private double CosineSimilarity(float[] vectorA, float[] vectorB)
     {
         if (vectorA.Length != vectorB.Length)
@@ -1514,6 +1648,43 @@ public class CodebaseContextService
             return 0;
 
         return dotProduct / (magnitudeA * magnitudeB);
+    }
+
+    private static float[] ToFloatVector(dynamic vector)
+    {
+        if (vector is null)
+        {
+            return Array.Empty<float>();
+        }
+
+        if (vector is float[] floatArray)
+        {
+            return floatArray;
+        }
+
+        if (vector is IEnumerable<float> floatEnumerable)
+        {
+            return floatEnumerable.ToArray();
+        }
+
+        if (vector is double[] doubleArray)
+        {
+            return doubleArray.Select(v => (float)v).ToArray();
+        }
+
+        if (vector is IEnumerable<double> doubleEnumerable)
+        {
+            return doubleEnumerable.Select(v => (float)v).ToArray();
+        }
+
+        try
+        {
+            return ((IEnumerable<object>)vector).Select(v => Convert.ToSingle(v)).ToArray();
+        }
+        catch
+        {
+            return Array.Empty<float>();
+        }
     }
 
     /// <summary>
@@ -1588,4 +1759,10 @@ public class CodeChunk
     public string Metadata { get; set; } = string.Empty;
     public string FilePath { get; set; } = string.Empty;
     public float[] Embedding { get; set; } = Array.Empty<float>();
+}
+
+public class SimilarityResult
+{
+    public CodeChunk Chunk { get; set; } = new();
+    public double Similarity { get; set; }
 }

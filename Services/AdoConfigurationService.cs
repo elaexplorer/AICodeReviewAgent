@@ -22,6 +22,12 @@ public class AdoConfigurationService
         _logger = logger;
         _isConfigured = false;
 
+        if (IsForceUiConfigEnabled())
+        {
+            _logger.LogInformation("FORCE_UI_CONFIG enabled: skipping ADO environment auto-configuration");
+            return;
+        }
+
         // Try to load from environment variables as fallback
         _organization = Environment.GetEnvironmentVariable("ADO_ORGANIZATION");
         _personalAccessToken = Environment.GetEnvironmentVariable("ADO_PAT");
@@ -108,5 +114,18 @@ public class AdoConfigurationService
         _personalAccessToken = null;
         _isConfigured = false;
         _logger.LogInformation("ADO configuration cleared");
+    }
+
+    private static bool IsForceUiConfigEnabled()
+    {
+        var value = Environment.GetEnvironmentVariable("FORCE_UI_CONFIG");
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        return string.Equals(value, "true", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(value, "1", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(value, "yes", StringComparison.OrdinalIgnoreCase);
     }
 }

@@ -89,6 +89,7 @@ source ~/.bashrc
 | `AZURE_OPENAI_EMBEDDING_DEPLOYMENT` | `text-embedding-ada-002` | Embedding model deployment |
 | `ADO_ORGANIZATION` | `SPOOL` | Azure DevOps organization name |
 | `MCP_SERVER_URL` | `http://localhost:3000` | MCP server URL |
+| `FORCE_UI_CONFIG` | `false` | When `true`, ignores env credentials and requires users to configure via UI |
 
 ## Advanced Configuration
 
@@ -202,5 +203,13 @@ For production deployments, consider:
 - Azure Key Vault
 - Container secrets (Docker, Kubernetes)
 - Azure Container Apps secrets
+
+If you want each user to enter credentials manually in deployed containers:
+
+```env
+FORCE_UI_CONFIG=true
+```
+
+With `FORCE_UI_CONFIG=true`, the app does not auto-load ADO/OpenAI credentials from environment variables at startup. Users must submit config through the UI/API (`/api/codereview/config/validate`).
 
 See [DEPLOYMENT.md](DEPLOYMENT.md) for detailed deployment instructions.

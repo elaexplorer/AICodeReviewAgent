@@ -99,10 +99,27 @@ public class CodeReviewController : ControllerBase
     [HttpGet("projects")]
     public IActionResult GetProjects()
     {
-        // Return predefined sample list of projects
+        // Return predefined sample list of projects used by the UI dropdown.
         var projects = new List<ProjectInfo>
         {
-            new ProjectInfo { Name = "MyProject", DisplayName = "My Project", Repositories = new List<string>() }
+            new ProjectInfo
+            {
+                Name = "SCC",
+                DisplayName = "SCC",
+                Repositories = new List<string> { "service-shared_framework_waimea" }
+            },
+            new ProjectInfo
+            {
+                Name = "waimeabay",
+                DisplayName = "Waimea Bay",
+                Repositories = new List<string> { "waimeabay" }
+            },
+            new ProjectInfo
+            {
+                Name = "MyProject",
+                DisplayName = "My Project",
+                Repositories = new List<string>()
+            }
         };
 
         return Ok(projects);
@@ -114,8 +131,13 @@ public class CodeReviewController : ControllerBase
         try
         {
             // In a real implementation, fetch repositories from ADO.
-            // For sample mode, return an empty list.
-            var repositories = new List<string>();
+            // For sample mode, return a small predefined map.
+            var repositories = project switch
+            {
+                "SCC" => new List<string> { "service-shared_framework_waimea" },
+                "waimeabay" => new List<string> { "waimeabay" },
+                _ => new List<string>()
+            };
 
             return Ok(repositories);
         }
@@ -304,6 +326,7 @@ public class CodeReviewController : ControllerBase
     [HttpGet("config/status")]
     public IActionResult GetConfigStatus()
     {
+        var forceUiConfig = IsForceUiConfigEnabled();
         var hasDefaultPat = !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("ADO_PAT"));
         var hasDefaultChatApiKey =
             !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("AZURE_OPENAI_API_KEY"));
@@ -314,18 +337,32 @@ public class CodeReviewController : ControllerBase
         return Ok(new {
             isConfigured = _adoConfig.IsConfigured,
             organization = _adoConfig.Organization,
-            hasDefaultPat = hasDefaultPat,
+            forceUiConfig = forceUiConfig,
+            hasDefaultPat = forceUiConfig ? false : hasDefaultPat,
             chatIsConfigured = _chatConfig.IsConfigured,
             chatEndpoint = _chatConfig.Endpoint,
             chatDeployment = _chatConfig.Deployment,
             chatApiVersion = _chatConfig.ApiVersion,
-            hasDefaultChatApiKey = hasDefaultChatApiKey,
+            hasDefaultChatApiKey = forceUiConfig ? false : hasDefaultChatApiKey,
             embeddingIsConfigured = _embeddingConfig.IsConfigured,
             embeddingEndpoint = _embeddingConfig.Endpoint,
             embeddingDeployment = _embeddingConfig.Deployment,
             embeddingApiVersion = _embeddingConfig.ApiVersion,
-            hasDefaultEmbeddingApiKey = hasDefaultEmbeddingApiKey
+            hasDefaultEmbeddingApiKey = forceUiConfig ? false : hasDefaultEmbeddingApiKey
         });
+    }
+
+    private static bool IsForceUiConfigEnabled()
+    {
+        var value = Environment.GetEnvironmentVariable("FORCE_UI_CONFIG");
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        return string.Equals(value, "true", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(value, "1", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(value, "yes", StringComparison.OrdinalIgnoreCase);
     }
 
     [HttpPost("config/validate")]

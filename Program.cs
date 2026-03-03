@@ -30,6 +30,21 @@ var builder = WebApplication.CreateBuilder(args);
 // Helper function to get environment variable with fallback
 string? GetEnvVar(string key) => Environment.GetEnvironmentVariable(key);
 
+bool IsForceUiConfigEnabled()
+{
+    var value = Environment.GetEnvironmentVariable("FORCE_UI_CONFIG");
+    if (string.IsNullOrWhiteSpace(value))
+    {
+        return false;
+    }
+
+    return string.Equals(value, "true", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(value, "1", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(value, "yes", StringComparison.OrdinalIgnoreCase);
+}
+
+var forceUiConfig = IsForceUiConfigEnabled();
+
 // Configuration validation - now uses .env values first, then system variables
 var openAiApiKey = GetEnvVar("OPENAI_API_KEY");
 var azureOpenAiEndpoint = GetEnvVar("AZURE_OPENAI_ENDPOINT");
@@ -38,9 +53,14 @@ var azureOpenAiDeployment = GetEnvVar("AZURE_OPENAI_DEPLOYMENT") ?? "gpt-4";
 var azureOpenAiEmbeddingDeployment = GetEnvVar("AZURE_OPENAI_EMBEDDING_DEPLOYMENT") ?? "text-embedding-ada-002";
 // Support separate endpoint for embeddings (some orgs have different resources for chat vs embeddings)
 var azureOpenAiEmbeddingEndpoint = GetEnvVar("AZURE_OPENAI_EMBEDDING_ENDPOINT") ?? azureOpenAiEndpoint;
-var adoOrganization = GetEnvVar("ADO_ORGANIZATION") ?? "SPOOL";
-var adoPat = GetEnvVar("ADO_PAT");
+var adoOrganization = forceUiConfig ? string.Empty : (GetEnvVar("ADO_ORGANIZATION") ?? "SPOOL");
+var adoPat = forceUiConfig ? string.Empty : (GetEnvVar("ADO_PAT") ?? string.Empty);
 var mcpServerUrl = GetEnvVar("MCP_SERVER_URL") ?? "http://localhost:3000";
+
+if (forceUiConfig)
+{
+    Console.WriteLine("FORCE_UI_CONFIG enabled: environment credentials are ignored until user submits config in UI.");
+}
 
 // Add runtime logger service first
 builder.Services.AddSingleton<RuntimeLoggerService>();
@@ -138,7 +158,7 @@ var app = builder.Build();
 CleanupTempCloneDirectories(app.Services.GetRequiredService<ILogger<Program>>());
 
 // Initialize ADO configuration on startup if credentials are available
-if (!string.IsNullOrEmpty(adoOrganization) && !string.IsNullOrEmpty(adoPat))
+if (!forceUiConfig && !string.IsNullOrEmpty(adoOrganization) && !string.IsNullOrEmpty(adoPat))
 {
     var adoConfig = app.Services.GetRequiredService<AdoConfigurationService>();
     var adoClient = app.Services.GetRequiredService<AzureDevOpsMcpClient>();
