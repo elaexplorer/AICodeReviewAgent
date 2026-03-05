@@ -103,6 +103,68 @@ var success = await codeReviewAgent.ReviewPullRequestAsync("MyProject", 123);
 var summary = await codeReviewAgent.GetReviewSummaryAsync("MyProject", 123);
 ```
 
+### API Usage (PR Link)
+
+Use the API endpoint to trigger code review by passing a full Azure DevOps PR link.
+
+Endpoint:
+
+```http
+POST /api/codereview/review-by-link
+Content-Type: application/json
+```
+
+Request body:
+
+```json
+{
+   "pullRequestLink": "https://dev.azure.com/<organization>/<project>/_git/<repository>/pullrequest/<id>"
+}
+```
+
+PowerShell example:
+
+```powershell
+$body = @{
+   pullRequestLink = "https://dev.azure.com/Skype/SCC/_git/service-shared_framework_waimea/pullrequest/1365872"
+} | ConvertTo-Json
+
+Invoke-RestMethod -Method Post `
+   -Uri "http://localhost:5002/api/codereview/review-by-link" `
+   -ContentType "application/json" `
+   -Body $body
+```
+
+`curl` example:
+
+```bash
+curl -X POST "http://localhost:5002/api/codereview/review-by-link" \
+   -H "Content-Type: application/json" \
+   -d '{"pullRequestLink":"https://dev.azure.com/Skype/SCC/_git/service-shared_framework_waimea/pullrequest/1365872"}'
+```
+
+Response shape:
+
+```json
+{
+   "pullRequestLink": "...",
+   "project": "SCC",
+   "repository": "service-shared_framework_waimea",
+   "pullRequestId": 1365872,
+   "comments": [
+      {
+         "id": "...",
+         "filePath": "...",
+         "lineNumber": 0,
+         "commentText": "...",
+         "commentType": "issue",
+         "severity": "high",
+         "posted": false
+      }
+   ]
+}
+```
+
 ## Architecture
 
 ### System Overview

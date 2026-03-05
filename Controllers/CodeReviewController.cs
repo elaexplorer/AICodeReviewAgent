@@ -4,6 +4,7 @@ using CodeReviewAgent.Services;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using System.Text.RegularExpressions;
 
 namespace CodeReviewAgent.Controllers;
 
@@ -81,6 +82,74 @@ public class CodeReviewController : ControllerBase
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error starting review");
+            return StatusCode(500, new { error = ex.Message });
+        }
+    }
+
+    [HttpPost("review-by-link")]
+    public async Task<IActionResult> ReviewByPullRequestLink([FromBody] ReviewByLinkRequest request)
+    {
+        if (string.IsNullOrWhiteSpace(request.PullRequestLink))
+        {
+            return BadRequest(new { error = "pullRequestLink is required" });
+        }
+
+        if (!TryParseAzureDevOpsPullRequestLink(request.PullRequestLink, out var parsed, out var parseError))
+        {
+            return BadRequest(new { error = parseError });
+        }
+
+        if (!string.IsNullOrWhiteSpace(_adoConfig.Organization) &&
+            !string.IsNullOrWhiteSpace(parsed.Organization) &&
+            !string.Equals(_adoConfig.Organization, parsed.Organization, StringComparison.OrdinalIgnoreCase))
+        {
+            return BadRequest(new
+            {
+                error = $"PR link organization '{parsed.Organization}' does not match configured organization '{_adoConfig.Organization}'."
+            });
+        }
+
+        try
+        {
+            _logger.LogInformation("Starting review from link for PR {PullRequestId} in {Project}/{Repository}",
+                parsed.PullRequestId, parsed.Project, parsed.Repository);
+
+            var pullRequest = await _adoClient.GetPullRequestAsync(
+                parsed.Project, parsed.Repository, parsed.PullRequestId);
+
+            if (pullRequest == null)
+            {
+                return NotFound(new { error = "Pull request not found" });
+            }
+
+            var files = await _adoClient.GetPullRequestFilesAsync(
+                parsed.Project, parsed.Repository, parsed.PullRequestId);
+
+            var reviewService = HttpContext.RequestServices.GetRequiredService<CodeReviewService>();
+            var comments = await reviewService.ReviewPullRequestAsync(
+                pullRequest, files, parsed.Project, parsed.Repository);
+
+            _currentReview = new ReviewResult
+            {
+                PullRequest = pullRequest,
+                Files = files,
+                Comments = comments,
+                Project = parsed.Project,
+                Repository = parsed.Repository
+            };
+
+            return Ok(new
+            {
+                pullRequestLink = request.PullRequestLink,
+                project = parsed.Project,
+                repository = parsed.Repository,
+                pullRequestId = parsed.PullRequestId,
+                comments = comments
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error running review from PR link");
             return StatusCode(500, new { error = ex.Message });
         }
     }
@@ -490,6 +559,98 @@ public class CodeReviewController : ControllerBase
             chunkCount = chunkCount
         });
     }
+
+    private static bool TryParseAzureDevOpsPullRequestLink(
+        string pullRequestLink,
+        out ParsedPullRequestLink parsed,
+        out string error)
+    {
+        parsed = new ParsedPullRequestLink();
+        error = string.Empty;
+
+        if (!Uri.TryCreate(pullRequestLink, UriKind.Absolute, out var uri))
+        {
+            error = "Invalid pullRequestLink. Provide a full Azure DevOps PR URL.";
+            return false;
+        }
+
+        var pathSegments = uri.AbsolutePath.Trim('/').Split('/', StringSplitOptions.RemoveEmptyEntries);
+
+        var prIdMatch = Regex.Match(uri.AbsolutePath, @"/pullrequest/(\d+)", RegexOptions.IgnoreCase);
+        if (!prIdMatch.Success || !int.TryParse(prIdMatch.Groups[1].Value, out var prId))
+        {
+            error = "Could not extract pull request id from URL.";
+            return false;
+        }
+
+        string organization = string.Empty;
+        string project = string.Empty;
+        string repository = string.Empty;
+
+        if (uri.Host.EndsWith("dev.azure.com", StringComparison.OrdinalIgnoreCase))
+        {
+            // Format: /{organization}/{project}/_git/{repository}/pullrequest/{id}
+            if (pathSegments.Length < 6)
+            {
+                error = "Unsupported Azure DevOps URL format.";
+                return false;
+            }
+
+            organization = Uri.UnescapeDataString(pathSegments[0]);
+            project = Uri.UnescapeDataString(pathSegments[1]);
+
+            var gitIndex = Array.FindIndex(pathSegments, s => s.Equals("_git", StringComparison.OrdinalIgnoreCase));
+            if (gitIndex < 0 || gitIndex + 1 >= pathSegments.Length)
+            {
+                error = "Could not extract repository from URL.";
+                return false;
+            }
+
+            repository = Uri.UnescapeDataString(pathSegments[gitIndex + 1]);
+        }
+        else if (uri.Host.EndsWith("visualstudio.com", StringComparison.OrdinalIgnoreCase))
+        {
+            // Format: https://{organization}.visualstudio.com/{project}/_git/{repository}/pullrequest/{id}
+            organization = uri.Host.Split('.')[0];
+            if (pathSegments.Length < 5)
+            {
+                error = "Unsupported Visual Studio URL format.";
+                return false;
+            }
+
+            project = Uri.UnescapeDataString(pathSegments[0]);
+
+            var gitIndex = Array.FindIndex(pathSegments, s => s.Equals("_git", StringComparison.OrdinalIgnoreCase));
+            if (gitIndex < 0 || gitIndex + 1 >= pathSegments.Length)
+            {
+                error = "Could not extract repository from URL.";
+                return false;
+            }
+
+            repository = Uri.UnescapeDataString(pathSegments[gitIndex + 1]);
+        }
+        else
+        {
+            error = "Only Azure DevOps pull request URLs are supported.";
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(project) || string.IsNullOrWhiteSpace(repository))
+        {
+            error = "Could not parse project/repository from URL.";
+            return false;
+        }
+
+        parsed = new ParsedPullRequestLink
+        {
+            Organization = organization,
+            Project = project,
+            Repository = repository,
+            PullRequestId = prId
+        };
+
+        return true;
+    }
 }
 
 public class ReviewRequest
@@ -497,6 +658,11 @@ public class ReviewRequest
     public string Project { get; set; } = "MyProject";
     public string Repository { get; set; } = "";
     public int PullRequestId { get; set; }
+}
+
+public class ReviewByLinkRequest
+{
+    public string PullRequestLink { get; set; } = string.Empty;
 }
 
 public class PostCommentRequest
@@ -539,4 +705,12 @@ public class ProjectInfo
     public string Name { get; set; } = "";
     public string DisplayName { get; set; } = "";
     public List<string> Repositories { get; set; } = new();
+}
+
+public class ParsedPullRequestLink
+{
+    public string Organization { get; set; } = string.Empty;
+    public string Project { get; set; } = string.Empty;
+    public string Repository { get; set; } = string.Empty;
+    public int PullRequestId { get; set; }
 }
