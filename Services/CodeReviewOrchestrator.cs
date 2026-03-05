@@ -258,15 +258,7 @@ public class CodeReviewOrchestrator
     {
         try
         {
-            // Clean up the response
-            jsonResponse = jsonResponse.Trim();
-            if (jsonResponse.StartsWith("```json"))
-                jsonResponse = jsonResponse.Substring(7);
-            if (jsonResponse.StartsWith("```"))
-                jsonResponse = jsonResponse.Substring(3);
-            if (jsonResponse.EndsWith("```"))
-                jsonResponse = jsonResponse.Substring(0, jsonResponse.Length - 3);
-            jsonResponse = jsonResponse.Trim();
+            jsonResponse = ExtractJsonPayload(jsonResponse);
 
             var options = new System.Text.Json.JsonSerializerOptions
             {
@@ -287,9 +279,58 @@ public class CodeReviewOrchestrator
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error parsing review comments JSON");
+            _logger.LogError(ex, "Error parsing review comments JSON. Response preview: {Preview}",
+                jsonResponse.Length > 500 ? jsonResponse.Substring(0, 500) : jsonResponse);
             return new List<CodeReviewComment>();
         }
+    }
+
+    private static string ExtractJsonPayload(string response)
+    {
+        var trimmed = response.Trim();
+        if (trimmed.StartsWith("```json"))
+        {
+            trimmed = trimmed.Substring(7);
+        }
+
+        if (trimmed.StartsWith("```"))
+        {
+            trimmed = trimmed.Substring(3);
+        }
+
+        if (trimmed.EndsWith("```"))
+        {
+            trimmed = trimmed.Substring(0, trimmed.Length - 3);
+        }
+
+        trimmed = trimmed.Trim();
+
+        // Most responses should be an array. If the model adds leading or trailing text,
+        // extract only the first complete JSON array segment.
+        var firstArray = trimmed.IndexOf('[');
+        var lastArray = trimmed.LastIndexOf(']');
+        if (firstArray >= 0 && lastArray > firstArray)
+        {
+            return trimmed.Substring(firstArray, lastArray - firstArray + 1);
+        }
+
+        // Some models wrap the output as { "comments": [ ... ] }.
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(trimmed);
+            if (doc.RootElement.ValueKind == System.Text.Json.JsonValueKind.Object &&
+                doc.RootElement.TryGetProperty("comments", out var comments) &&
+                comments.ValueKind == System.Text.Json.JsonValueKind.Array)
+            {
+                return comments.GetRawText();
+            }
+        }
+        catch
+        {
+            // Let the caller attempt normal deserialize and surface the parse failure in logs.
+        }
+
+        return trimmed;
     }
 
     private class ReviewCommentJson
