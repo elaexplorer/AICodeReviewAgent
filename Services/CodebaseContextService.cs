@@ -348,12 +348,14 @@ public class CodebaseContextService
 
                     // Split large files into chunks
                     var fileChunks = SplitIntoChunks(content, filePath);
-                    
+
                     // Generate embeddings for each chunk
                     _logger.LogInformation("   🧩 Generating embeddings for {ChunkCount} chunks...", fileChunks.Count);
                     foreach (var chunk in fileChunks)
                     {
-                        var embeddingResponse = await _embeddingGenerator.GenerateAsync(chunk.Content);
+                        var langTag = GetLanguageTag(chunk.FilePath);
+                        var textToEmbed = string.IsNullOrEmpty(langTag) ? chunk.Content : $"{langTag}\n{chunk.Content}";
+                        var embeddingResponse = await _embeddingGenerator.GenerateAsync(textToEmbed);
                         chunk.Embedding = embeddingResponse.Vector.ToArray();
                         chunks.Add(chunk);
                         indexed++;
@@ -430,7 +432,9 @@ public class CodebaseContextService
                     {
                         try
                         {
-                            var embedding = await GenerateEmbeddingWithRetryAsync(chunk.Content);
+                            var langTag = GetLanguageTag(chunk.FilePath);
+                            var textToEmbed = string.IsNullOrEmpty(langTag) ? chunk.Content : $"{langTag}\n{chunk.Content}";
+                            var embedding = await GenerateEmbeddingWithRetryAsync(textToEmbed);
                             chunk.Embedding = ((dynamic)embedding).Vector.ToArray();
                             chunks.Add(chunk);
                             indexed++;
@@ -705,12 +709,47 @@ public class CodebaseContextService
                 _logger.LogInformation("     Chunk magnitude: {ChunkMag:F6}", chunkMagnitude);
                 _logger.LogInformation("     Cosine similarity: {Cosine:F6}", dotProduct / (queryMagnitude * chunkMagnitude));
 
+                // Reconstruct the full file from all its chunks (sorted by line number)
+                const int MAX_FULL_FILE_CHARS = 8000; // ~2000 tokens — safe context budget per file
+                var allChunksInFile = chunks
+                    .Where(c => c.FilePath == result.Chunk.FilePath)
+                    .OrderBy(c => c.StartLine)
+                    .ToList();
+
+                var fullFileContent = string.Join("\n", allChunksInFile.Select(c => c.Content));
+                var fileStart = allChunksInFile.First().StartLine;
+                var fileEnd = allChunksInFile.Last().EndLine;
+
+                string displayContent;
+                string locationLabel;
+
+                if (fullFileContent.Length <= MAX_FULL_FILE_CHARS)
+                {
+                    // Small enough — send the whole file for full context
+                    displayContent = fullFileContent;
+                    locationLabel = $"{result.Chunk.FilePath}:L{fileStart}-L{fileEnd} (full file, {fullFileContent.Length} chars, ~{fullFileContent.Length / 4} tokens)";
+                    _logger.LogInformation("   📄 Sending FULL FILE ({Length} chars, {Chunks} chunks)", fullFileContent.Length, allChunksInFile.Count);
+                }
+                else
+                {
+                    // File too large — fall back to matched chunk ± 1 neighbor window
+                    var matchedIdx = result.Chunk.ChunkIndex;
+                    var windowChunks = allChunksInFile
+                        .Where(c => c.ChunkIndex >= matchedIdx - 1 && c.ChunkIndex <= matchedIdx + 1)
+                        .OrderBy(c => c.StartLine)
+                        .ToList();
+
+                    displayContent = string.Join("\n", windowChunks.Select(c => c.Content));
+                    var windowStart = windowChunks.First().StartLine;
+                    var windowEnd = windowChunks.Last().EndLine;
+                    locationLabel = $"{result.Chunk.FilePath}:L{windowStart}-L{windowEnd} (window, {displayContent.Length} chars, ~{displayContent.Length / 4} tokens)";
+                    _logger.LogInformation("   📄 File too large ({Length} chars) — sending window around matched chunk", fullFileContent.Length);
+                }
+
                 context.AppendLine($"### Similar code (relevance: {result.Similarity:F2})");
-                context.AppendLine($"Location: {result.Chunk.Metadata}");
+                context.AppendLine($"Location: {locationLabel}");
                 context.AppendLine("```");
-                context.AppendLine(result.Chunk.Content.Length > 500
-                    ? result.Chunk.Content.Substring(0, 500) + "..."
-                    : result.Chunk.Content);
+                context.AppendLine(displayContent);
                 context.AppendLine("```");
                 context.AppendLine();
                 resultIndex++;
@@ -1362,7 +1401,10 @@ public class CodebaseContextService
                     try
                     {
                         // Generate embedding for the chunk with retry logic
-                        var embeddingResponse = await GenerateEmbeddingWithRetryAsync(chunk.Content);
+                        // Prepend language tag so embeddings are language-aware
+                        var langTag = GetLanguageTag(chunk.FilePath);
+                        var textToEmbed = string.IsNullOrEmpty(langTag) ? chunk.Content : $"{langTag}\n{chunk.Content}";
+                        var embeddingResponse = await GenerateEmbeddingWithRetryAsync(textToEmbed);
                         chunk.Embedding = ((dynamic)embeddingResponse).Vector.ToArray();
                         
                         _logger.LogInformation("  📊 EMBEDDING VECTOR DETAILS for chunk {Index}:", chunk.ChunkIndex);
@@ -1423,6 +1465,31 @@ public class CodebaseContextService
 
         return skipPatterns.Any(pattern =>
             path.Contains(pattern, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static string GetLanguageTag(string filePath)
+    {
+        var ext = Path.GetExtension(filePath).ToLowerInvariant();
+        return ext switch
+        {
+            ".ts" or ".tsx" => "[TypeScript]",
+            ".js" or ".jsx" => "[JavaScript]",
+            ".cs" => "[CSharp]",
+            ".rs" => "[Rust]",
+            ".java" => "[Java]",
+            ".py" => "[Python]",
+            ".go" => "[Go]",
+            ".cpp" or ".cc" or ".cxx" => "[C++]",
+            ".c" => "[C]",
+            ".rb" => "[Ruby]",
+            ".swift" => "[Swift]",
+            ".kt" => "[Kotlin]",
+            ".sh" or ".bash" => "[Shell]",
+            ".bicep" => "[Bicep]",
+            ".json" => "[JSON]",
+            ".yaml" or ".yml" => "[YAML]",
+            _ => string.Empty
+        };
     }
 
     private List<CodeChunk> SplitIntoChunks(string content, string filePath)
@@ -1499,43 +1566,56 @@ public class CodebaseContextService
 
         var queryParts = new List<string>();
 
+        // Prepend language tag so the query vector is in the same language-aware space as indexed chunks
+        var langTag = GetLanguageTag(file.Path);
+        if (!string.IsNullOrEmpty(langTag))
+        {
+            queryParts.Add(langTag);
+            _logger.LogDebug("   Added language tag: {LangTag}", langTag);
+        }
+
         // Extract meaningful content from changes
         if (!string.IsNullOrEmpty(file.UnifiedDiff))
         {
             _logger.LogDebug("   Processing unified diff ({Length} chars)...", file.UnifiedDiff.Length);
 
             var allDiffLines = file.UnifiedDiff.Split('\n');
+
+            // Added lines carry intent; take up to 30 for richer signal
             var addedLines = allDiffLines
                 .Where(l => l.StartsWith('+') && !l.StartsWith("+++"))
-                .ToList();
-
-            _logger.LogDebug("   Total lines in diff: {Total}", allDiffLines.Length);
-            _logger.LogDebug("   Added lines (starting with '+'): {Added}", addedLines.Count);
-
-            var diffLines = addedLines
                 .Select(l => l.Substring(1).Trim())
                 .Where(l => !string.IsNullOrWhiteSpace(l) && l.Length > 5)
-                .Take(10) // First 10 added lines
+                .Take(30)
                 .ToList();
 
-            _logger.LogDebug("   Selected lines for query (non-empty, >5 chars, max 10): {Count}", diffLines.Count);
-            foreach (var line in diffLines.Take(5))
-            {
-                _logger.LogDebug("     - \"{Line}\"", line.Length > 60 ? line.Substring(0, 60) + "..." : line);
-            }
+            // Context lines (unchanged, starting with space) give surrounding semantic context
+            var contextLines = allDiffLines
+                .Where(l => l.Length > 0 && l[0] == ' ')
+                .Select(l => l.Substring(1).Trim())
+                .Where(l => !string.IsNullOrWhiteSpace(l) && l.Length > 5)
+                .Take(10)
+                .ToList();
 
-            queryParts.AddRange(diffLines);
+            _logger.LogDebug("   Added lines selected: {Added}, context lines: {Ctx}", addedLines.Count, contextLines.Count);
+
+            queryParts.AddRange(addedLines);
+            queryParts.AddRange(contextLines);
         }
 
-        // Add file name context
+        // Add file name and directory for path-level signal
         var fileName = Path.GetFileNameWithoutExtension(file.Path);
+        var dirName = Path.GetDirectoryName(file.Path)?.Replace('\\', '/') ?? string.Empty;
         queryParts.Add($"file {fileName}");
-        _logger.LogDebug("   Added file name context: 'file {FileName}'", fileName);
+        if (!string.IsNullOrEmpty(dirName))
+            queryParts.Add($"directory {dirName}");
+
+        _logger.LogDebug("   Added file/dir context: '{FileName}', '{DirName}'", fileName, dirName);
 
         var query = string.Join(' ', queryParts);
-        var finalQuery = query.Length > 1000 ? query.Substring(0, 1000) : query;
+        var finalQuery = query.Length > 2000 ? query.Substring(0, 2000) : query;
 
-        _logger.LogDebug("   Final query length: {Length} chars (max 1000)", finalQuery.Length);
+        _logger.LogDebug("   Final query length: {Length} chars (max 2000)", finalQuery.Length);
         return finalQuery;
     }
 
