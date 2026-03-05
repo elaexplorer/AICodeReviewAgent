@@ -171,7 +171,10 @@ public class CodeReviewService
         prompt.AppendLine("5. Maintainability and readability");
         prompt.AppendLine();
 
-        if (!string.IsNullOrEmpty(file.PreviousContent) && file.ChangeType != "add")
+        const int MAX_CONTENT_CHARS = 40_000;
+        var isLargeFile = (file.Content?.Length ?? 0) > MAX_CONTENT_CHARS;
+
+        if (!isLargeFile && !string.IsNullOrEmpty(file.PreviousContent) && file.ChangeType != "add")
         {
             prompt.AppendLine("Previous version:");
             prompt.AppendLine("```");
@@ -180,10 +183,21 @@ public class CodeReviewService
             prompt.AppendLine();
         }
 
-        prompt.AppendLine("Current version:");
-        prompt.AppendLine("```");
-        prompt.AppendLine(file.Content);
-        prompt.AppendLine("```");
+        if (isLargeFile)
+        {
+            prompt.AppendLine($"[File is large ({file.Content!.Length:N0} chars). Showing diff only to avoid context limits.]");
+            prompt.AppendLine("Diff:");
+            prompt.AppendLine("```");
+            prompt.AppendLine(file.UnifiedDiff);
+            prompt.AppendLine("```");
+        }
+        else
+        {
+            prompt.AppendLine("Current version:");
+            prompt.AppendLine("```");
+            prompt.AppendLine(file.Content);
+            prompt.AppendLine("```");
+        }
         prompt.AppendLine();
 
         prompt.AppendLine("Please provide your review in the following format:");

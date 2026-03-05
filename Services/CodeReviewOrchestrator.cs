@@ -137,6 +137,18 @@ public class CodeReviewOrchestrator
     {
         try
         {
+            // Cap content to avoid context length errors. For large/generated files, prefer the diff.
+            const int MAX_CONTENT_CHARS = 40_000;
+            var isLargeFile = (file.Content?.Length ?? 0) > MAX_CONTENT_CHARS;
+            var contentSection = isLargeFile
+                ? $"[File is large ({file.Content!.Length:N0} chars). Showing diff only — full content truncated to avoid context limits.]\n\nDiff:\n```\n{file.UnifiedDiff}\n```"
+                : $"```\n{file.Content}\n```";
+
+            // Omit previous content for large files (the diff captures what changed)
+            var previousSection = (!isLargeFile && !string.IsNullOrEmpty(file.PreviousContent))
+                ? $"Previous Content:\n```\n{file.PreviousContent}\n```\n"
+                : string.Empty;
+
             var prompt = $$$"""
                 You are a general code reviewer with broad knowledge of software engineering best practices.
 
@@ -146,17 +158,9 @@ public class CodeReviewOrchestrator
                 Change Type: {{{file.ChangeType}}}
 
                 Current Content:
-                ```
-                {{{file.Content}}}
-                ```
+                {{{contentSection}}}
 
-                {{{(string.IsNullOrEmpty(file.PreviousContent) ? "" : $@"
-                Previous Content:
-                ```
-                {file.PreviousContent}
-                ```
-                ")}}}
-
+                {{{previousSection}}}
                 Codebase Context:
                 {{{codebaseContext}}}
 
