@@ -31,8 +31,12 @@ TestResults/
 # macOS
 .DS_Store
 
-# Claude settings with secrets
-.claude/settings.local.json
+# Claude settings and memory (may contain internal repo names/paths)
+.claude/
+
+# Runtime logs (may contain internal org/repo names)
+*.log
+runtime.log
 
 # Temporary repository clones
 temp_repos/

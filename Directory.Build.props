@@ -1,0 +1,7 @@
+<Project>
+  <PropertyGroup Condition="'$(MSBuildProjectName)' == 'CodeReviewAgent.Tests'">
+    <MSBuildProjectExtensionsPath>obj\CodeReviewAgent.Tests\</MSBuildProjectExtensionsPath>
+    <BaseIntermediateOutputPath>obj\CodeReviewAgent.Tests\</BaseIntermediateOutputPath>
+    <BaseOutputPath>bin\CodeReviewAgent.Tests\</BaseOutputPath>
+  </PropertyGroup>
+</Project>
