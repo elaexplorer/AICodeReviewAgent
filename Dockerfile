@@ -2,13 +2,13 @@
 FROM mcr.microsoft.com/dotnet/sdk:9.0 AS build
 WORKDIR /src
 
-# Copy csproj and restore dependencies
-COPY *.csproj ./
-RUN dotnet restore
+# Copy project file and restore dependencies
+COPY CodeReviewAgent.csproj ./
+RUN dotnet restore CodeReviewAgent.csproj
 
 # Copy everything else and build
 COPY . ./
-RUN dotnet publish -c Release -o /app/publish
+RUN dotnet publish CodeReviewAgent.csproj -c Release -o /app/publish --no-restore
 
 # Runtime stage
 FROM mcr.microsoft.com/dotnet/aspnet:9.0 AS runtime
