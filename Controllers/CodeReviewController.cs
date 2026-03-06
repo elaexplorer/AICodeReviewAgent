@@ -58,6 +58,11 @@ public class CodeReviewController : ControllerBase
                 return NotFound(new { error = "Pull request not found" });
             }
 
+            TriggerBackgroundIndexing(
+                request.Project,
+                request.Repository,
+                GetBranchName(pullRequest.TargetBranch));
+
             // Get PR files
             var files = await _adoClient.GetPullRequestFilesAsync(
                 request.Project, request.Repository, request.PullRequestId);
@@ -121,6 +126,11 @@ public class CodeReviewController : ControllerBase
             {
                 return NotFound(new { error = "Pull request not found" });
             }
+
+            TriggerBackgroundIndexing(
+                parsed.Project,
+                parsed.Repository,
+                GetBranchName(pullRequest.TargetBranch));
 
             var files = await _adoClient.GetPullRequestFilesAsync(
                 parsed.Project, parsed.Repository, parsed.PullRequestId);
@@ -350,6 +360,22 @@ public class CodeReviewController : ControllerBase
                 }
             }
         });
+    }
+
+    private static string GetBranchName(string? fullRef)
+    {
+        if (string.IsNullOrWhiteSpace(fullRef))
+        {
+            return "master";
+        }
+
+        const string headsPrefix = "refs/heads/";
+        if (fullRef.StartsWith(headsPrefix, StringComparison.OrdinalIgnoreCase))
+        {
+            return fullRef.Substring(headsPrefix.Length);
+        }
+
+        return fullRef;
     }
 
     [HttpPost("comment")]
