@@ -4,6 +4,7 @@ using CodeReviewAgent.Services;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using System.Collections.Concurrent;
 using System.Text.RegularExpressions;
 
 namespace CodeReviewAgent.Controllers;
@@ -14,6 +15,7 @@ public class CodeReviewController : ControllerBase
 {
     private readonly CodeReviewAgentService _codeReviewAgent;
     private readonly AzureDevOpsMcpClient _adoClient;
+    private readonly CodeReviewService _reviewService;
     private readonly AdoConfigurationService _adoConfig;
     private readonly ChatConfigurationService _chatConfig;
     private readonly EmbeddingConfigurationService _embeddingConfig;
@@ -22,10 +24,13 @@ public class CodeReviewController : ControllerBase
     private static ReviewResult? _currentReview;
     private static readonly HashSet<string> _indexingInProgress = new();
     private static readonly object _indexingLock = new();
+    private static readonly ConcurrentDictionary<string, ReviewByLinkAndPostJobStatus> _reviewByLinkAndPostJobs = new();
+    private static readonly TimeSpan ReviewByLinkAndPostSyncWait = TimeSpan.FromSeconds(220);
 
     public CodeReviewController(
         CodeReviewAgentService codeReviewAgent,
         AzureDevOpsMcpClient adoClient,
+        CodeReviewService reviewService,
         AdoConfigurationService adoConfig,
         ChatConfigurationService chatConfig,
         EmbeddingConfigurationService embeddingConfig,
@@ -34,6 +39,7 @@ public class CodeReviewController : ControllerBase
     {
         _codeReviewAgent = codeReviewAgent;
         _adoClient = adoClient;
+        _reviewService = reviewService;
         _adoConfig = adoConfig;
         _chatConfig = chatConfig;
         _embeddingConfig = embeddingConfig;
@@ -68,8 +74,7 @@ public class CodeReviewController : ControllerBase
                 request.Project, request.Repository, request.PullRequestId);
 
             // Perform code review
-            var reviewService = HttpContext.RequestServices.GetRequiredService<CodeReviewService>();
-            var comments = await reviewService.ReviewPullRequestAsync(
+            var comments = await _reviewService.ReviewPullRequestAsync(
                 pullRequest, files, request.Project, request.Repository);
 
             // Store the review result
@@ -135,8 +140,7 @@ public class CodeReviewController : ControllerBase
             var files = await _adoClient.GetPullRequestFilesAsync(
                 parsed.Project, parsed.Repository, parsed.PullRequestId);
 
-            var reviewService = HttpContext.RequestServices.GetRequiredService<CodeReviewService>();
-            var comments = await reviewService.ReviewPullRequestAsync(
+            var comments = await _reviewService.ReviewPullRequestAsync(
                 pullRequest, files, parsed.Project, parsed.Repository);
 
             _currentReview = new ReviewResult
@@ -162,6 +166,189 @@ public class CodeReviewController : ControllerBase
             _logger.LogError(ex, "Error running review from PR link");
             return StatusCode(500, new { error = ex.Message });
         }
+    }
+
+    [HttpPost("review-by-link-and-post")]
+    public async Task<IActionResult> ReviewByPullRequestLinkAndPost([FromBody] ReviewByLinkRequest request)
+    {
+        if (string.IsNullOrWhiteSpace(request.PullRequestLink))
+        {
+            return BadRequest(new { error = "pullRequestLink is required" });
+        }
+
+        if (!TryParseAndValidatePullRequestLink(request.PullRequestLink, out var parsed, out var errorResult))
+        {
+            return errorResult!;
+        }
+
+        var adoAccessTokenOverride = GetOptionalAdoAccessTokenHeader();
+
+        var jobId = Guid.NewGuid().ToString("N");
+        _reviewByLinkAndPostJobs[jobId] = new ReviewByLinkAndPostJobStatus
+        {
+            JobId = jobId,
+            PullRequestLink = request.PullRequestLink,
+            Project = parsed.Project,
+            Repository = parsed.Repository,
+            PullRequestId = parsed.PullRequestId,
+            Status = "running",
+            StartedAtUtc = DateTime.UtcNow
+        };
+
+        var backgroundTask = Task.Run(async () =>
+        {
+            try
+            {
+                _logger.LogInformation(
+                    "Starting review-by-link-and-post job {JobId} for PR {PullRequestId} in {Project}/{Repository}",
+                    jobId,
+                    parsed.PullRequestId,
+                    parsed.Project,
+                    parsed.Repository);
+
+                var reviewOutput = await RunReviewByLinkCoreAsync(request.PullRequestLink, parsed);
+                var highPriorityComments = reviewOutput.Comments
+                    .Where(IsHighPriorityComment)
+                    .ToList();
+                var existingFingerprints = await _adoClient.GetExistingCommentFingerprintsAsync(
+                    reviewOutput.Project,
+                    reviewOutput.Repository,
+                    reviewOutput.PullRequestId);
+                var existingPositionKeys = await _adoClient.GetExistingCommentPositionKeysAsync(
+                    reviewOutput.Project,
+                    reviewOutput.Repository,
+                    reviewOutput.PullRequestId);
+
+                var postedCount = 0;
+                var skippedCount = 0;
+                var postingFailures = new List<ReviewPostingFailure>();
+                foreach (var comment in highPriorityComments)
+                {
+                    var fingerprint = AzureDevOpsRestClient.BuildCommentFingerprint(comment);
+                    var positionKey = AzureDevOpsRestClient.BuildCommentPositionKey(comment);
+                    if (existingFingerprints.Contains(fingerprint) || existingPositionKeys.Contains(positionKey))
+                    {
+                        skippedCount++;
+                        comment.Posted = true;
+                        _logger.LogInformation(
+                            "Skipping duplicate high-priority comment for PR {PullRequestId} at {FilePath}:{LineNumber}",
+                            reviewOutput.PullRequestId,
+                            comment.FilePath,
+                            comment.LineNumber);
+                        continue;
+                    }
+
+                    var postResult = await _adoClient.PostCommentWithResultAsync(
+                        reviewOutput.Project,
+                        reviewOutput.Repository,
+                        reviewOutput.PullRequestId,
+                        comment,
+                        adoAccessTokenOverride);
+
+                    if (postResult.Success)
+                    {
+                        comment.Posted = true;
+                        postedCount++;
+                        existingFingerprints.Add(fingerprint);
+                        existingPositionKeys.Add(positionKey);
+                    }
+                    else
+                    {
+                        postingFailures.Add(new ReviewPostingFailure
+                        {
+                            CommentId = comment.Id,
+                            FilePath = comment.FilePath,
+                            LineNumber = comment.LineNumber,
+                            Severity = comment.Severity,
+                            Stage = postResult.Stage,
+                            StatusCode = postResult.StatusCode,
+                            ErrorMessage = postResult.ErrorMessage
+                        });
+
+                        _logger.LogWarning(
+                            "Failed to post high-priority comment for PR {PullRequestId} at {FilePath}:{LineNumber}. Stage={Stage}, StatusCode={StatusCode}, Error={Error}",
+                            reviewOutput.PullRequestId,
+                            comment.FilePath,
+                            comment.LineNumber,
+                            postResult.Stage,
+                            postResult.StatusCode,
+                            postResult.ErrorMessage);
+                    }
+                }
+
+                _reviewByLinkAndPostJobs[jobId] = new ReviewByLinkAndPostJobStatus
+                {
+                    JobId = jobId,
+                    PullRequestLink = request.PullRequestLink,
+                    Project = reviewOutput.Project,
+                    Repository = reviewOutput.Repository,
+                    PullRequestId = reviewOutput.PullRequestId,
+                    Status = "completed",
+                    StartedAtUtc = _reviewByLinkAndPostJobs[jobId].StartedAtUtc,
+                    CompletedAtUtc = DateTime.UtcNow,
+                    TotalComments = reviewOutput.Comments.Count,
+                    HighPriorityComments = highPriorityComments.Count,
+                    PostedHighPriorityComments = postedCount,
+                    SkippedHighPriorityComments = skippedCount,
+                    Comments = reviewOutput.Comments,
+                    PostingFailures = postingFailures
+                };
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "review-by-link-and-post job {JobId} failed", jobId);
+
+                var existing = _reviewByLinkAndPostJobs[jobId];
+                existing.Status = "failed";
+                existing.Error = ex.Message;
+                existing.CompletedAtUtc = DateTime.UtcNow;
+                _reviewByLinkAndPostJobs[jobId] = existing;
+            }
+        });
+
+        var completedTask = await Task.WhenAny(backgroundTask, Task.Delay(ReviewByLinkAndPostSyncWait));
+        if (completedTask == backgroundTask)
+        {
+            var finalState = _reviewByLinkAndPostJobs[jobId];
+            if (string.Equals(finalState.Status, "failed", StringComparison.OrdinalIgnoreCase))
+            {
+                return StatusCode(500, new
+                {
+                    error = finalState.Error ?? "review-by-link-and-post failed",
+                    jobId
+                });
+            }
+
+            return Ok(new
+            {
+                jobId,
+                pullRequestLink = finalState.PullRequestLink,
+                project = finalState.Project,
+                repository = finalState.Repository,
+                pullRequestId = finalState.PullRequestId,
+                comments = finalState.Comments,
+                posting = new
+                {
+                    highPriorityComments = finalState.HighPriorityComments,
+                    postedHighPriorityComments = finalState.PostedHighPriorityComments,
+                    skippedHighPriorityComments = finalState.SkippedHighPriorityComments,
+                    failures = finalState.PostingFailures
+                },
+                status = finalState.Status
+            });
+        }
+
+        // If the request takes too long, continue processing in background and return immediately.
+        return Accepted(new
+        {
+            jobId,
+            status = "running",
+            message = "Review continues in background and high-priority comments will be posted when ready, even if the client request times out.",
+            project = parsed.Project,
+            repository = parsed.Repository,
+            pullRequestId = parsed.PullRequestId,
+            pullRequestLink = request.PullRequestLink
+        });
     }
 
     [HttpGet("current")]
@@ -677,6 +864,100 @@ public class CodeReviewController : ControllerBase
 
         return true;
     }
+
+    private bool TryParseAndValidatePullRequestLink(
+        string pullRequestLink,
+        out ParsedPullRequestLink parsed,
+        out IActionResult? errorResult)
+    {
+        errorResult = null;
+
+        if (!TryParseAzureDevOpsPullRequestLink(pullRequestLink, out parsed, out var parseError))
+        {
+            errorResult = BadRequest(new { error = parseError });
+            return false;
+        }
+
+        if (!string.IsNullOrWhiteSpace(_adoConfig.Organization) &&
+            !string.IsNullOrWhiteSpace(parsed.Organization) &&
+            !string.Equals(_adoConfig.Organization, parsed.Organization, StringComparison.OrdinalIgnoreCase))
+        {
+            errorResult = BadRequest(new
+            {
+                error = $"PR link organization '{parsed.Organization}' does not match configured organization '{_adoConfig.Organization}'."
+            });
+            return false;
+        }
+
+        return true;
+    }
+
+    private async Task<ReviewByLinkExecutionResult> RunReviewByLinkCoreAsync(
+        string pullRequestLink,
+        ParsedPullRequestLink parsed)
+    {
+        var pullRequest = await _adoClient.GetPullRequestAsync(
+            parsed.Project,
+            parsed.Repository,
+            parsed.PullRequestId);
+
+        if (pullRequest == null)
+        {
+            throw new InvalidOperationException("Pull request not found");
+        }
+
+        TriggerBackgroundIndexing(
+            parsed.Project,
+            parsed.Repository,
+            GetBranchName(pullRequest.TargetBranch));
+
+        var files = await _adoClient.GetPullRequestFilesAsync(
+            parsed.Project,
+            parsed.Repository,
+            parsed.PullRequestId);
+
+        var comments = await _reviewService.ReviewPullRequestAsync(
+            pullRequest,
+            files,
+            parsed.Project,
+            parsed.Repository);
+
+        _currentReview = new ReviewResult
+        {
+            PullRequest = pullRequest,
+            Files = files,
+            Comments = comments,
+            Project = parsed.Project,
+            Repository = parsed.Repository
+        };
+
+        return new ReviewByLinkExecutionResult
+        {
+            PullRequestLink = pullRequestLink,
+            Project = parsed.Project,
+            Repository = parsed.Repository,
+            PullRequestId = parsed.PullRequestId,
+            Comments = comments
+        };
+    }
+
+    private static bool IsHighPriorityComment(CodeReviewComment comment)
+    {
+        var severity = comment.Severity?.Trim();
+        return string.Equals(severity, "high", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(severity, "critical", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private string? GetOptionalAdoAccessTokenHeader()
+    {
+        if (!Request.Headers.TryGetValue("X-Ado-Access-Token", out var headerValues))
+        {
+            return null;
+        }
+
+        var token = headerValues.FirstOrDefault()?.Trim();
+        return string.IsNullOrWhiteSpace(token) ? null : token;
+    }
 }
 
 public class ReviewRequest
@@ -739,4 +1020,43 @@ public class ParsedPullRequestLink
     public string Project { get; set; } = string.Empty;
     public string Repository { get; set; } = string.Empty;
     public int PullRequestId { get; set; }
+}
+
+public class ReviewByLinkExecutionResult
+{
+    public string PullRequestLink { get; set; } = string.Empty;
+    public string Project { get; set; } = string.Empty;
+    public string Repository { get; set; } = string.Empty;
+    public int PullRequestId { get; set; }
+    public List<CodeReviewComment> Comments { get; set; } = new();
+}
+
+public class ReviewByLinkAndPostJobStatus
+{
+    public string JobId { get; set; } = string.Empty;
+    public string PullRequestLink { get; set; } = string.Empty;
+    public string Project { get; set; } = string.Empty;
+    public string Repository { get; set; } = string.Empty;
+    public int PullRequestId { get; set; }
+    public string Status { get; set; } = string.Empty;
+    public string? Error { get; set; }
+    public DateTime StartedAtUtc { get; set; }
+    public DateTime? CompletedAtUtc { get; set; }
+    public int TotalComments { get; set; }
+    public int HighPriorityComments { get; set; }
+    public int PostedHighPriorityComments { get; set; }
+    public int SkippedHighPriorityComments { get; set; }
+    public List<CodeReviewComment> Comments { get; set; } = new();
+    public List<ReviewPostingFailure> PostingFailures { get; set; } = new();
+}
+
+public class ReviewPostingFailure
+{
+    public string CommentId { get; set; } = string.Empty;
+    public string FilePath { get; set; } = string.Empty;
+    public int LineNumber { get; set; }
+    public string Severity { get; set; } = string.Empty;
+    public string Stage { get; set; } = string.Empty;
+    public int? StatusCode { get; set; }
+    public string ErrorMessage { get; set; } = string.Empty;
 }

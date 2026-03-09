@@ -126,7 +126,7 @@ PowerShell example:
 
 ```powershell
 $body = @{
-   pullRequestLink = "https://dev.azure.com/Skype/SCC/_git/service-shared_framework_waimea/pullrequest/1365872"
+   pullRequestLink = "https://dev.azure.com/<organization>/<project>/_git/<repository>/pullrequest/<id>"
 } | ConvertTo-Json
 
 Invoke-RestMethod -Method Post `
@@ -140,7 +140,7 @@ Invoke-RestMethod -Method Post `
 ```bash
 curl -X POST "http://localhost:5002/api/codereview/review-by-link" \
    -H "Content-Type: application/json" \
-   -d '{"pullRequestLink":"https://dev.azure.com/Skype/SCC/_git/service-shared_framework_waimea/pullrequest/1365872"}'
+   -d '{"pullRequestLink":"https://dev.azure.com/<organization>/<project>/_git/<repository>/pullrequest/<id>"}'
 ```
 
 Response shape:
@@ -148,9 +148,9 @@ Response shape:
 ```json
 {
    "pullRequestLink": "...",
-   "project": "SCC",
-   "repository": "service-shared_framework_waimea",
-   "pullRequestId": 1365872,
+   "project": "<project>",
+   "repository": "<repository>",
+   "pullRequestId": 12345,
    "comments": [
       {
          "id": "...",
@@ -162,6 +162,74 @@ Response shape:
          "posted": false
       }
    ]
+}
+```
+
+### API Usage (PR Link + Auto Post High Priority)
+
+Use this endpoint when you want the agent to review a PR and automatically post
+high-priority comments (`severity: high` or `critical`) back to Azure DevOps.
+
+Endpoint:
+
+```http
+POST /api/codereview/review-by-link-and-post
+Content-Type: application/json
+```
+
+Request body:
+
+```json
+{
+   "pullRequestLink": "https://dev.azure.com/<organization>/<project>/_git/<repository>/pullrequest/<id>"
+}
+```
+
+Behavior:
+
+- If review finishes quickly, API returns `200` with all comments and posting summary.
+- If review takes long, API returns `202 Accepted` and processing continues in the background.
+- High-priority comments are posted to the PR even if the client times out.
+
+Possible `200` response:
+
+```json
+{
+   "jobId": "...",
+   "pullRequestLink": "...",
+   "project": "<project>",
+   "repository": "<repository>",
+   "pullRequestId": 12345,
+   "comments": [
+      {
+         "id": "...",
+         "filePath": "...",
+         "lineNumber": 0,
+         "commentText": "...",
+         "commentType": "issue",
+         "severity": "high",
+         "posted": true
+      }
+   ],
+   "posting": {
+      "highPriorityComments": 3,
+      "postedHighPriorityComments": 3
+   },
+   "status": "completed"
+}
+```
+
+Possible `202` response:
+
+```json
+{
+   "jobId": "...",
+   "status": "running",
+   "message": "Review continues in background and high-priority comments will be posted when ready, even if the client request times out.",
+   "project": "<project>",
+   "repository": "<repository>",
+   "pullRequestId": 12345,
+   "pullRequestLink": "..."
 }
 ```
 

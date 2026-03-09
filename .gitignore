@@ -40,3 +40,9 @@ runtime.log
 
 # Temporary repository clones
 temp_repos/
+
+# Local API test payloads/results (may contain proprietary repo links and content)
+tmp-review-*.json
+last-review-by-link-and-post-response*.json
+response-dedupe-run.json
+remote-test-output.txt

@@ -1,6 +1,7 @@
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using CodeReviewAgent.Models;
 using Microsoft.Extensions.Logging;
 
@@ -483,42 +484,323 @@ public class AzureDevOpsRestClient
         string project,
         string repositoryId,
         int pullRequestId,
-        CodeReviewComment comment)
+        CodeReviewComment comment,
+        string? accessTokenOverride = null)
+    {
+        var result = await PostPullRequestCommentDetailedAsync(project, repositoryId, pullRequestId, comment, accessTokenOverride);
+        return result.Success;
+    }
+
+    public async Task<PullRequestCommentPostResult> PostPullRequestCommentDetailedAsync(
+        string project,
+        string repositoryId,
+        int pullRequestId,
+        CodeReviewComment comment,
+        string? accessTokenOverride = null)
     {
         try
         {
             _logger.LogInformation("Posting comment to PR {PullRequestId} via REST API", pullRequestId);
 
-            // Create a thread with a comment
-            var commentPayload = new
+            var url = $"https://dev.azure.com/{_organization}/{project}/_apis/git/repositories/{repositoryId}/pullRequests/{pullRequestId}/threads?api-version=7.1";
+            var normalizedFilePath = NormalizeThreadFilePath(comment.FilePath);
+            var lineNumber = comment.LineNumber > 0 ? comment.LineNumber : 1;
+            var anchorBody = BuildCommentBody(comment);
+
+            // Attempt inline thread first so comments appear on the right file/line in the PR diff.
+            if (!string.IsNullOrWhiteSpace(normalizedFilePath))
+            {
+                var inlinePayload = new
+                {
+                    comments = new[]
+                    {
+                        new
+                        {
+                            parentCommentId = 0,
+                            content = anchorBody,
+                            commentType = 1
+                        }
+                    },
+                    status = 1,
+                    threadContext = new
+                    {
+                        filePath = normalizedFilePath,
+                        rightFileStart = new { line = lineNumber, offset = 1 },
+                        rightFileEnd = new { line = lineNumber, offset = 1 }
+                    }
+                };
+
+                var inlineJson = JsonSerializer.Serialize(inlinePayload);
+                using var inlineRequest = BuildThreadPostRequest(url, inlineJson, accessTokenOverride);
+                var inlineResponse = await _httpClient.SendAsync(inlineRequest);
+
+                if (inlineResponse.IsSuccessStatusCode)
+                {
+                    _logger.LogInformation(
+                        "Successfully posted inline comment to PR {PullRequestId} at {FilePath}:{LineNumber}",
+                        pullRequestId,
+                        normalizedFilePath,
+                        lineNumber);
+                    return PullRequestCommentPostResult.SuccessResult();
+                }
+
+                var inlineResponseText = await inlineResponse.Content.ReadAsStringAsync();
+                _logger.LogWarning(
+                    "Inline comment post failed for PR {PullRequestId} at {FilePath}:{LineNumber}. Status: {StatusCode}. Falling back to general thread. Body: {Body}",
+                    pullRequestId,
+                    normalizedFilePath,
+                    lineNumber,
+                    inlineResponse.StatusCode,
+                    inlineResponseText);
+            }
+
+            // Fallback to a general PR thread if inline anchoring cannot be applied.
+            var generalPayload = new
             {
                 comments = new[]
                 {
                     new
                     {
                         parentCommentId = 0,
-                        content = $"**[{comment.Severity.ToUpper()}] {comment.CommentType}** (Line {comment.LineNumber})\n\n{comment.CommentText}",
-                        commentType = 1 // Text comment
+                        content = anchorBody,
+                        commentType = 1
                     }
                 },
-                status = 1 // Active
+                status = 1
             };
 
-            var url = $"https://dev.azure.com/{_organization}/{project}/_apis/git/repositories/{repositoryId}/pullRequests/{pullRequestId}/threads?api-version=7.1";
-            var json = System.Text.Json.JsonSerializer.Serialize(commentPayload);
-            var content = new StringContent(json, System.Text.Encoding.UTF8, "application/json");
+            var json = JsonSerializer.Serialize(generalPayload);
+            using var request = BuildThreadPostRequest(url, json, accessTokenOverride);
+            var response = await _httpClient.SendAsync(request);
 
-            var response = await _httpClient.PostAsync(url, content);
-            response.EnsureSuccessStatusCode();
+            if (!response.IsSuccessStatusCode)
+            {
+                var responseText = await response.Content.ReadAsStringAsync();
+                _logger.LogError(
+                    "General thread comment post failed for PR {PullRequestId}. Status: {StatusCode}. Body: {Body}",
+                    pullRequestId,
+                    response.StatusCode,
+                    responseText);
+
+                return PullRequestCommentPostResult.FailureResult(
+                    stage: "general-thread",
+                    statusCode: (int)response.StatusCode,
+                    errorMessage: $"General thread post failed with HTTP {(int)response.StatusCode}.",
+                    responseBody: responseText);
+            }
 
             _logger.LogInformation("Successfully posted comment to PR {PullRequestId}", pullRequestId);
-            return true;
+            return PullRequestCommentPostResult.SuccessResult();
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error posting comment to PR {PullRequestId}", pullRequestId);
-            return false;
+            return PullRequestCommentPostResult.FailureResult(
+                stage: "exception",
+                statusCode: null,
+                errorMessage: ex.Message,
+                responseBody: null);
         }
+    }
+
+    private static HttpRequestMessage BuildThreadPostRequest(string url, string payloadJson, string? accessTokenOverride)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Post, url)
+        {
+            Content = new StringContent(payloadJson, Encoding.UTF8, "application/json")
+        };
+
+        var authHeader = BuildTokenOverrideAuthHeader(accessTokenOverride);
+        if (authHeader != null)
+        {
+            request.Headers.Authorization = authHeader;
+        }
+
+        return request;
+    }
+
+    private static AuthenticationHeaderValue? BuildTokenOverrideAuthHeader(string? accessTokenOverride)
+    {
+        if (string.IsNullOrWhiteSpace(accessTokenOverride))
+        {
+            return null;
+        }
+
+        var token = accessTokenOverride.Trim();
+        const string bearerPrefix = "Bearer ";
+        if (token.StartsWith(bearerPrefix, StringComparison.OrdinalIgnoreCase))
+        {
+            token = token[bearerPrefix.Length..].Trim();
+        }
+
+        return string.IsNullOrWhiteSpace(token)
+            ? null
+            : new AuthenticationHeaderValue("Bearer", token);
+    }
+
+    private static string NormalizeThreadFilePath(string? filePath)
+    {
+        if (string.IsNullOrWhiteSpace(filePath))
+        {
+            return string.Empty;
+        }
+
+        return filePath.StartsWith("/", StringComparison.Ordinal)
+            ? filePath
+            : "/" + filePath;
+    }
+
+    public static string BuildCommentBody(CodeReviewComment comment)
+    {
+        var lineNumber = comment.LineNumber > 0 ? comment.LineNumber : 1;
+        var anchorTitle = $"**[{comment.Severity.ToUpper()}] {comment.CommentType}**";
+        return $"{anchorTitle} (Line {lineNumber})\n\n{comment.CommentText}";
+    }
+
+    public static string BuildCommentFingerprint(CodeReviewComment comment)
+    {
+        return NormalizeCommentBody(BuildCommentBody(comment));
+    }
+
+    public static string NormalizeCommentBody(string? commentBody)
+    {
+        if (string.IsNullOrWhiteSpace(commentBody))
+        {
+            return string.Empty;
+        }
+
+        // Collapse whitespace so equivalent content with formatting differences dedupes.
+        return Regex.Replace(commentBody.Trim(), "\\s+", " ");
+    }
+
+    public async Task<HashSet<string>> GetExistingCommentFingerprintsAsync(string project, string repositoryId, int pullRequestId)
+    {
+        var fingerprints = new HashSet<string>(StringComparer.Ordinal);
+
+        try
+        {
+            var url = $"https://dev.azure.com/{_organization}/{project}/_apis/git/repositories/{repositoryId}/pullRequests/{pullRequestId}/threads?api-version=7.1";
+            var response = await _httpClient.GetAsync(url);
+            response.EnsureSuccessStatusCode();
+
+            var content = await response.Content.ReadAsStringAsync();
+            var root = JsonSerializer.Deserialize<JsonElement>(content);
+            if (!root.TryGetProperty("value", out var threads) || threads.ValueKind != JsonValueKind.Array)
+            {
+                return fingerprints;
+            }
+
+            foreach (var thread in threads.EnumerateArray())
+            {
+                if (!thread.TryGetProperty("comments", out var comments) || comments.ValueKind != JsonValueKind.Array)
+                {
+                    continue;
+                }
+
+                foreach (var comment in comments.EnumerateArray())
+                {
+                    if (!comment.TryGetProperty("content", out var contentProp))
+                    {
+                        continue;
+                    }
+
+                    var text = contentProp.GetString();
+                    var normalized = NormalizeCommentBody(text);
+                    if (!string.IsNullOrEmpty(normalized))
+                    {
+                        fingerprints.Add(normalized);
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Unable to fetch existing PR thread comments for dedupe on PR {PullRequestId}", pullRequestId);
+        }
+
+        return fingerprints;
+    }
+
+    public static string BuildCommentPositionKey(CodeReviewComment comment)
+    {
+        var path = NormalizeThreadFilePath(comment.FilePath).ToLowerInvariant();
+        var line = comment.LineNumber > 0 ? comment.LineNumber : 1;
+        var severity = (comment.Severity ?? string.Empty).Trim().ToLowerInvariant();
+        var type = (comment.CommentType ?? string.Empty).Trim().ToLowerInvariant();
+        return $"{path}|{line}|{severity}|{type}";
+    }
+
+    public async Task<HashSet<string>> GetExistingCommentPositionKeysAsync(string project, string repositoryId, int pullRequestId)
+    {
+        var keys = new HashSet<string>(StringComparer.Ordinal);
+
+        try
+        {
+            var url = $"https://dev.azure.com/{_organization}/{project}/_apis/git/repositories/{repositoryId}/pullRequests/{pullRequestId}/threads?api-version=7.1";
+            var response = await _httpClient.GetAsync(url);
+            response.EnsureSuccessStatusCode();
+
+            var content = await response.Content.ReadAsStringAsync();
+            var root = JsonSerializer.Deserialize<JsonElement>(content);
+            if (!root.TryGetProperty("value", out var threads) || threads.ValueKind != JsonValueKind.Array)
+            {
+                return keys;
+            }
+
+            foreach (var thread in threads.EnumerateArray())
+            {
+                string? filePath = null;
+                int lineNumber = 1;
+
+                if (thread.TryGetProperty("threadContext", out var threadContext) && threadContext.ValueKind == JsonValueKind.Object)
+                {
+                    if (threadContext.TryGetProperty("filePath", out var fp))
+                    {
+                        filePath = fp.GetString();
+                    }
+
+                    if (threadContext.TryGetProperty("rightFileStart", out var start) &&
+                        start.ValueKind == JsonValueKind.Object &&
+                        start.TryGetProperty("line", out var lineProp) &&
+                        lineProp.ValueKind == JsonValueKind.Number)
+                    {
+                        lineNumber = lineProp.GetInt32();
+                    }
+                }
+
+                if (!thread.TryGetProperty("comments", out var comments) || comments.ValueKind != JsonValueKind.Array)
+                {
+                    continue;
+                }
+
+                foreach (var comment in comments.EnumerateArray())
+                {
+                    if (!comment.TryGetProperty("content", out var contentProp))
+                    {
+                        continue;
+                    }
+
+                    var text = contentProp.GetString() ?? string.Empty;
+                    var match = Regex.Match(text, @"\*\*\[(?<sev>[^\]]+)\]\s+(?<type>[^*]+)\*\*", RegexOptions.IgnoreCase);
+                    if (!match.Success)
+                    {
+                        continue;
+                    }
+
+                    var severity = match.Groups["sev"].Value.Trim().ToLowerInvariant();
+                    var type = match.Groups["type"].Value.Trim().ToLowerInvariant();
+                    var normalizedPath = NormalizeThreadFilePath(filePath).ToLowerInvariant();
+
+                    keys.Add($"{normalizedPath}|{lineNumber}|{severity}|{type}");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Unable to fetch existing PR thread position keys for dedupe on PR {PullRequestId}", pullRequestId);
+        }
+
+        return keys;
     }
 
     /// <summary>
@@ -846,5 +1128,35 @@ public class AzureDevOpsRestClient
             _logger.LogError("════════════════════════════════════════════════════════════");
             return new List<string>();
         }
+    }
+}
+
+public class PullRequestCommentPostResult
+{
+    public bool Success { get; set; }
+    public string Stage { get; set; } = string.Empty;
+    public int? StatusCode { get; set; }
+    public string ErrorMessage { get; set; } = string.Empty;
+    public string? ResponseBody { get; set; }
+
+    public static PullRequestCommentPostResult SuccessResult()
+    {
+        return new PullRequestCommentPostResult
+        {
+            Success = true,
+            Stage = "success"
+        };
+    }
+
+    public static PullRequestCommentPostResult FailureResult(string stage, int? statusCode, string errorMessage, string? responseBody)
+    {
+        return new PullRequestCommentPostResult
+        {
+            Success = false,
+            Stage = stage,
+            StatusCode = statusCode,
+            ErrorMessage = errorMessage,
+            ResponseBody = responseBody
+        };
     }
 }

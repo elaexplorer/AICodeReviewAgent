@@ -246,7 +246,23 @@ public class AzureDevOpsMcpClient : IAsyncDisposable
         }
     }
 
-    public async Task<bool> PostCommentAsync(string project, string repository, int pullRequestId, CodeReviewComment comment)
+    public async Task<bool> PostCommentAsync(
+        string project,
+        string repository,
+        int pullRequestId,
+        CodeReviewComment comment,
+        string? accessTokenOverride = null)
+    {
+        var result = await PostCommentWithResultAsync(project, repository, pullRequestId, comment, accessTokenOverride);
+        return result.Success;
+    }
+
+    public async Task<PullRequestCommentPostResult> PostCommentWithResultAsync(
+        string project,
+        string repository,
+        int pullRequestId,
+        CodeReviewComment comment,
+        string? accessTokenOverride = null)
     {
         // Try REST API first as MCP doesn't support posting comments
         try
@@ -254,44 +270,87 @@ public class AzureDevOpsMcpClient : IAsyncDisposable
             _logger.LogInformation("Posting comment to PR {PullRequestId} in repository {Repository} via REST API",
                 pullRequestId, repository);
 
-            // Get repository ID first
-            var repoResult = await GetMcpClientAsync();
-            var repoResponse = await repoResult.CallToolAsync("repo_get_repo_by_name_or_id", new Dictionary<string, object?>
-            {
-                ["project"] = project,
-                ["repositoryNameOrId"] = repository
-            });
-
-            string? repositoryId = null;
-            if (repoResponse.Content?.Count > 0)
-            {
-                var repoContent = JsonSerializer.Serialize(repoResponse.Content[0]);
-                var repoData = JsonSerializer.Deserialize<JsonElement>(repoContent);
-                var textValue = repoData.TryGetProperty("text", out var textProp) ? textProp.GetString() : repoContent;
-                var repo = JsonSerializer.Deserialize<JsonElement>(textValue!);
-                repositoryId = repo.GetProperty("id").GetString();
-            }
+            // Resolve repository ID through REST to avoid MCP payload-shape drift for this hot path.
+            var repoInfo = await _restClient.GetRepositoryAsync(project, repository);
+            var repositoryId = repoInfo?.Id;
 
             if (string.IsNullOrEmpty(repositoryId))
             {
                 _logger.LogError("Repository {Repository} not found", repository);
-                return false;
+                return PullRequestCommentPostResult.FailureResult(
+                    stage: "repository-resolution",
+                    statusCode: null,
+                    errorMessage: $"Repository '{repository}' not found in project '{project}'.",
+                    responseBody: null);
             }
 
-            // Use REST API to post comment
-            var success = await _restClient.PostPullRequestCommentAsync(project, repositoryId, pullRequestId, comment);
-            if (success)
+            var result = await _restClient.PostPullRequestCommentDetailedAsync(
+                project,
+                repositoryId,
+                pullRequestId,
+                comment,
+                accessTokenOverride);
+            if (result.Success)
             {
                 _logger.LogInformation("Posted comment to PR {PullRequestId}: {Comment}", pullRequestId, comment.CommentText);
-                return true;
             }
 
-            return false;
+            return result;
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error posting comment to PR {PullRequestId}", pullRequestId);
-            return false;
+            return PullRequestCommentPostResult.FailureResult(
+                stage: "exception",
+                statusCode: null,
+                errorMessage: ex.Message,
+                responseBody: null);
+        }
+    }
+
+    public async Task<HashSet<string>> GetExistingCommentFingerprintsAsync(string project, string repository, int pullRequestId)
+    {
+        try
+        {
+            var repoInfo = await _restClient.GetRepositoryAsync(project, repository);
+            if (repoInfo == null || string.IsNullOrWhiteSpace(repoInfo.Id))
+            {
+                _logger.LogWarning(
+                    "Could not resolve repository ID for dedupe check. Project={Project}, Repository={Repository}",
+                    project,
+                    repository);
+                return new HashSet<string>(StringComparer.Ordinal);
+            }
+
+            return await _restClient.GetExistingCommentFingerprintsAsync(project, repoInfo.Id, pullRequestId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to fetch existing comment fingerprints for PR {PullRequestId}", pullRequestId);
+            return new HashSet<string>(StringComparer.Ordinal);
+        }
+    }
+
+    public async Task<HashSet<string>> GetExistingCommentPositionKeysAsync(string project, string repository, int pullRequestId)
+    {
+        try
+        {
+            var repoInfo = await _restClient.GetRepositoryAsync(project, repository);
+            if (repoInfo == null || string.IsNullOrWhiteSpace(repoInfo.Id))
+            {
+                _logger.LogWarning(
+                    "Could not resolve repository ID for position-key dedupe check. Project={Project}, Repository={Repository}",
+                    project,
+                    repository);
+                return new HashSet<string>(StringComparer.Ordinal);
+            }
+
+            return await _restClient.GetExistingCommentPositionKeysAsync(project, repoInfo.Id, pullRequestId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to fetch existing comment position keys for PR {PullRequestId}", pullRequestId);
+            return new HashSet<string>(StringComparer.Ordinal);
         }
     }
 
