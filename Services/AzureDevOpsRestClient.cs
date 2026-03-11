@@ -98,7 +98,8 @@ public class AzureDevOpsRestClient
     public async Task<PullRequest?> GetPullRequestAsync(
         string project,
         string repository,
-        int pullRequestId)
+        int pullRequestId,
+        string? accessTokenOverride = null)
     {
         try
         {
@@ -107,7 +108,7 @@ public class AzureDevOpsRestClient
 
             // Get repository ID first
             var repoUrl = $"https://dev.azure.com/{_organization}/{project}/_apis/git/repositories/{repository}?api-version=7.1";
-            var repoResponse = await _httpClient.GetAsync(repoUrl);
+            var repoResponse = await SendGetWithAuthFallbackAsync(repoUrl, accessTokenOverride, "repository lookup");
             repoResponse.EnsureSuccessStatusCode();
 
             var repoContent = await repoResponse.Content.ReadAsStringAsync();
@@ -122,7 +123,7 @@ public class AzureDevOpsRestClient
 
             // Get the PR details
             var prUrl = $"https://dev.azure.com/{_organization}/{project}/_apis/git/repositories/{repositoryId}/pullRequests/{pullRequestId}?api-version=7.1";
-            var prResponse = await _httpClient.GetAsync(prUrl);
+            var prResponse = await SendGetWithAuthFallbackAsync(prUrl, accessTokenOverride, "pull request lookup");
             prResponse.EnsureSuccessStatusCode();
 
             var prContent = await prResponse.Content.ReadAsStringAsync();
@@ -531,8 +532,11 @@ public class AzureDevOpsRestClient
                 };
 
                 var inlineJson = JsonSerializer.Serialize(inlinePayload);
-                using var inlineRequest = BuildThreadPostRequest(url, inlineJson, accessTokenOverride);
-                var inlineResponse = await _httpClient.SendAsync(inlineRequest);
+                var inlineResponse = await SendPostWithAuthFallbackAsync(
+                    url,
+                    inlineJson,
+                    accessTokenOverride,
+                    "inline-thread-post");
 
                 if (inlineResponse.IsSuccessStatusCode)
                 {
@@ -570,8 +574,11 @@ public class AzureDevOpsRestClient
             };
 
             var json = JsonSerializer.Serialize(generalPayload);
-            using var request = BuildThreadPostRequest(url, json, accessTokenOverride);
-            var response = await _httpClient.SendAsync(request);
+            var response = await SendPostWithAuthFallbackAsync(
+                url,
+                json,
+                accessTokenOverride,
+                "general-thread-post");
 
             if (!response.IsSuccessStatusCode)
             {
@@ -636,6 +643,73 @@ public class AzureDevOpsRestClient
         return string.IsNullOrWhiteSpace(token)
             ? null
             : new AuthenticationHeaderValue("Bearer", token);
+    }
+
+    private static bool IsAuthFailureStatusCode(System.Net.HttpStatusCode statusCode)
+    {
+        return statusCode == System.Net.HttpStatusCode.Unauthorized
+            || statusCode == System.Net.HttpStatusCode.Forbidden;
+    }
+
+    private async Task<HttpResponseMessage> SendGetWithAuthFallbackAsync(
+        string url,
+        string? accessTokenOverride,
+        string operationName)
+    {
+        var overrideHeader = BuildTokenOverrideAuthHeader(accessTokenOverride);
+        if (overrideHeader == null)
+        {
+            return await _httpClient.GetAsync(url);
+        }
+
+        using var preferredRequest = new HttpRequestMessage(HttpMethod.Get, url);
+        preferredRequest.Headers.Authorization = overrideHeader;
+
+        var preferredResponse = await _httpClient.SendAsync(preferredRequest);
+        if (!IsAuthFailureStatusCode(preferredResponse.StatusCode))
+        {
+            return preferredResponse;
+        }
+
+        var responsePreview = await preferredResponse.Content.ReadAsStringAsync();
+        _logger.LogWarning(
+            "Bearer token authorization failed during {Operation}. Falling back to configured PAT. Status={StatusCode}, Body={Body}",
+            operationName,
+            preferredResponse.StatusCode,
+            responsePreview.Length > 400 ? responsePreview.Substring(0, 400) : responsePreview);
+
+        preferredResponse.Dispose();
+        return await _httpClient.GetAsync(url);
+    }
+
+    private async Task<HttpResponseMessage> SendPostWithAuthFallbackAsync(
+        string url,
+        string payloadJson,
+        string? accessTokenOverride,
+        string operationName)
+    {
+        var overrideHeader = BuildTokenOverrideAuthHeader(accessTokenOverride);
+        if (overrideHeader == null)
+        {
+            return await _httpClient.PostAsync(url, new StringContent(payloadJson, Encoding.UTF8, "application/json"));
+        }
+
+        using var preferredRequest = BuildThreadPostRequest(url, payloadJson, accessTokenOverride);
+        var preferredResponse = await _httpClient.SendAsync(preferredRequest);
+        if (!IsAuthFailureStatusCode(preferredResponse.StatusCode))
+        {
+            return preferredResponse;
+        }
+
+        var responsePreview = await preferredResponse.Content.ReadAsStringAsync();
+        _logger.LogWarning(
+            "Bearer token authorization failed during {Operation}. Falling back to configured PAT. Status={StatusCode}, Body={Body}",
+            operationName,
+            preferredResponse.StatusCode,
+            responsePreview.Length > 400 ? responsePreview.Substring(0, 400) : responsePreview);
+
+        preferredResponse.Dispose();
+        return await _httpClient.PostAsync(url, new StringContent(payloadJson, Encoding.UTF8, "application/json"));
     }
 
     private static string NormalizeThreadFilePath(string? filePath)

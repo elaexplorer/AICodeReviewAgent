@@ -5,6 +5,10 @@
     <TargetFramework>net9.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <DefaultItemExcludes>$(DefaultItemExcludes);temp_repos/**;temp_repos\**</DefaultItemExcludes>
+    <EnableDefaultEmbeddedResourceItems>false</EnableDefaultEmbeddedResourceItems>
+    <EnableDefaultRazorGenerateItems>false</EnableDefaultRazorGenerateItems>
+    <EnableDefaultRazorComponentItems>false</EnableDefaultRazorComponentItems>
   </PropertyGroup>
 
   <ItemGroup>

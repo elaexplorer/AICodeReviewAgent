@@ -13,6 +13,7 @@ namespace CodeReviewAgent.Controllers;
 [Route("api/[controller]")]
 public class CodeReviewController : ControllerBase
 {
+    private const string PullRequestFetchFailedClientError = "Internal server error while retrieving pull request from Azure DevOps.";
     private readonly CodeReviewAgentService _codeReviewAgent;
     private readonly AzureDevOpsMcpClient _adoClient;
     private readonly CodeReviewService _reviewService;
@@ -61,13 +62,28 @@ public class CodeReviewController : ControllerBase
 
             if (pullRequest == null)
             {
-                return NotFound(new { error = "Pull request not found" });
+                _logger.LogError(
+                    "Pull request fetch returned null for PR {PullRequestId} in {Project}/{Repository}. ADO config: IsConfigured={IsConfigured}, Organization={Organization}, ForceUiConfig={ForceUiConfig}, HasDefaultPat={HasDefaultPat}",
+                    request.PullRequestId,
+                    request.Project,
+                    request.Repository,
+                    _adoConfig.IsConfigured,
+                    _adoConfig.Organization,
+                    IsForceUiConfigEnabled(),
+                    !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("ADO_PAT")));
+
+                return StatusCode(500, new
+                {
+                    error = PullRequestFetchFailedClientError,
+                    errorCode = "ADO_PR_FETCH_FAILED"
+                });
             }
 
             TriggerBackgroundIndexing(
                 request.Project,
                 request.Repository,
-                GetBranchName(pullRequest.TargetBranch));
+                GetBranchName(pullRequest.TargetBranch),
+                GetOptionalAdoAccessTokenHeader());
 
             // Get PR files
             var files = await _adoClient.GetPullRequestFilesAsync(
@@ -121,21 +137,38 @@ public class CodeReviewController : ControllerBase
 
         try
         {
+            var adoAccessTokenOverride = GetOptionalAdoAccessTokenHeader();
+
             _logger.LogInformation("Starting review from link for PR {PullRequestId} in {Project}/{Repository}",
                 parsed.PullRequestId, parsed.Project, parsed.Repository);
 
             var pullRequest = await _adoClient.GetPullRequestAsync(
-                parsed.Project, parsed.Repository, parsed.PullRequestId);
+                parsed.Project, parsed.Repository, parsed.PullRequestId, adoAccessTokenOverride);
 
             if (pullRequest == null)
             {
-                return NotFound(new { error = "Pull request not found" });
+                _logger.LogError(
+                    "Pull request fetch returned null for PR {PullRequestId} in {Project}/{Repository}. ADO config: IsConfigured={IsConfigured}, Organization={Organization}, ForceUiConfig={ForceUiConfig}, HasDefaultPat={HasDefaultPat}",
+                    parsed.PullRequestId,
+                    parsed.Project,
+                    parsed.Repository,
+                    _adoConfig.IsConfigured,
+                    _adoConfig.Organization,
+                    IsForceUiConfigEnabled(),
+                    !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("ADO_PAT")));
+
+                return StatusCode(500, new
+                {
+                    error = PullRequestFetchFailedClientError,
+                    errorCode = "ADO_PR_FETCH_FAILED"
+                });
             }
 
             TriggerBackgroundIndexing(
                 parsed.Project,
                 parsed.Repository,
-                GetBranchName(pullRequest.TargetBranch));
+                GetBranchName(pullRequest.TargetBranch),
+                adoAccessTokenOverride);
 
             var files = await _adoClient.GetPullRequestFilesAsync(
                 parsed.Project, parsed.Repository, parsed.PullRequestId);
@@ -206,7 +239,7 @@ public class CodeReviewController : ControllerBase
                     parsed.Project,
                     parsed.Repository);
 
-                var reviewOutput = await RunReviewByLinkCoreAsync(request.PullRequestLink, parsed);
+                var reviewOutput = await RunReviewByLinkCoreAsync(request.PullRequestLink, parsed, adoAccessTokenOverride);
                 var highPriorityComments = reviewOutput.Comments
                     .Where(IsHighPriorityComment)
                     .ToList();
@@ -300,7 +333,7 @@ public class CodeReviewController : ControllerBase
 
                 var existing = _reviewByLinkAndPostJobs[jobId];
                 existing.Status = "failed";
-                existing.Error = ex.Message;
+                existing.Error = PullRequestFetchFailedClientError;
                 existing.CompletedAtUtc = DateTime.UtcNow;
                 _reviewByLinkAndPostJobs[jobId] = existing;
             }
@@ -314,7 +347,8 @@ public class CodeReviewController : ControllerBase
             {
                 return StatusCode(500, new
                 {
-                    error = finalState.Error ?? "review-by-link-and-post failed",
+                    error = finalState.Error ?? PullRequestFetchFailedClientError,
+                    errorCode = "INTERNAL_SERVER_ERROR",
                     jobId
                 });
             }
@@ -376,12 +410,6 @@ public class CodeReviewController : ControllerBase
             },
             new ProjectInfo
             {
-                Name = "waimeabay",
-                DisplayName = "Waimea Bay",
-                Repositories = new List<string> { "waimeabay" }
-            },
-            new ProjectInfo
-            {
                 Name = "MyProject",
                 DisplayName = "My Project",
                 Repositories = new List<string>()
@@ -401,7 +429,6 @@ public class CodeReviewController : ControllerBase
             var repositories = project switch
             {
                 "SCC" => new List<string> { "service-shared_framework_waimea" },
-                "waimeabay" => new List<string> { "waimeabay" },
                 _ => new List<string>()
             };
 
@@ -479,7 +506,11 @@ public class CodeReviewController : ControllerBase
     /// <summary>
     /// Triggers background indexing for a repository if not already indexed or in progress
     /// </summary>
-    private void TriggerBackgroundIndexing(string project, string repository, string branch = "master")
+    private void TriggerBackgroundIndexing(
+        string project,
+        string repository,
+        string branch = "master",
+        string? accessTokenOverride = null)
     {
         // Skip if already indexed
         if (_codebaseContextService.IsRepositoryIndexed(repository))
@@ -514,7 +545,7 @@ public class CodeReviewController : ControllerBase
                 var startTime = DateTime.UtcNow;
                 _logger.LogInformation("🚀 Background indexing started for '{Repository}'", repository);
 
-                var chunksIndexed = await _codebaseContextService.IndexRepositoryAsync(project, repository, branch);
+                var chunksIndexed = await _codebaseContextService.IndexRepositoryAsync(project, repository, branch, accessTokenOverride);
 
                 var duration = DateTime.UtcNow - startTime;
                 _logger.LogInformation("╔════════════════════════════════════════════════════════════╗");
@@ -652,7 +683,24 @@ public class CodeReviewController : ControllerBase
     {
         try
         {
-            var (isValid, errorMessage) = await _adoConfig.ValidateAndConfigureAsync(request.Organization, request.PersonalAccessToken);
+            if (string.IsNullOrWhiteSpace(request.PersonalAccessToken))
+            {
+                return BadRequest(new {
+                    success = false,
+                    error = "Personal Access Token is required."
+                });
+            }
+
+            var organization = Environment.GetEnvironmentVariable("ADO_ORGANIZATION")?.Trim();
+            if (string.IsNullOrWhiteSpace(organization))
+            {
+                return BadRequest(new {
+                    success = false,
+                    error = "ADO_ORGANIZATION is not configured in environment."
+                });
+            }
+
+            var (isValid, errorMessage) = await _adoConfig.ValidateAndConfigureAsync(organization, request.PersonalAccessToken);
 
             if (!isValid)
             {
@@ -662,41 +710,29 @@ public class CodeReviewController : ControllerBase
                 });
             }
 
-            var (chatIsValid, chatError) = await _chatConfig.ValidateAndConfigureAsync(
-                request.ChatEndpoint,
-                request.ChatApiKey,
-                request.ChatDeployment,
-                request.ChatApiVersion);
-
-            if (!chatIsValid)
+            if (!_chatConfig.IsConfigured)
             {
                 return BadRequest(new {
                     success = false,
-                    error = chatError
+                    error = "Chat configuration is missing in environment. Set AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, AZURE_OPENAI_DEPLOYMENT."
                 });
             }
 
-            var (embeddingIsValid, embeddingError) = await _embeddingConfig.ValidateAndConfigureAsync(
-                request.EmbeddingEndpoint,
-                request.EmbeddingApiKey,
-                request.EmbeddingDeployment,
-                request.EmbeddingApiVersion);
-
-            if (!embeddingIsValid)
+            if (!_embeddingConfig.IsConfigured)
             {
                 return BadRequest(new {
                     success = false,
-                    error = embeddingError
+                    error = "Embedding configuration is missing in environment. Set embedding endpoint/key/deployment variables."
                 });
             }
 
             // Reinitialize ADO client with new credentials
-            _adoClient.UpdateConfiguration(request.Organization, request.PersonalAccessToken);
+            _adoClient.UpdateConfiguration(organization, request.PersonalAccessToken);
 
             return Ok(new {
                 success = true,
                 message = "Configuration validated successfully",
-                organization = request.Organization
+                organization = organization
             });
         }
         catch (Exception ex)
@@ -737,7 +773,8 @@ public class CodeReviewController : ControllerBase
             var indexedCount = await _codebaseContextService.IndexRepositoryAsync(
                 request.Project,
                 request.Repository,
-                request.Branch);
+                request.Branch,
+                GetOptionalAdoAccessTokenHeader());
 
             _logger.LogInformation("✅ Indexing complete: {Count} chunks indexed", indexedCount);
 
@@ -894,22 +931,35 @@ public class CodeReviewController : ControllerBase
 
     private async Task<ReviewByLinkExecutionResult> RunReviewByLinkCoreAsync(
         string pullRequestLink,
-        ParsedPullRequestLink parsed)
+        ParsedPullRequestLink parsed,
+        string? accessTokenOverride = null)
     {
         var pullRequest = await _adoClient.GetPullRequestAsync(
             parsed.Project,
             parsed.Repository,
-            parsed.PullRequestId);
+            parsed.PullRequestId,
+            accessTokenOverride);
 
         if (pullRequest == null)
         {
-            throw new InvalidOperationException("Pull request not found");
+            _logger.LogError(
+                "RunReviewByLinkCoreAsync failed to retrieve PR {PullRequestId} in {Project}/{Repository}. ADO config: IsConfigured={IsConfigured}, Organization={Organization}, ForceUiConfig={ForceUiConfig}, HasDefaultPat={HasDefaultPat}",
+                parsed.PullRequestId,
+                parsed.Project,
+                parsed.Repository,
+                _adoConfig.IsConfigured,
+                _adoConfig.Organization,
+                IsForceUiConfigEnabled(),
+                !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("ADO_PAT")));
+
+            throw new InvalidOperationException(PullRequestFetchFailedClientError);
         }
 
         TriggerBackgroundIndexing(
             parsed.Project,
             parsed.Repository,
-            GetBranchName(pullRequest.TargetBranch));
+            GetBranchName(pullRequest.TargetBranch),
+            accessTokenOverride);
 
         var files = await _adoClient.GetPullRequestFilesAsync(
             parsed.Project,

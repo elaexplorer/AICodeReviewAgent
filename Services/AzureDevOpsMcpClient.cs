@@ -58,7 +58,11 @@ public class AzureDevOpsMcpClient : IAsyncDisposable
         return _mcpClient;
     }
 
-    public async Task<PullRequest?> GetPullRequestAsync(string project, string repository, int pullRequestId)
+    public async Task<PullRequest?> GetPullRequestAsync(
+        string project,
+        string repository,
+        int pullRequestId,
+        string? accessTokenOverride = null)
     {
         // Try REST API first as it's more reliable
         try
@@ -66,7 +70,7 @@ public class AzureDevOpsMcpClient : IAsyncDisposable
             _logger.LogInformation("Fetching PR {PullRequestId} from repository {Repository} (project {Project}) via REST API",
                 pullRequestId, repository, project);
 
-            var pullRequest = await _restClient.GetPullRequestAsync(project, repository, pullRequestId);
+            var pullRequest = await _restClient.GetPullRequestAsync(project, repository, pullRequestId, accessTokenOverride);
             if (pullRequest != null)
             {
                 _logger.LogInformation("Found PR {PullRequestId}: {Title}", pullRequest.Id, pullRequest.Title);

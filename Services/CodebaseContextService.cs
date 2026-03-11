@@ -82,7 +82,8 @@ public class CodebaseContextService
         string project,
         string repositoryId,
         string branch = "master",
-        string? repositoryUrl = null)
+        string? repositoryUrl = null,
+        string? accessTokenOverride = null)
     {
         _logger.LogInformation("╔════════════════════════════════════════════════════════════╗");
         _logger.LogInformation("║ RAG INDEXING: Starting Git Clone-Based Repository Indexing ║");
@@ -130,9 +131,18 @@ public class CodebaseContextService
 
             // Step 2: Construct repository URL and clone
             var repoUrl = repositoryUrl ?? $"https://dev.azure.com/{_adoClient.Organization}/{project}/_git/{repositoryId}";
-            repoUrl = BuildAuthenticatedCloneUrl(repoUrl);
+            repoUrl = BuildAuthenticatedCloneUrl(repoUrl, accessTokenOverride);
             var adoPat = _adoClient.PersonalAccessToken;
-            var logUrl = !string.IsNullOrEmpty(adoPat) ? repoUrl.Replace(adoPat, "***") : repoUrl;
+            var normalizedOverride = NormalizeAdoAccessToken(accessTokenOverride);
+            var logUrl = repoUrl;
+            if (!string.IsNullOrEmpty(adoPat))
+            {
+                logUrl = logUrl.Replace(adoPat, "***");
+            }
+            if (!string.IsNullOrEmpty(normalizedOverride))
+            {
+                logUrl = logUrl.Replace(normalizedOverride, "***");
+            }
             _logger.LogInformation("Step 2: Cloning repository from: {RepoUrl}", logUrl);
             _logger.LogInformation("   Requested branch: {Branch} (will auto-detect if this fails)", branch);
 
@@ -225,7 +235,8 @@ public class CodebaseContextService
     public async Task<int> IndexRepositoryAsync(
         string project,
         string repositoryId,
-        string branch = "master")
+        string branch = "master",
+        string? accessTokenOverride = null)
     {
         _logger.LogInformation("╔════════════════════════════════════════════════════════════╗");
         _logger.LogInformation("║ RAG INDEXING: Starting Repository Indexing (Git Clone Only) ║");
@@ -241,7 +252,7 @@ public class CodebaseContextService
         
         try
         {
-            var cloneResult = await IndexRepositoryWithCloneAsync(project, repositoryId, branch);
+            var cloneResult = await IndexRepositoryWithCloneAsync(project, repositoryId, branch, null, accessTokenOverride);
             if (cloneResult > 0)
             {
                 _logger.LogInformation("✅ Git Clone approach succeeded: {ChunkCount} chunks indexed", cloneResult);
@@ -251,37 +262,39 @@ public class CodebaseContextService
             {
                 _logger.LogWarning("⚠️ Git Clone approach returned 0 chunks - attempting API fallback indexing...");
 
-                var (apiSuccess, apiIndexedCount) = await TryIndexWithApiAsync(project, repositoryId, branch);
+                var (apiSuccess, apiIndexedCount, apiError) = await TryIndexWithApiAsync(project, repositoryId, branch);
                 if (apiSuccess && apiIndexedCount > 0)
                 {
                     _logger.LogInformation("✅ API fallback succeeded: {ChunkCount} chunks indexed", apiIndexedCount);
                     return apiIndexedCount;
                 }
 
-                _logger.LogError("❌ Both Git Clone and API fallback indexing failed");
-                return 0;
+                var message = $"RAG repository indexing failed for {project}/{repositoryId} on branch '{branch}'. Clone returned 0 chunks and API fallback failed. API error: {apiError ?? "none"}";
+                _logger.LogError("❌ {Message}", message);
+                throw new InvalidOperationException(message);
             }
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "❌ Git Clone approach failed - attempting API fallback...");
 
-            var (apiSuccess, apiIndexedCount) = await TryIndexWithApiAsync(project, repositoryId, branch);
+            var (apiSuccess, apiIndexedCount, apiError) = await TryIndexWithApiAsync(project, repositoryId, branch);
             if (apiSuccess && apiIndexedCount > 0)
             {
                 _logger.LogInformation("✅ API fallback succeeded after clone exception: {ChunkCount} chunks indexed", apiIndexedCount);
                 return apiIndexedCount;
             }
 
-            _logger.LogError("❌ API fallback also failed after clone exception");
-            return 0;
+            var message = $"RAG repository indexing failed for {project}/{repositoryId} on branch '{branch}'. Clone error: {ex.Message}. API fallback error: {apiError ?? "none"}";
+            _logger.LogError("❌ {Message}", message);
+            throw new InvalidOperationException(message, ex);
         }
     }
 
     /// <summary>
     /// Try indexing using Azure DevOps REST API
     /// </summary>
-    private async Task<(bool Success, int IndexedCount)> TryIndexWithApiAsync(
+    private async Task<(bool Success, int IndexedCount, string? Error)> TryIndexWithApiAsync(
         string project,
         string repositoryId, 
         string branch)
@@ -300,7 +313,7 @@ public class CodebaseContextService
             if (files.Count == 0)
             {
                 _logger.LogWarning("⚠️  No files found in repository using API method");
-                return (false, 0);
+                return (false, 0, "No files found in repository via API method.");
             }
 
             int indexed = 0;
@@ -379,7 +392,7 @@ public class CodebaseContextService
             {
                 _logger.LogWarning("⚠️  API approach has too many errors ({Errors}/{Total} files failed)", 
                     apiErrors, apiTestFiles.Count);
-                return (false, 0);
+                return (false, 0, $"Too many API retrieval errors during validation batch ({apiErrors}/{apiTestFiles.Count}).");
             }
             
             // If API is working, continue with all files
@@ -464,12 +477,12 @@ public class CodebaseContextService
             _inMemoryStore[repositoryId] = chunks;
 
             _logger.LogInformation("✅ API Method: Indexed {Count} chunks from {Files} files", indexed, files.Count);
-            return (true, indexed);
+            return (true, indexed, null);
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "❌ API indexing method failed");
-            return (false, 0);
+            return (false, 0, ex.Message);
         }
     }
 
@@ -982,12 +995,14 @@ public class CodebaseContextService
     /// <summary>
     /// Build authenticated clone URL for Azure DevOps
     /// </summary>
-    private string BuildAuthenticatedCloneUrl(string originalUrl)
+    private string BuildAuthenticatedCloneUrl(string originalUrl, string? accessTokenOverride = null)
     {
-        var pat = _adoClient.PersonalAccessToken;
-        if (string.IsNullOrEmpty(pat))
+        var preferredToken = NormalizeAdoAccessToken(accessTokenOverride);
+        var fallbackPat = _adoClient.PersonalAccessToken;
+
+        if (string.IsNullOrEmpty(preferredToken) && string.IsNullOrEmpty(fallbackPat))
         {
-            return originalUrl; // Return original URL if no PAT available
+            return originalUrl; // Return original URL if no credentials are available
         }
 
         try
@@ -1005,10 +1020,12 @@ public class CodebaseContextService
                     var organization = pathParts[0]; // "organization"
                     var project = pathParts[1]; // "project"
                     var repoPath = string.Join("/", pathParts.Skip(2)); // "_git/repository"
+                    var credentialToken = !string.IsNullOrWhiteSpace(preferredToken) ? preferredToken : fallbackPat;
+                    var credentialSource = !string.IsNullOrWhiteSpace(preferredToken) ? "X-Ado-Access-Token" : "ADO_PAT";
                     
                     // Use visualstudio.com format with username and DefaultCollection
-                    var authenticatedUrl = $"https://git:{pat}@{organization.ToLower()}.visualstudio.com/DefaultCollection/{project}/{repoPath}";
-                    _logger.LogDebug("🔐 Using authenticated clone URL for Azure DevOps (visualstudio.com format)");
+                    var authenticatedUrl = $"https://git:{credentialToken}@{organization.ToLower()}.visualstudio.com/DefaultCollection/{project}/{repoPath}";
+                    _logger.LogInformation("🔐 Using {CredentialSource} as primary clone credential for Azure DevOps", credentialSource);
                     return authenticatedUrl;
                 }
             }
@@ -1019,6 +1036,23 @@ public class CodebaseContextService
         }
 
         return originalUrl;
+    }
+
+    private static string? NormalizeAdoAccessToken(string? accessTokenOverride)
+    {
+        if (string.IsNullOrWhiteSpace(accessTokenOverride))
+        {
+            return null;
+        }
+
+        var token = accessTokenOverride.Trim();
+        const string bearerPrefix = "Bearer ";
+        if (token.StartsWith(bearerPrefix, StringComparison.OrdinalIgnoreCase))
+        {
+            token = token[bearerPrefix.Length..].Trim();
+        }
+
+        return string.IsNullOrWhiteSpace(token) ? null : token;
     }
 
     /// <summary>

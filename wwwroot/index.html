@@ -543,15 +543,12 @@
     <div id="loginContainer" class="container" style="display:none;">
         <div style="max-width: 760px; margin: 100px auto; background: #fff; padding: 40px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1);">
             <h1 style="text-align: center; margin-bottom: 30px;">🤖 Code Review Agent</h1>
-            <h2 style="font-size: 18px; margin-bottom: 20px; color: #666;">Configure Azure DevOps + Chat + Embeddings</h2>
+            <h2 style="font-size: 18px; margin-bottom: 20px; color: #666;">Sign in with Azure DevOps PAT</h2>
 
             <div id="loginError" class="error" style="display: none; margin-bottom: 20px;"></div>
 
-            <div style="margin-bottom: 20px;">
-                <label style="display: block; margin-bottom: 8px; font-weight: 600;">Organization Name:</label>
-                <input type="text" id="organizationInput" value="myorganization" placeholder="e.g., myorganization"
-                       style="width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px;">
-                <p style="font-size: 12px; color: #666; margin-top: 5px;">Your Azure DevOps organization name from the URL (dev.azure.com/<strong>organization</strong>)</p>
+            <div style="margin-bottom: 20px; padding: 12px; background: #f8f9fa; border: 1px solid #eee; border-radius: 4px; font-size: 14px;">
+                <strong>Organization:</strong> <span id="organizationFromEnv">(from environment)</span>
             </div>
 
             <div style="margin-bottom: 20px;">
@@ -562,62 +559,6 @@
                     Required scopes: <strong>Code (Read)</strong><br>
                     <a href="https://dev.azure.com/_usersSettings/tokens" target="_blank" style="color: #0078d4;">Create a new PAT</a>
                 </p>
-            </div>
-
-            <hr style="border: none; border-top: 1px solid #eee; margin: 24px 0;">
-
-            <div style="margin-bottom: 20px; font-weight: 700; color: #333;">Chat Model Configuration</div>
-
-            <div style="margin-bottom: 20px;">
-                <label style="display: block; margin-bottom: 8px; font-weight: 600;">Chat Endpoint:</label>
-                <input type="text" id="chatEndpointInput" placeholder="https://your-resource.openai.azure.com/"
-                       style="width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px;">
-            </div>
-
-            <div style="margin-bottom: 20px;">
-                <label style="display: block; margin-bottom: 8px; font-weight: 600;">Chat Deployment:</label>
-                <input type="text" id="chatDeploymentInput" value="gpt-4" placeholder="gpt-4"
-                       style="width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px;">
-            </div>
-
-            <div style="margin-bottom: 20px;">
-                <label style="display: block; margin-bottom: 8px; font-weight: 600;">Chat API Version:</label>
-                <input type="text" id="chatApiVersionInput" value="2024-02-01" placeholder="2024-02-01"
-                       style="width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px;">
-            </div>
-
-            <div style="margin-bottom: 20px;">
-                <label style="display: block; margin-bottom: 8px; font-weight: 600;">Chat API Key:</label>
-                <input type="password" id="chatApiKeyInput" placeholder="Enter your Azure OpenAI chat API key"
-                       style="width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px;">
-            </div>
-
-            <hr style="border: none; border-top: 1px solid #eee; margin: 24px 0;">
-
-            <div style="margin-bottom: 20px; font-weight: 700; color: #333;">Embedding Configuration</div>
-
-            <div style="margin-bottom: 20px;">
-                <label style="display: block; margin-bottom: 8px; font-weight: 600;">Embedding Endpoint:</label>
-                <input type="text" id="embeddingEndpointInput" placeholder="https://your-resource.openai.azure.com/"
-                       style="width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px;">
-            </div>
-
-            <div style="margin-bottom: 20px;">
-                <label style="display: block; margin-bottom: 8px; font-weight: 600;">Embedding Deployment:</label>
-                <input type="text" id="embeddingDeploymentInput" value="text-embedding-3-large" placeholder="text-embedding-3-large"
-                       style="width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px;">
-            </div>
-
-            <div style="margin-bottom: 20px;">
-                <label style="display: block; margin-bottom: 8px; font-weight: 600;">Embedding API Version:</label>
-                <input type="text" id="embeddingApiVersionInput" value="2024-12-01-preview" placeholder="2024-12-01-preview"
-                       style="width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px;">
-            </div>
-
-            <div style="margin-bottom: 20px;">
-                <label style="display: block; margin-bottom: 8px; font-weight: 600;">Embedding API Key:</label>
-                <input type="password" id="embeddingApiKeyInput" placeholder="Enter your Azure OpenAI embedding API key"
-                       style="width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px;">
             </div>
 
             <button id="loginBtn" onclick="validateAndLogin()" style="width: 100%; padding: 12px; font-size: 16px;">
@@ -715,31 +656,7 @@
 
                 // Populate form with defaults
                 if (status.organization) {
-                    document.getElementById('organizationInput').value = status.organization;
-                }
-
-                if (status.embeddingEndpoint) {
-                    document.getElementById('embeddingEndpointInput').value = status.embeddingEndpoint;
-                }
-
-                if (status.embeddingDeployment) {
-                    document.getElementById('embeddingDeploymentInput').value = status.embeddingDeployment;
-                }
-
-                if (status.embeddingApiVersion) {
-                    document.getElementById('embeddingApiVersionInput').value = status.embeddingApiVersion;
-                }
-
-                if (status.chatEndpoint) {
-                    document.getElementById('chatEndpointInput').value = status.chatEndpoint;
-                }
-
-                if (status.chatDeployment) {
-                    document.getElementById('chatDeploymentInput').value = status.chatDeployment;
-                }
-
-                if (status.chatApiVersion) {
-                    document.getElementById('chatApiVersionInput').value = status.chatApiVersion;
+                    document.getElementById('organizationFromEnv').textContent = status.organization;
                 }
 
                 // Show login page - don't auto-login to avoid proxy timing issues
@@ -749,11 +666,11 @@
                 // If already configured, show a different message
                 if (status.isConfigured && status.organization && status.chatIsConfigured && status.embeddingIsConfigured) {
                     document.getElementById('loginBtn').textContent = 'Continue with Saved Credentials';
-                    console.log('Credentials loaded from .env file. Click "Continue" to proceed.');
+                    console.log('Credentials loaded from environment. Enter PAT and continue.');
                 }
 
                 if (status.hasDefaultPat && status.hasDefaultChatApiKey && status.hasDefaultEmbeddingApiKey) {
-                    console.log('Environment contains PAT, chat API key, and embedding API key. You can paste/update values and continue.');
+                    console.log('Environment contains default credentials. Enter PAT and continue.');
                 }
                 
             } catch (error) {
@@ -764,22 +681,13 @@
         }
 
         async function validateAndLogin() {
-            const organization = document.getElementById('organizationInput').value.trim();
             const pat = document.getElementById('patInput').value.trim();
-            const chatEndpoint = document.getElementById('chatEndpointInput').value.trim();
-            const chatApiKey = document.getElementById('chatApiKeyInput').value.trim();
-            const chatDeployment = document.getElementById('chatDeploymentInput').value.trim();
-            const chatApiVersion = document.getElementById('chatApiVersionInput').value.trim();
-            const embeddingEndpoint = document.getElementById('embeddingEndpointInput').value.trim();
-            const embeddingApiKey = document.getElementById('embeddingApiKeyInput').value.trim();
-            const embeddingDeployment = document.getElementById('embeddingDeploymentInput').value.trim();
-            const embeddingApiVersion = document.getElementById('embeddingApiVersionInput').value.trim();
             const loginBtn = document.getElementById('loginBtn');
             const loginError = document.getElementById('loginError');
 
             // Validate inputs
-            if (!organization || !pat || !chatEndpoint || !chatApiKey || !chatDeployment || !embeddingEndpoint || !embeddingApiKey || !embeddingDeployment) {
-                showLoginError('Please fill in organization, PAT, chat endpoint/deployment/api key, and embedding endpoint/deployment/api key');
+            if (!pat) {
+                showLoginError('Please enter Personal Access Token (PAT)');
                 return;
             }
 
@@ -792,16 +700,7 @@
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
-                        organization: organization,
-                        personalAccessToken: pat,
-                        chatEndpoint: chatEndpoint,
-                        chatApiKey: chatApiKey,
-                        chatDeployment: chatDeployment,
-                        chatApiVersion: chatApiVersion,
-                        embeddingEndpoint: embeddingEndpoint,
-                        embeddingApiKey: embeddingApiKey,
-                        embeddingDeployment: embeddingDeployment,
-                        embeddingApiVersion: embeddingApiVersion
+                        personalAccessToken: pat
                     })
                 });
 
@@ -811,7 +710,7 @@
                     // Success - switch to main app
                     document.getElementById('loginContainer').style.display = 'none';
                     document.getElementById('mainContainer').style.display = 'block';
-                    document.getElementById('currentOrg').textContent = organization;
+                    document.getElementById('currentOrg').textContent = result.organization || document.getElementById('organizationFromEnv').textContent;
                     await loadProjects();
                 } else {
                     showLoginError(result.error || 'Failed to validate credentials');
@@ -835,16 +734,7 @@
                 await fetch('/api/CodeReview/config/clear', { method: 'POST' });
                 document.getElementById('mainContainer').style.display = 'none';
                 document.getElementById('loginContainer').style.display = 'block';
-                document.getElementById('organizationInput').value = 'myorganization';
                 document.getElementById('patInput').value = '';
-                document.getElementById('chatEndpointInput').value = '';
-                document.getElementById('chatApiKeyInput').value = '';
-                document.getElementById('chatDeploymentInput').value = 'gpt-4';
-                document.getElementById('chatApiVersionInput').value = '2024-02-01';
-                document.getElementById('embeddingEndpointInput').value = '';
-                document.getElementById('embeddingApiKeyInput').value = '';
-                document.getElementById('embeddingDeploymentInput').value = 'text-embedding-3-large';
-                document.getElementById('embeddingApiVersionInput').value = '2024-12-01-preview';
             } catch (error) {
                 console.error('Error logging out:', error);
             }
@@ -864,6 +754,14 @@
                     option.textContent = project.displayName;
                     projectSelect.appendChild(option);
                 });
+
+                // Default to SCC on first screen as requested.
+                const defaultProject = projects.find(p => p.name === 'SCC');
+                if (defaultProject) {
+                    projectSelect.value = 'SCC';
+                    selectedProject = 'SCC';
+                    await onProjectChange();
+                }
             } catch (error) {
                 showError('Failed to load projects: ' + error.message);
             }
