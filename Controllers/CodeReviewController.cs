@@ -243,6 +243,7 @@ public class CodeReviewController : ControllerBase
                 var highPriorityComments = reviewOutput.Comments
                     .Where(IsHighPriorityComment)
                     .ToList();
+                var validRightSideLinesByFile = BuildValidRightSideLineLookup(reviewOutput.Files);
                 var existingFingerprints = await _adoClient.GetExistingCommentFingerprintsAsync(
                     reviewOutput.Project,
                     reviewOutput.Repository,
@@ -257,17 +258,30 @@ public class CodeReviewController : ControllerBase
                 var postingFailures = new List<ReviewPostingFailure>();
                 foreach (var comment in highPriorityComments)
                 {
-                    var fingerprint = AzureDevOpsRestClient.BuildCommentFingerprint(comment);
-                    var positionKey = AzureDevOpsRestClient.BuildCommentPositionKey(comment);
+                    var commentToPost = CloneComment(comment);
+                    var remappedLine = RemapToNearestValidRightSideLine(commentToPost, validRightSideLinesByFile);
+                    if (remappedLine.HasValue)
+                    {
+                        _logger.LogInformation(
+                            "Adjusted comment line anchor for PR {PullRequestId} at {FilePath} from {OriginalLine} to {MappedLine}",
+                            reviewOutput.PullRequestId,
+                            commentToPost.FilePath,
+                            comment.LineNumber,
+                            remappedLine.Value);
+                    }
+
+                    var fingerprint = AzureDevOpsRestClient.BuildCommentFingerprint(commentToPost);
+                    var positionKey = AzureDevOpsRestClient.BuildCommentPositionKey(commentToPost);
                     if (existingFingerprints.Contains(fingerprint) || existingPositionKeys.Contains(positionKey))
                     {
                         skippedCount++;
                         comment.Posted = true;
+                        comment.LineNumber = commentToPost.LineNumber;
                         _logger.LogInformation(
                             "Skipping duplicate high-priority comment for PR {PullRequestId} at {FilePath}:{LineNumber}",
                             reviewOutput.PullRequestId,
-                            comment.FilePath,
-                            comment.LineNumber);
+                            commentToPost.FilePath,
+                            commentToPost.LineNumber);
                         continue;
                     }
 
@@ -275,12 +289,13 @@ public class CodeReviewController : ControllerBase
                         reviewOutput.Project,
                         reviewOutput.Repository,
                         reviewOutput.PullRequestId,
-                        comment,
+                        commentToPost,
                         adoAccessTokenOverride);
 
                     if (postResult.Success)
                     {
                         comment.Posted = true;
+                        comment.LineNumber = commentToPost.LineNumber;
                         postedCount++;
                         existingFingerprints.Add(fingerprint);
                         existingPositionKeys.Add(positionKey);
@@ -290,8 +305,8 @@ public class CodeReviewController : ControllerBase
                         postingFailures.Add(new ReviewPostingFailure
                         {
                             CommentId = comment.Id,
-                            FilePath = comment.FilePath,
-                            LineNumber = comment.LineNumber,
+                            FilePath = commentToPost.FilePath,
+                            LineNumber = commentToPost.LineNumber,
                             Severity = comment.Severity,
                             Stage = postResult.Stage,
                             StatusCode = postResult.StatusCode,
@@ -301,8 +316,8 @@ public class CodeReviewController : ControllerBase
                         _logger.LogWarning(
                             "Failed to post high-priority comment for PR {PullRequestId} at {FilePath}:{LineNumber}. Stage={Stage}, StatusCode={StatusCode}, Error={Error}",
                             reviewOutput.PullRequestId,
-                            comment.FilePath,
-                            comment.LineNumber,
+                            commentToPost.FilePath,
+                            commentToPost.LineNumber,
                             postResult.Stage,
                             postResult.StatusCode,
                             postResult.ErrorMessage);
@@ -987,6 +1002,7 @@ public class CodeReviewController : ControllerBase
             Project = parsed.Project,
             Repository = parsed.Repository,
             PullRequestId = parsed.PullRequestId,
+            Files = files,
             Comments = comments
         };
     }
@@ -996,6 +1012,140 @@ public class CodeReviewController : ControllerBase
         var severity = comment.Severity?.Trim();
         return string.Equals(severity, "high", StringComparison.OrdinalIgnoreCase)
             || string.Equals(severity, "critical", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static CodeReviewComment CloneComment(CodeReviewComment comment)
+    {
+        return new CodeReviewComment
+        {
+            Id = comment.Id,
+            FilePath = comment.FilePath,
+            LineNumber = comment.LineNumber,
+            CommentText = comment.CommentText,
+            CommentType = comment.CommentType,
+            Severity = comment.Severity,
+            Posted = comment.Posted
+        };
+    }
+
+    private static int? RemapToNearestValidRightSideLine(
+        CodeReviewComment comment,
+        Dictionary<string, List<int>> validRightSideLinesByFile)
+    {
+        var normalizedPath = NormalizePath(comment.FilePath);
+        if (string.IsNullOrWhiteSpace(normalizedPath))
+        {
+            return null;
+        }
+
+        if (!validRightSideLinesByFile.TryGetValue(normalizedPath, out var validLines) || validLines.Count == 0)
+        {
+            return null;
+        }
+
+        var requestedLine = comment.LineNumber > 0 ? comment.LineNumber : 1;
+        if (validLines.BinarySearch(requestedLine) >= 0)
+        {
+            return null;
+        }
+
+        var mappedLine = validLines
+            .OrderBy(line => Math.Abs(line - requestedLine))
+            .ThenBy(line => line)
+            .First();
+
+        comment.LineNumber = mappedLine;
+        return mappedLine;
+    }
+
+    private static Dictionary<string, List<int>> BuildValidRightSideLineLookup(List<PullRequestFile> files)
+    {
+        var lookup = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var file in files)
+        {
+            var normalizedPath = NormalizePath(file.Path);
+            if (string.IsNullOrWhiteSpace(normalizedPath))
+            {
+                continue;
+            }
+
+            var lines = ExtractRightSideLinesFromUnifiedDiff(file.UnifiedDiff);
+            if (lines.Count == 0)
+            {
+                continue;
+            }
+
+            lookup[normalizedPath] = lines;
+        }
+
+        return lookup;
+    }
+
+    private static List<int> ExtractRightSideLinesFromUnifiedDiff(string? unifiedDiff)
+    {
+        var lines = new SortedSet<int>();
+        if (string.IsNullOrWhiteSpace(unifiedDiff))
+        {
+            return lines.ToList();
+        }
+
+        var currentRightLine = 0;
+        var inHunk = false;
+        var diffLines = unifiedDiff.Split('\n');
+
+        foreach (var rawLine in diffLines)
+        {
+            var line = rawLine.TrimEnd('\r');
+
+            if (line.StartsWith("@@", StringComparison.Ordinal))
+            {
+                var match = Regex.Match(line, "@@ -\\d+(?:,\\d+)? \\+(?<start>\\d+)(?:,\\d+)? @@");
+                if (!match.Success)
+                {
+                    inHunk = false;
+                    continue;
+                }
+
+                currentRightLine = int.Parse(match.Groups["start"].Value);
+                inHunk = true;
+                continue;
+            }
+
+            if (!inHunk)
+            {
+                continue;
+            }
+
+            if (line.StartsWith("+", StringComparison.Ordinal) && !line.StartsWith("+++", StringComparison.Ordinal))
+            {
+                lines.Add(currentRightLine);
+                currentRightLine++;
+                continue;
+            }
+
+            if (line.StartsWith("-", StringComparison.Ordinal) && !line.StartsWith("---", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            lines.Add(currentRightLine);
+            currentRightLine++;
+        }
+
+        return lines.ToList();
+    }
+
+    private static string NormalizePath(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return string.Empty;
+        }
+
+        return path.StartsWith("/", StringComparison.Ordinal)
+            ? path
+            : "/" + path;
     }
 
     private string? GetOptionalAdoAccessTokenHeader()
@@ -1078,6 +1228,7 @@ public class ReviewByLinkExecutionResult
     public string Project { get; set; } = string.Empty;
     public string Repository { get; set; } = string.Empty;
     public int PullRequestId { get; set; }
+    public List<PullRequestFile> Files { get; set; } = new();
     public List<CodeReviewComment> Comments { get; set; } = new();
 }
 
