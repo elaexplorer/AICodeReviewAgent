@@ -46,3 +46,6 @@ tmp-review-*.json
 last-review-by-link-and-post-response*.json
 response-dedupe-run.json
 remote-test-output.txt
+local-pr-*.json
+FOUNDRY_AGENT_CARD.md
+pp.xml

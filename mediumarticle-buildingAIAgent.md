@@ -88,10 +88,11 @@ flowchart TD
     I1 --> I2[Cosine Similarity Search]
     I2 --> I3[Context Ranking & Fusion]
     
-    H --> J[Azure DevOps MCP]
+    B --> J[Azure DevOps MCP]
+    J --> J1[PR Metadata & Changes]
     
     I3 --> K[Relevant Code Context]
-    J --> L[PR Metadata & Changes]
+    J1 --> L[PR Metadata & Changes]
     
     K --> M[Enhanced Review Context]
     L --> M
@@ -108,6 +109,11 @@ flowchart TD
         I1
         I2
         I3
+    end
+
+    subgraph MCP Integration
+        J
+        J1
     end
 ```
 
@@ -180,56 +186,61 @@ Our Code Review Agent demonstrates all these capabilities through a sophisticate
 - **Configuration-Driven**: Agents behavior can be tuned without code changes
 - **Testing Isolation**: Each component can be tested independently
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Microsoft AI Agent Framework                  │
-│                         (Orchestration Layer)                   │
-└─────────────────────┬───────────────────────────────────────────┘
-                      │
-        ┌─────────────┼─────────────┬─────────────────────────────┐
-        │             │             │                             │
-   ┌────▼──────┐ ┌───▼──────┐ ┌────▼──────┐            ┌─────────▼─────────┐
-   │ DotNet    │ │ Python   │ │   Rust    │            │ RAG Pipeline      │
-   │ Agent     │ │ Agent    │ │   Agent   │            │ & Context Service │
-   └─────┬─────┘ └─────┬────┘ └─────┬─────┘            └─────────┬─────────┘
-         │             │            │                            │
-         └─────────────┼────────────┴──────────┐                │
-                       │                       │                │
-              ┌────────▼────────┐              │                │
-              │ Azure DevOps    │              │                │
-              │ MCP Integration │              │                │
-              └─────────────────┘              │                │
-                                               │                │
-              ┌─────────────────────────────────────────────────▼─┐
-              │              RAG IMPLEMENTATION                    │
-              │                                                   │
-              │  ┌──────────────┐    ┌─────────────────────────┐  │
-              │  │ Repository   │    │ Embedding Generation    │  │
-              │  │ Indexing     ├────┤ (OpenAI/Azure OpenAI)   │  │
-              │  │              │    │ text-embedding-3-large  │  │
-              │  └──────────────┘    └─────────────────────────┘  │
-              │           │                        │              │
-              │           ▼                        ▼              │
-              │  ┌──────────────┐    ┌─────────────────────────┐  │
-              │  │ File         │    │ Vector Storage          │  │
-              │  │ Chunking     │    │ • In-Memory Collections │  │
-              │  │ Strategy     │    │ • Pinecone (Production) │  │
-              │  └──────────────┘    │ • Qdrant (Self-hosted)  │  │
-              │                      └─────────────────────────┘  │
-              │                                 │                 │
-              │                                 ▼                 │
-              │        ┌─────────────────────────────────────┐    │
-              │        │ Semantic Search & Retrieval         │    │
-              │        │ • Cosine Similarity Matching        │    │
-              │        │ • Contextual Ranking                │    │
-              │        │ • Multi-vector Fusion               │    │
-              │        └─────────────────────────────────────┘    │
-              └─────────────────────────────────────────────────────┘
-                                       │
-                            ┌─────────▼─────────┐
-                            │ Enhanced Context  │
-                            │ for Code Review   │
-                            └───────────────────┘
+```mermaid
+flowchart TB
+    U[PR Review Request]
+
+    subgraph L1[Orchestration Layer]
+        O[Code Review Orchestrator]
+    end
+
+    subgraph L2[Specialized Review Agents]
+        A1[DotNet Agent]
+        A2[Python Agent]
+        A3[Rust Agent]
+        A4[General Agent]
+    end
+
+    subgraph L3[Integration Layer - MCP]
+        M1[Azure DevOps MCP Client]
+        M2[PR Metadata + File Diffs]
+        M3[Comment Posting API]
+    end
+
+    subgraph L4[Knowledge Layer - RAG]
+        R1[Repository Indexing]
+        R2[Chunking + Embeddings]
+        R3[Vector Store]
+        R4[Semantic Retrieval + Ranking]
+    end
+
+    subgraph L5[Review Synthesis]
+        S1[Context Fusion]
+        S2[Structured Findings]
+    end
+
+    U --> O
+    O --> A1
+    O --> A2
+    O --> A3
+    O --> A4
+
+    O --> M1
+    M1 --> M2
+
+    A1 --> R4
+    A2 --> R4
+    A3 --> R4
+    A4 --> R4
+
+    R1 --> R2
+    R2 --> R3
+    R3 --> R4
+
+    R4 --> S1
+    M2 --> S1
+    S1 --> S2
+    S2 --> M3
 ```
 
 ## Part 1: Microsoft AI Agent Framework Integration
