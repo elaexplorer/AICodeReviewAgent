@@ -189,18 +189,18 @@ public class CodeReviewOrchestrator
 
         var results = await Task.WhenAll(reviewTasks);
         overallStopwatch.Stop();
-        
+
         var allComments = results.SelectMany(comments => comments).ToList();
-        
+
         _logger.LogInformation("╔════════════════════════════════════════════════════════════╗");
         _logger.LogInformation("║ PARALLEL PROCESSING COMPLETE                              ║");
         _logger.LogInformation("╚════════════════════════════════════════════════════════════╝");
-        _logger.LogInformation("⏱️  Total parallel processing time: {TotalMs}ms ({TotalSec:F2} seconds)", 
+        _logger.LogInformation("⏱️  Total parallel processing time: {TotalMs}ms ({TotalSec:F2} seconds)",
             overallStopwatch.ElapsedMilliseconds, overallStopwatch.Elapsed.TotalSeconds);
         _logger.LogInformation("📊 Processing results:");
         _logger.LogInformation("   Files processed: {FileCount}", files.Count);
         _logger.LogInformation("   Total comments generated: {CommentCount}", allComments.Count);
-        _logger.LogInformation("   Average time per file: {AvgMs}ms", 
+        _logger.LogInformation("   Average time per file: {AvgMs}ms",
             files.Count > 0 ? overallStopwatch.ElapsedMilliseconds / files.Count : 0);
 
         if (!failures.IsEmpty)
@@ -216,7 +216,19 @@ public class CodeReviewOrchestrator
             throw new InvalidOperationException(
                 $"Code review failed for all files. {errorDetails}. Check LLM chat credentials/configuration and retry.");
         }
-        
+
+        // Cross-file analysis — only worth running when there are multiple changed files
+        var reviewableFiles = files.Where(f => !IsGeneratedFile(f) && !string.IsNullOrEmpty(Path.GetExtension(f.Path))).ToList();
+        if (reviewableFiles.Count > 1)
+        {
+            var crossFileComments = await RunCrossFileAnalysisAsync(reviewableFiles, codebaseContext);
+            if (crossFileComments.Count > 0)
+            {
+                _logger.LogInformation("🔗 Cross-file analysis added {Count} additional comments", crossFileComments.Count);
+                allComments.AddRange(crossFileComments);
+            }
+        }
+
         return allComments;
     }
 
@@ -269,6 +281,170 @@ public class CodeReviewOrchestrator
         "low"      => 1,
         _          => 0
     };
+
+    /// <summary>
+    /// Runs a single LLM pass across all changed file diffs together to find
+    /// cross-file consistency issues: renamed constants not updated in callers,
+    /// new config keys missing from YAML, interface changes without implementation
+    /// updates, missing test coverage for newly added methods, etc.
+    /// </summary>
+    private async Task<List<CodeReviewComment>> RunCrossFileAnalysisAsync(
+        List<PullRequestFile> files,
+        string codebaseContext)
+    {
+        const int MaxDiffCharsPerFile = 3_000;
+
+        try
+        {
+            _logger.LogInformation("🔗 Starting cross-file analysis across {FileCount} files", files.Count);
+
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine("The following files were all changed together in one pull request.");
+            sb.AppendLine("Each file's unified diff is shown below.");
+            sb.AppendLine();
+
+            foreach (var file in files)
+            {
+                sb.AppendLine($"### {file.Path} ({file.ChangeType})");
+                var diff = file.UnifiedDiff ?? file.Content ?? string.Empty;
+                if (diff.Length > MaxDiffCharsPerFile)
+                    diff = diff[..MaxDiffCharsPerFile] + "\n[truncated]";
+                sb.AppendLine("```diff");
+                sb.AppendLine(diff);
+                sb.AppendLine("```");
+                sb.AppendLine();
+            }
+
+            var fileList = string.Join(", ", files.Select(f => f.Path));
+
+            var prompt = $$$"""
+                You are a senior code reviewer performing a CROSS-FILE consistency analysis.
+                Your job is to find issues that ONLY become visible when looking at multiple changed files together.
+
+                Changed files in this PR:
+                {{{fileList}}}
+
+                {{{sb}}}
+
+                Codebase Context:
+                {{{codebaseContext}}}
+
+                CROSS-FILE ISSUES TO LOOK FOR:
+                1. **Renamed/removed constants or types** used in one changed file but not updated in another changed file
+                2. **New config keys or settings** added in a C# config class but missing from the corresponding YAML/JSON settings file (or vice versa)
+                3. **Interface or API changes** in one file whose callers in other changed files are not updated
+                4. **New public methods or behaviours** added in a source file but not covered by tests in the corresponding test file
+                5. **Inconsistent values** — the same literal value hardcoded differently across multiple changed files that should share a constant
+                6. **Missing paired changes** — e.g. a feature flag added in code but not in the feature flag config file
+
+                IMPORTANT RULES:
+                - ONLY report issues that require looking at MORE THAN ONE file to detect. Do not repeat single-file issues.
+                - For each issue, set "filePath" to the file that should receive the comment (the one missing the update, or the most relevant file).
+                - Set startLine/endLine to the relevant line numbers in that file (use 1 if the issue is file-level with no specific line).
+                - Be conservative — only report issues you are confident about (confidence >= 0.7).
+
+                Return a JSON array (empty array [] if no cross-file issues found):
+                [
+                  {
+                    "filePath": "path/to/file.cs",
+                    "startLine": 42,
+                    "endLine": 42,
+                    "severity": "high",
+                    "type": "issue",
+                    "comment": "Clear explanation referencing both files involved",
+                    "suggestedFix": "Concrete fix",
+                    "confidence": 0.85
+                  }
+                ]
+                """;
+
+            var messages = new List<ChatMessage>
+            {
+                new(ChatRole.System, "You are a senior code reviewer specialising in cross-file consistency analysis."),
+                new(ChatRole.User, prompt)
+            };
+
+            _logger.LogInformation("📤 Cross-file analysis prompt: {Chars} chars across {Files} files", prompt.Length, files.Count);
+
+            var stopwatch = Stopwatch.StartNew();
+            var response = await _chatClient.GetResponseAsync(messages);
+            stopwatch.Stop();
+
+            var responseText = response.Text ?? "[]";
+            _logger.LogInformation("📥 Cross-file analysis response: {Chars} chars in {Ms}ms", responseText.Length, stopwatch.ElapsedMilliseconds);
+            _logger.LogInformation("📝 Cross-file LLM response:\n{Response}", responseText);
+
+            return ParseCrossFileComments(responseText, files);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error in cross-file analysis");
+            return [];
+        }
+    }
+
+    private List<CodeReviewComment> ParseCrossFileComments(string jsonResponse, List<PullRequestFile> files)
+    {
+        try
+        {
+            jsonResponse = ExtractJsonPayload(jsonResponse);
+            var validPaths = new HashSet<string>(files.Select(f => f.Path), StringComparer.OrdinalIgnoreCase);
+
+            var options = new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+            var parsed = System.Text.Json.JsonSerializer.Deserialize<List<CrossFileCommentJson>>(jsonResponse, options)
+                ?? [];
+
+            var comments = new List<CodeReviewComment>();
+            foreach (var c in parsed)
+            {
+                var filePath = c.FilePath ?? string.Empty;
+
+                // Accept exact match or longest suffix match against known file paths
+                if (!validPaths.Contains(filePath))
+                {
+                    filePath = files.Select(f => f.Path)
+                        .FirstOrDefault(p => p.EndsWith(filePath.TrimStart('/'), StringComparison.OrdinalIgnoreCase))
+                        ?? filePath;
+                }
+
+                var confidence = c.Confidence is > 0.0 and <= 1.0 ? c.Confidence : 1.0;
+                if (confidence < 0.7) continue;
+
+                var sl = c.StartLine > 0 ? c.StartLine : 1;
+                comments.Add(new CodeReviewComment
+                {
+                    FilePath = filePath,
+                    StartLine = sl,
+                    EndLine = c.EndLine >= sl ? c.EndLine : sl,
+                    Severity = c.Severity?.ToLower() ?? "medium",
+                    CommentType = c.Type?.ToLower() ?? "issue",
+                    CommentText = $"[Cross-file] {c.Comment ?? string.Empty}",
+                    SuggestedFix = c.SuggestedFix ?? string.Empty,
+                    Confidence = confidence
+                });
+            }
+
+            _logger.LogInformation("✅ Cross-file analysis: {Count} comments after confidence filter", comments.Count);
+            return comments;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error parsing cross-file analysis response");
+            return [];
+        }
+    }
+
+    private class CrossFileCommentJson
+    {
+        public string? FilePath { get; set; }
+        public int StartLine { get; set; }
+        public int EndLine { get; set; }
+        public string? Severity { get; set; }
+        public string? Type { get; set; }
+        public string? Comment { get; set; }
+        public string? SuggestedFix { get; set; }
+        public double Confidence { get; set; }
+    }
 
     /// <summary>
     /// General review for files without specialized agents
