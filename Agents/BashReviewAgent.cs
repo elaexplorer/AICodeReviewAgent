@@ -1,4 +1,3 @@
-using System.ComponentModel;
 using System.Diagnostics;
 using CodeReviewAgent.Models;
 using CodeReviewAgent.Services;
@@ -9,44 +8,43 @@ using Microsoft.Agents.AI;
 namespace CodeReviewAgent.Agents;
 
 /// <summary>
-/// Rust code review expert agent using Microsoft.Agents.AI
+/// Shell/script/YAML code review expert agent using Microsoft.Agents.AI
 /// </summary>
-public class RustReviewAgent : ILanguageReviewAgent
+public class BashReviewAgent : ILanguageReviewAgent
 {
-    private readonly ILogger<RustReviewAgent> _logger;
+    private readonly ILogger<BashReviewAgent> _logger;
     private readonly AIAgent _agent;
 
-    public string Language => "Rust";
-    public string[] FileExtensions => new[] { ".rs", ".toml" };
+    public string Language => "Bash";
+    public string[] FileExtensions => new[] { ".sh", ".bash", ".ps1", ".psm1", ".psd1", ".yaml", ".yml" };
 
-    public RustReviewAgent(
-        ILogger<RustReviewAgent> logger,
+    public BashReviewAgent(
+        ILogger<BashReviewAgent> logger,
         IChatClient chatClient)
     {
         _logger = logger;
 
-        // Create ChatClientAgent with specialized instructions
         _agent = new ChatClientAgent(
             chatClient,
             instructions: """
-                You are an expert Rust code reviewer with deep knowledge of:
-                - Rust best practices and idioms
-                - Ownership, borrowing, and lifetime rules
-                - Memory safety and zero-cost abstractions
-                - Common Rust security patterns
-                - Performance optimization techniques
-                - Error handling (Result, Option, panic)
-                - Concurrency and thread safety (Send, Sync)
-                - Popular Rust frameworks (tokio, actix, serde, etc.)
-                - Cargo and dependency management
+                You are an expert reviewer of shell scripts, PowerShell scripts, and YAML configuration files with deep knowledge of:
+                - Bash/shell scripting best practices and POSIX compliance
+                - PowerShell scripting, modules, and cmdlet design
+                - YAML structure, anchors, and common pitfalls
+                - CI/CD pipeline definitions (Azure Pipelines, GitHub Actions, GitLab CI)
+                - Kubernetes and Helm manifests
+                - Infrastructure-as-code patterns (Bicep, Terraform YAML blocks)
+                - Secret and credential handling in scripts and pipelines
+                - Error handling, exit codes, and signal trapping in shell scripts
+                - Injection vulnerabilities in scripts (command injection, argument injection)
 
                 CRITICAL RULES:
                 1. ONLY comment on lines marked with '+' in the diff (new/modified lines)
                 2. DO NOT comment on lines marked with '-' (removed lines) or context lines
-                3. Each '+' line has an [Lxx] tag showing its actual line number in the file — e.g. +[L42] fn foo() {
+                3. Each '+' line has an [Lxx] tag showing its actual line number in the file — e.g. +[L42] echo "hello"
                 4. 'startLine' MUST be the [Lxx] number of the first '+' line of the issue; 'endLine' MUST be the [Lxx] number of the last '+' line of the issue (same as startLine for single-line issues)
                 5. Provide your response as a JSON array of review comments
-                6. DO NOT flag style, naming conventions, whitespace, formatting, missing doc comments, or anything a linter/formatter (e.g. clippy, rustfmt) would catch automatically. Only report issues that carry real risk: bugs, security vulnerabilities, performance problems, compliance violations, or missing critical test coverage. Use "nitpick" sparingly and only when it prevents genuine confusion — not for cosmetic preferences.
+                6. DO NOT flag style, formatting, whitespace, naming conventions, or anything a linter (e.g. shellcheck, PSScriptAnalyzer, yamllint) would catch automatically. Only report issues that carry real risk: bugs, security vulnerabilities, incorrect behaviour, missing error handling for critical paths, or compliance violations. Use "nitpick" sparingly and only when it prevents genuine confusion.
 
                 Severity values — choose exactly one:
                 - "critical" : security vulnerability, data loss, crash, or auth bypass — MUST fix before merge
@@ -85,7 +83,7 @@ public class RustReviewAgent : ILanguageReviewAgent
 
                 If no issues are found, return an empty array: []
                 """,
-            name: "RustReviewAgent");
+            name: "BashReviewAgent");
     }
 
     public async Task<List<CodeReviewComment>> ReviewFileAsync(
@@ -94,10 +92,18 @@ public class RustReviewAgent : ILanguageReviewAgent
     {
         try
         {
-            _logger.LogInformation("Reviewing Rust file: {FilePath}", file.Path);
+            _logger.LogInformation("Reviewing shell/script/YAML file: {FilePath}", file.Path);
+
+            var ext = Path.GetExtension(file.Path).ToLowerInvariant();
+            var langLabel = ext switch
+            {
+                ".ps1" or ".psm1" or ".psd1" => "powershell",
+                ".yaml" or ".yml" => "yaml",
+                _ => "bash"
+            };
 
             var prompt = $$$"""
-                Review ONLY THE CHANGES in the following Rust file from a pull request.
+                Review ONLY THE CHANGES in the following {{{langLabel}}} file from a pull request.
 
                 File Path: {{{file.Path}}}
                 Change Type: {{{file.ChangeType}}}
@@ -112,7 +118,7 @@ public class RustReviewAgent : ILanguageReviewAgent
                 ========================================
                 FULL FILE CONTENT (FOR CONTEXT ONLY - DO NOT REVIEW):
                 ========================================
-                ```rust
+                ```{{{langLabel}}}
                 {{{file.Content}}}
                 ```
 
@@ -120,7 +126,7 @@ public class RustReviewAgent : ILanguageReviewAgent
                 ========================================
                 PREVIOUS FILE CONTENT (FOR CONTEXT ONLY - DO NOT REVIEW):
                 ========================================
-                ```rust
+                ```{langLabel}
                 {file.PreviousContent}
                 ```
                 ")}}}
@@ -129,20 +135,19 @@ public class RustReviewAgent : ILanguageReviewAgent
                 {{{codebaseContext}}}
 
                 Provide a thorough code review focusing on:
-                1. **Security Issues**: Unsafe code blocks, buffer overflows, integer overflows, race conditions
-                2. **Memory Safety**: Improper use of unsafe, lifetime issues, use-after-free potential
-                3. **Bugs**: Logic errors, panic conditions, incorrect error handling, unwrap usage
-                4. **Performance**: Unnecessary cloning, inefficient algorithms, blocking operations
-                5. **Best Practices**: Proper error propagation, idiomatic Rust patterns, documentation
-                6. **Rust-Specific**: Ownership patterns, trait implementations, lifetime annotations, macro usage
+                1. **Security Issues**: Command injection, hardcoded secrets/tokens, insecure permissions (chmod 777), unquoted variables, path traversal
+                2. **Bugs**: Uninitialized variables, missing exit-code checks, incorrect quoting, broken error trapping, logic errors
+                3. **Reliability**: Missing `set -euo pipefail` (bash), lack of error handling, unchecked return values, race conditions
+                4. **Secrets & Compliance**: Credentials, tokens, or PII in plain text; missing secret-masking in pipelines
+                5. **YAML/Pipeline-Specific**: Incorrect indentation semantics, missing `needs`/`depends_on`, exposed environment variables, unsafe `eval`/`Invoke-Expression` usage
+                6. **PowerShell-Specific**: Use of `Invoke-Expression`, missing `ErrorActionPreference`, unsafe parameter handling
                 """;
 
-            // Log LLM request details
             _logger.LogInformation("╔════════════════════════════════════════════════════════════╗");
-            _logger.LogInformation("║ LLM REQUEST: Rust Code Review Agent                        ║");
+            _logger.LogInformation("║ LLM REQUEST: Bash/Script Code Review Agent                 ║");
             _logger.LogInformation("╚════════════════════════════════════════════════════════════╝");
             _logger.LogInformation("📤 SENDING TO LLM:");
-            _logger.LogInformation("   Agent: {AgentName}", "RustReviewAgent");
+            _logger.LogInformation("   Agent: {AgentName}", "BashReviewAgent");
             _logger.LogInformation("   File: {FilePath}", file.Path);
             _logger.LogInformation("   Prompt length: {Length} chars", prompt.Length);
             _logger.LogInformation("   Diff length: {DiffLength} chars", file.UnifiedDiff?.Length ?? 0);
@@ -151,23 +156,20 @@ public class RustReviewAgent : ILanguageReviewAgent
             _logger.LogInformation("   Codebase context length: {ContextLength} chars", codebaseContext?.Length ?? 0);
             _logger.LogInformation("📝 FULL PROMPT:\n{Prompt}", prompt);
 
-            // Use AIAgent.RunAsync to execute the agent
             var stopwatch = Stopwatch.StartNew();
             var response = await _agent.RunAsync(prompt);
             stopwatch.Stop();
 
             var responseText = response.Text;
 
-            // Log LLM response details
             _logger.LogInformation("╔════════════════════════════════════════════════════════════╗");
-            _logger.LogInformation("║ LLM RESPONSE: Rust Code Review Agent                       ║");
+            _logger.LogInformation("║ LLM RESPONSE: Bash/Script Code Review Agent                ║");
             _logger.LogInformation("╚════════════════════════════════════════════════════════════╝");
             _logger.LogInformation("📥 RECEIVED FROM LLM:");
             _logger.LogInformation("   Response length: {Length} chars", responseText?.Length ?? 0);
             _logger.LogInformation("   ⏱️  Time taken: {ElapsedMs} ms ({ElapsedSec:F2} seconds)",
                 stopwatch.ElapsedMilliseconds, stopwatch.Elapsed.TotalSeconds);
 
-            // Log token usage if available
             if (response.Usage != null)
             {
                 _logger.LogInformation("📊 TOKEN USAGE:");
@@ -176,7 +178,6 @@ public class RustReviewAgent : ILanguageReviewAgent
                 _logger.LogInformation("   Total tokens: {TotalTokens}",
                     (response.Usage.InputTokenCount ?? 0) + (response.Usage.OutputTokenCount ?? 0));
 
-                // Estimate cost (approximate pricing for GPT-4)
                 var inputCost = (response.Usage.InputTokenCount ?? 0) * 0.00003m;
                 var outputCost = (response.Usage.OutputTokenCount ?? 0) * 0.00006m;
                 _logger.LogInformation("   💰 Estimated cost: ${TotalCost:F4} (input: ${InputCost:F4}, output: ${OutputCost:F4})",
@@ -190,7 +191,6 @@ public class RustReviewAgent : ILanguageReviewAgent
             _logger.LogInformation("📝 FULL LLM RESPONSE:\n{Response}", responseText);
             _logger.LogInformation("════════════════════════════════════════════════════════════");
 
-            // Parse the JSON response
             var comments = ParseReviewComments(responseText ?? "[]", file.Path);
 
             _logger.LogInformation("✅ Found {CommentCount} review comments for {FilePath}",
@@ -200,7 +200,7 @@ public class RustReviewAgent : ILanguageReviewAgent
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error reviewing Rust file {FilePath}", file.Path);
+            _logger.LogError(ex, "Error reviewing shell/script file {FilePath}", file.Path);
 
             if (ReviewExceptionClassifier.IsAuthenticationError(ex))
             {

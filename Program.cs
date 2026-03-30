@@ -132,6 +132,7 @@ builder.Services.AddSingleton<CodebaseContextService>();
 builder.Services.AddSingleton<ILanguageReviewAgent, PythonReviewAgent>();
 builder.Services.AddSingleton<ILanguageReviewAgent, DotNetReviewAgent>();
 builder.Services.AddSingleton<ILanguageReviewAgent, RustReviewAgent>();
+builder.Services.AddSingleton<ILanguageReviewAgent, BashReviewAgent>();
 
 // Add orchestrator
 builder.Services.AddSingleton<CodeReviewOrchestrator>();

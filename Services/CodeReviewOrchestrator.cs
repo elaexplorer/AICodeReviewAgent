@@ -271,7 +271,8 @@ public class CodeReviewOrchestrator
             return parsedComments.Select(c => new CodeReviewComment
             {
                 FilePath = filePath,
-                LineNumber = c.LineNumber,
+                StartLine = c.LineNumber,
+                EndLine = c.LineNumber,
                 Severity = c.Severity?.ToLower() ?? "low",
                 CommentType = c.Type?.ToLower() ?? "suggestion",
                 CommentText = c.Comment ?? string.Empty

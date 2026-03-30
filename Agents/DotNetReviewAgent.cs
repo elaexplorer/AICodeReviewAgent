@@ -44,8 +44,9 @@ public class DotNetReviewAgent : ILanguageReviewAgent
                 1. ONLY comment on lines marked with '+' in the diff (new/modified lines)
                 2. DO NOT comment on lines marked with '-' (removed lines) or context lines
                 3. Each '+' line has an [Lxx] tag showing its actual line number in the file — e.g. +[L42] public void Foo()
-                4. The 'lineNumber' in your response MUST be the exact number from the [Lxx] tag on the '+' line you are commenting on
+                4. 'startLine' MUST be the [Lxx] number of the first '+' line of the issue; 'endLine' MUST be the [Lxx] number of the last '+' line of the issue (same as startLine for single-line issues)
                 5. Provide your response as a JSON array of review comments
+                6. DO NOT flag style, naming conventions, whitespace, formatting, missing XML docs, or anything a linter/formatter (e.g. Roslyn analyzers, StyleCop, EditorConfig) would catch automatically. Only report issues that carry real risk: bugs, security vulnerabilities, performance problems, compliance violations, or missing critical test coverage. Use "nitpick" sparingly and only when it prevents genuine confusion — not for cosmetic preferences.
 
                 Severity values — choose exactly one:
                 - "critical" : security vulnerability, data loss, crash, or auth bypass — MUST fix before merge
@@ -61,20 +62,24 @@ public class DotNetReviewAgent : ILanguageReviewAgent
                 - "nitpick"    : minor style improvement (use sparingly)
 
                 For each issue found, provide:
-                - lineNumber    : The EXACT number from the [Lxx] tag on the '+' line containing the issue
-                - severity      : one of critical/high/medium/low
-                - type          : one of issue/suggestion/compliance/testing/nitpick
-                - comment       : clear explanation of the problem
-                - suggestedFix  : a concrete fix — a code snippet showing the corrected code, or step-by-step instructions. ALWAYS provide this field.
+                - startLine    : [Lxx] number of the first '+' line of the issue
+                - endLine      : [Lxx] number of the last '+' line of the issue (same as startLine for single-line issues)
+                - severity     : one of critical/high/medium/low
+                - type         : one of issue/suggestion/compliance/testing/nitpick
+                - comment      : clear explanation of the problem
+                - suggestedFix : a concrete fix — a code snippet showing the corrected code, or step-by-step instructions. ALWAYS provide this field.
+                - confidence   : a number from 0.0 to 1.0 indicating how certain you are this is a real issue (1.0 = certain, 0.7 = fairly confident, below 0.7 = speculative). Be honest — do not inflate confidence.
 
                 Return your response as a JSON array of objects with this structure:
                 [
                   {
-                    "lineNumber": 42,
+                    "startLine": 42,
+                    "endLine": 45,
                     "severity": "critical",
                     "type": "issue",
                     "comment": "Clear explanation of the problem",
-                    "suggestedFix": "Concrete code snippet or step-by-step fix"
+                    "suggestedFix": "Concrete code snippet or step-by-step fix",
+                    "confidence": 0.95
                   }
                 ]
 
@@ -225,11 +230,13 @@ public class DotNetReviewAgent : ILanguageReviewAgent
             return parsedComments.Select(c => new CodeReviewComment
             {
                 FilePath = filePath,
-                LineNumber = c.LineNumber,
+                StartLine = c.StartLine,
+                EndLine = c.EndLine > 0 ? c.EndLine : c.StartLine,
                 Severity = c.Severity?.ToLower() ?? "low",
                 CommentType = c.Type?.ToLower() ?? "suggestion",
                 CommentText = c.Comment ?? string.Empty,
-                SuggestedFix = c.SuggestedFix ?? string.Empty
+                SuggestedFix = c.SuggestedFix ?? string.Empty,
+                Confidence = c.Confidence is > 0.0 and <= 1.0 ? c.Confidence : 1.0
             }).ToList();
         }
         catch (Exception ex)
@@ -287,10 +294,12 @@ public class DotNetReviewAgent : ILanguageReviewAgent
 
     private class ReviewCommentJson
     {
-        public int LineNumber { get; set; }
+        public int StartLine { get; set; }
+        public int EndLine { get; set; }
         public string? Severity { get; set; }
         public string? Type { get; set; }
         public string? Comment { get; set; }
         public string? SuggestedFix { get; set; }
+        public double Confidence { get; set; }
     }
 }

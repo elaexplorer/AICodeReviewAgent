@@ -266,7 +266,7 @@ public class CodeReviewController : ControllerBase
                             "Adjusted comment line anchor for PR {PullRequestId} at {FilePath} from {OriginalLine} to {MappedLine}",
                             reviewOutput.PullRequestId,
                             commentToPost.FilePath,
-                            comment.LineNumber,
+                            comment.StartLine,
                             remappedLine.Value);
                     }
 
@@ -276,12 +276,13 @@ public class CodeReviewController : ControllerBase
                     {
                         skippedCount++;
                         comment.Posted = true;
-                        comment.LineNumber = commentToPost.LineNumber;
+                        comment.StartLine = commentToPost.StartLine;
+                        comment.EndLine = commentToPost.EndLine;
                         _logger.LogInformation(
-                            "Skipping duplicate high-priority comment for PR {PullRequestId} at {FilePath}:{LineNumber}",
+                            "Skipping duplicate high-priority comment for PR {PullRequestId} at {FilePath}:{StartLine}",
                             reviewOutput.PullRequestId,
                             commentToPost.FilePath,
-                            commentToPost.LineNumber);
+                            commentToPost.StartLine);
                         continue;
                     }
 
@@ -295,7 +296,8 @@ public class CodeReviewController : ControllerBase
                     if (postResult.Success)
                     {
                         comment.Posted = true;
-                        comment.LineNumber = commentToPost.LineNumber;
+                        comment.StartLine = commentToPost.StartLine;
+                        comment.EndLine = commentToPost.EndLine;
                         postedCount++;
                         existingFingerprints.Add(fingerprint);
                         existingPositionKeys.Add(positionKey);
@@ -306,7 +308,8 @@ public class CodeReviewController : ControllerBase
                         {
                             CommentId = comment.Id,
                             FilePath = commentToPost.FilePath,
-                            LineNumber = commentToPost.LineNumber,
+                            StartLine = commentToPost.StartLine,
+                            EndLine = commentToPost.EndLine,
                             Severity = comment.Severity,
                             Stage = postResult.Stage,
                             StatusCode = postResult.StatusCode,
@@ -314,10 +317,10 @@ public class CodeReviewController : ControllerBase
                         });
 
                         _logger.LogWarning(
-                            "Failed to post high-priority comment for PR {PullRequestId} at {FilePath}:{LineNumber}. Stage={Stage}, StatusCode={StatusCode}, Error={Error}",
+                            "Failed to post high-priority comment for PR {PullRequestId} at {FilePath}:{StartLine}. Stage={Stage}, StatusCode={StatusCode}, Error={Error}",
                             reviewOutput.PullRequestId,
                             commentToPost.FilePath,
-                            commentToPost.LineNumber,
+                            commentToPost.StartLine,
                             postResult.Stage,
                             postResult.StatusCode,
                             postResult.ErrorMessage);
@@ -1009,6 +1012,8 @@ public class CodeReviewController : ControllerBase
 
     private static bool IsHighPriorityComment(CodeReviewComment comment)
     {
+        if (comment.Confidence < 0.7)
+            return false;
         var severity = comment.Severity?.Trim();
         return string.Equals(severity, "high", StringComparison.OrdinalIgnoreCase)
             || string.Equals(severity, "critical", StringComparison.OrdinalIgnoreCase);
@@ -1020,10 +1025,12 @@ public class CodeReviewController : ControllerBase
         {
             Id = comment.Id,
             FilePath = comment.FilePath,
-            LineNumber = comment.LineNumber,
+            StartLine = comment.StartLine,
+            EndLine = comment.EndLine,
             CommentText = comment.CommentText,
             CommentType = comment.CommentType,
             Severity = comment.Severity,
+            SuggestedFix = comment.SuggestedFix,
             Posted = comment.Posted
         };
     }
@@ -1043,7 +1050,7 @@ public class CodeReviewController : ControllerBase
             return null;
         }
 
-        var requestedLine = comment.LineNumber > 0 ? comment.LineNumber : 1;
+        var requestedLine = comment.StartLine > 0 ? comment.StartLine : 1;
         if (validLines.BinarySearch(requestedLine) >= 0)
         {
             return null;
@@ -1054,7 +1061,8 @@ public class CodeReviewController : ControllerBase
             .ThenBy(line => line)
             .First();
 
-        comment.LineNumber = mappedLine;
+        comment.StartLine = mappedLine;
+        comment.EndLine = Math.Max(mappedLine, comment.EndLine > 0 ? comment.EndLine : mappedLine);
         return mappedLine;
     }
 
@@ -1255,7 +1263,8 @@ public class ReviewPostingFailure
 {
     public string CommentId { get; set; } = string.Empty;
     public string FilePath { get; set; } = string.Empty;
-    public int LineNumber { get; set; }
+    public int StartLine { get; set; }
+    public int EndLine { get; set; }
     public string Severity { get; set; } = string.Empty;
     public string Stage { get; set; } = string.Empty;
     public int? StatusCode { get; set; }

@@ -60,7 +60,8 @@ public class CodeReviewComment
 {
     public string Id { get; set; } = Guid.NewGuid().ToString();
     public string FilePath { get; set; } = string.Empty;
-    public int LineNumber { get; set; }
+    public int StartLine { get; set; }
+    public int EndLine { get; set; }
     public string CommentText { get; set; } = string.Empty;
 
     // "issue" | "suggestion" | "compliance" | "testing" | "nitpick"
@@ -77,6 +78,9 @@ public class CodeReviewComment
 
     // Concrete fix: code snippet or step-by-step instructions provided by the LLM
     public string SuggestedFix { get; set; } = string.Empty;
+
+    // LLM confidence that this is a real issue (0.0–1.0). Comments below 0.7 are not posted.
+    public double Confidence { get; set; } = 1.0;
 
     public bool Posted { get; set; } = false;
 }

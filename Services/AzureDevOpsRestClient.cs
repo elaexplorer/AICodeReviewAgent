@@ -507,7 +507,8 @@ public class AzureDevOpsRestClient
 
             var url = $"https://dev.azure.com/{_organization}/{project}/_apis/git/repositories/{repositoryId}/pullRequests/{pullRequestId}/threads?api-version=7.1";
             var normalizedFilePath = NormalizeThreadFilePath(comment.FilePath);
-            var lineNumber = comment.LineNumber > 0 ? comment.LineNumber : 1;
+            var startLine = comment.StartLine > 0 ? comment.StartLine : 1;
+            var endLine = comment.EndLine >= startLine ? comment.EndLine : startLine;
             var anchorBody = BuildCommentBody(comment);
 
             // Attempt inline thread first so comments appear on the right file/line in the PR diff.
@@ -528,8 +529,8 @@ public class AzureDevOpsRestClient
                     threadContext = new
                     {
                         filePath = normalizedFilePath,
-                        rightFileStart = new { line = lineNumber, offset = 1 },
-                        rightFileEnd = new { line = lineNumber, offset = 1 }
+                        rightFileStart = new { line = startLine, offset = 1 },
+                        rightFileEnd = new { line = endLine, offset = 1 }
                     }
                 };
 
@@ -543,19 +544,21 @@ public class AzureDevOpsRestClient
                 if (inlineResponse.IsSuccessStatusCode)
                 {
                     _logger.LogInformation(
-                        "Successfully posted inline comment to PR {PullRequestId} at {FilePath}:{LineNumber}",
+                        "Successfully posted inline comment to PR {PullRequestId} at {FilePath}:{StartLine}-{EndLine}",
                         pullRequestId,
                         normalizedFilePath,
-                        lineNumber);
+                        startLine,
+                        endLine);
                     return PullRequestCommentPostResult.SuccessResult();
                 }
 
                 var inlineResponseText = await inlineResponse.Content.ReadAsStringAsync();
                 _logger.LogWarning(
-                    "Inline comment post failed for PR {PullRequestId} at {FilePath}:{LineNumber}. Status: {StatusCode}. Falling back to general thread. Body: {Body}",
+                    "Inline comment post failed for PR {PullRequestId} at {FilePath}:{StartLine}-{EndLine}. Status: {StatusCode}. Falling back to general thread. Body: {Body}",
                     pullRequestId,
                     normalizedFilePath,
-                    lineNumber,
+                    startLine,
+                    endLine,
                     inlineResponse.StatusCode,
                     inlineResponseText);
             }
@@ -728,9 +731,12 @@ public class AzureDevOpsRestClient
 
     public static string BuildCommentBody(CodeReviewComment comment)
     {
-        var lineNumber = comment.LineNumber > 0 ? comment.LineNumber : 1;
+        var startLine = comment.StartLine > 0 ? comment.StartLine : 1;
+        var endLine = comment.EndLine >= startLine ? comment.EndLine : startLine;
+        var lineRef = startLine == endLine ? $"Line {startLine}" : $"Lines {startLine}–{endLine}";
+        var confidenceStr = comment.Confidence > 0.0 ? $" · confidence: {comment.Confidence:F2}" : "";
         var anchorTitle = $"**[{comment.Severity.ToUpper()}] {comment.CommentType}**";
-        var body = $"{anchorTitle} (Line {lineNumber})\n\n{comment.CommentText}";
+        var body = $"{anchorTitle} ({lineRef}{confidenceStr})\n\n{comment.CommentText}";
         if (!string.IsNullOrWhiteSpace(comment.SuggestedFix))
             body += $"\n\n**Suggested fix:**\n{comment.SuggestedFix}";
         return body;
@@ -803,7 +809,7 @@ public class AzureDevOpsRestClient
     public static string BuildCommentPositionKey(CodeReviewComment comment)
     {
         var path = NormalizeThreadFilePath(comment.FilePath).ToLowerInvariant();
-        var line = comment.LineNumber > 0 ? comment.LineNumber : 1;
+        var line = comment.StartLine > 0 ? comment.StartLine : 1;
         var severity = (comment.Severity ?? string.Empty).Trim().ToLowerInvariant();
         var type = (comment.CommentType ?? string.Empty).Trim().ToLowerInvariant();
         return $"{path}|{line}|{severity}|{type}";

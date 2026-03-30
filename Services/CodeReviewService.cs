@@ -244,7 +244,10 @@ public class CodeReviewService
                 if (trimmedLine.StartsWith("Line:"))
                 {
                     if (int.TryParse(trimmedLine.Substring(5).Trim(), out var lineNumber))
-                        comment.LineNumber = lineNumber;
+                    {
+                        comment.StartLine = lineNumber;
+                        comment.EndLine = lineNumber;
+                    }
                 }
                 else if (trimmedLine.StartsWith("Type:"))
                 {
