@@ -40,10 +40,12 @@ public class PythonReviewAgent : ILanguageReviewAgent
                 CRITICAL RULES:
                 1. ONLY comment on lines marked with '+' in the diff (new/modified lines)
                 2. DO NOT comment on lines marked with '-' (removed lines) or context lines
-                3. Provide your response as a JSON array of review comments
+                3. Each '+' line has an [Lxx] tag showing its actual line number in the file — e.g. +[L42] def foo():
+                4. The 'lineNumber' in your response MUST be the exact number from the [Lxx] tag on the '+' line you are commenting on
+                5. Provide your response as a JSON array of review comments
 
                 For each issue found, provide:
-                - Line number from the diff (lines marked with + are the new code)
+                - lineNumber: The EXACT number from the [Lxx] tag on the '+' line containing the issue
                 - Severity (high/medium/low)
                 - Type (issue/suggestion/nitpick)
                 - Clear explanation of the problem
@@ -52,7 +54,7 @@ public class PythonReviewAgent : ILanguageReviewAgent
                 Return your response as a JSON array of objects with this structure:
                 [
                   {
-                    "lineNumber": 10,
+                    "lineNumber": 42,
                     "severity": "high",
                     "type": "issue",
                     "comment": "Detailed explanation and recommendation"
@@ -79,10 +81,10 @@ public class PythonReviewAgent : ILanguageReviewAgent
                 Change Type: {{{file.ChangeType}}}
 
                 ========================================
-                CHANGES TO REVIEW (lines with '+' prefix):
+                CHANGES TO REVIEW ('+' lines annotated with [Lxx] actual line numbers):
                 ========================================
                 ```diff
-                {{{file.UnifiedDiff}}}
+                {{{AnnotateDiffWithLineNumbers(file.UnifiedDiff)}}}
                 ```
 
                 ========================================
@@ -219,6 +221,9 @@ public class PythonReviewAgent : ILanguageReviewAgent
             return new List<CodeReviewComment>();
         }
     }
+
+    private static string AnnotateDiffWithLineNumbers(string? unifiedDiff) =>
+        Services.DiffAnnotator.AnnotateDiffWithLineNumbers(unifiedDiff);
 
     private static string ExtractJsonPayload(string response)
     {

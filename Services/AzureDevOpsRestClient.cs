@@ -376,8 +376,10 @@ public class AzureDevOpsRestClient
                 else if (newIndex < newLines.Length &&
                         (lcsIndex >= lcs.Count || newIndex != lcs[lcsIndex].newIndex))
                 {
-                    // Added line
-                    hunkLines.Add($"+{newLines[newIndex]}");
+                    // Added line — annotate with absolute new-file line number so the AI
+                    // can return an exact line number without parsing the @@ hunk header.
+                    var rightFileLine = newIndex + 1;
+                    hunkLines.Add($"+[L{rightFileLine}]{newLines[newIndex]}");
                     newIndex++;
                     newCount++;
                 }
