@@ -88,11 +88,12 @@ public class BashReviewAgent : ILanguageReviewAgent
 
     public async Task<List<CodeReviewComment>> ReviewFileAsync(
         PullRequestFile file,
-        string codebaseContext)
+        string codebaseContext,
+        string? focusArea = null)
     {
         try
         {
-            _logger.LogInformation("Reviewing shell/script/YAML file: {FilePath}", file.Path);
+            _logger.LogInformation("Reviewing shell/script/YAML file: {FilePath} (focus: {Focus})", file.Path, focusArea ?? "all");
 
             var ext = Path.GetExtension(file.Path).ToLowerInvariant();
             var langLabel = ext switch
@@ -101,6 +102,16 @@ public class BashReviewAgent : ILanguageReviewAgent
                 ".yaml" or ".yml" => "yaml",
                 _ => "bash"
             };
+
+            var reviewSection = FocusPassHelper.GetReviewInstructions(focusArea) ?? """
+                Provide a thorough code review focusing on:
+                1. **Security Issues**: Command injection, hardcoded secrets/tokens, insecure permissions (chmod 777), unquoted variables, path traversal
+                2. **Bugs**: Uninitialized variables, missing exit-code checks, incorrect quoting, broken error trapping, logic errors
+                3. **Reliability**: Missing `set -euo pipefail` (bash), lack of error handling, unchecked return values, race conditions
+                4. **Secrets & Compliance**: Credentials, tokens, or PII in plain text; missing secret-masking in pipelines
+                5. **YAML/Pipeline-Specific**: Incorrect indentation semantics, missing `needs`/`depends_on`, exposed environment variables, unsafe `eval`/`Invoke-Expression` usage
+                6. **PowerShell-Specific**: Use of `Invoke-Expression`, missing `ErrorActionPreference`, unsafe parameter handling
+                """;
 
             var prompt = $$$"""
                 Review ONLY THE CHANGES in the following {{{langLabel}}} file from a pull request.
@@ -134,13 +145,7 @@ public class BashReviewAgent : ILanguageReviewAgent
                 Codebase Context:
                 {{{codebaseContext}}}
 
-                Provide a thorough code review focusing on:
-                1. **Security Issues**: Command injection, hardcoded secrets/tokens, insecure permissions (chmod 777), unquoted variables, path traversal
-                2. **Bugs**: Uninitialized variables, missing exit-code checks, incorrect quoting, broken error trapping, logic errors
-                3. **Reliability**: Missing `set -euo pipefail` (bash), lack of error handling, unchecked return values, race conditions
-                4. **Secrets & Compliance**: Credentials, tokens, or PII in plain text; missing secret-masking in pipelines
-                5. **YAML/Pipeline-Specific**: Incorrect indentation semantics, missing `needs`/`depends_on`, exposed environment variables, unsafe `eval`/`Invoke-Expression` usage
-                6. **PowerShell-Specific**: Use of `Invoke-Expression`, missing `ErrorActionPreference`, unsafe parameter handling
+                {{{reviewSection}}}
                 """;
 
             _logger.LogInformation("╔════════════════════════════════════════════════════════════╗");

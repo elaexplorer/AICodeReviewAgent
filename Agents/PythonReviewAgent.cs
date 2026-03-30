@@ -87,11 +87,22 @@ public class PythonReviewAgent : ILanguageReviewAgent
 
     public async Task<List<CodeReviewComment>> ReviewFileAsync(
         PullRequestFile file,
-        string codebaseContext)
+        string codebaseContext,
+        string? focusArea = null)
     {
         try
         {
-            _logger.LogInformation("Reviewing Python file: {FilePath}", file.Path);
+            _logger.LogInformation("Reviewing Python file: {FilePath} (focus: {Focus})", file.Path, focusArea ?? "all");
+
+            var reviewSection = FocusPassHelper.GetReviewInstructions(focusArea) ?? """
+                Provide a thorough code review focusing on:
+                1. **Security Issues**: SQL injection, XSS, insecure deserialization, hardcoded secrets, path traversal
+                2. **Bugs**: Logic errors, null/None handling, type mismatches, incorrect API usage
+                3. **Performance**: Inefficient algorithms, unnecessary computations, memory leaks
+                4. **Best Practices**: PEP compliance, proper error handling, logging, documentation
+                5. **Code Quality**: Naming conventions, function complexity, code duplication
+                6. **Python-Specific**: Proper use of context managers, generators, decorators, type hints
+                """;
 
             var prompt = $$$"""
                 Review ONLY THE CHANGES in the following Python file from a pull request.
@@ -125,13 +136,7 @@ public class PythonReviewAgent : ILanguageReviewAgent
                 Codebase Context:
                 {{{codebaseContext}}}
 
-                Provide a thorough code review focusing on:
-                1. **Security Issues**: SQL injection, XSS, insecure deserialization, hardcoded secrets, path traversal
-                2. **Bugs**: Logic errors, null/None handling, type mismatches, incorrect API usage
-                3. **Performance**: Inefficient algorithms, unnecessary computations, memory leaks
-                4. **Best Practices**: PEP compliance, proper error handling, logging, documentation
-                5. **Code Quality**: Naming conventions, function complexity, code duplication
-                6. **Python-Specific**: Proper use of context managers, generators, decorators, type hints
+                {{{reviewSection}}}
                 """;
 
             // Log LLM request details

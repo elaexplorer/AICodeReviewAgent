@@ -90,11 +90,22 @@ public class DotNetReviewAgent : ILanguageReviewAgent
 
     public async Task<List<CodeReviewComment>> ReviewFileAsync(
         PullRequestFile file,
-        string codebaseContext)
+        string codebaseContext,
+        string? focusArea = null)
     {
         try
         {
-            _logger.LogInformation("Reviewing .NET file: {FilePath}", file.Path);
+            _logger.LogInformation("Reviewing .NET file: {FilePath} (focus: {Focus})", file.Path, focusArea ?? "all");
+
+            var reviewSection = FocusPassHelper.GetReviewInstructions(focusArea) ?? """
+                Provide a thorough code review focusing on:
+                1. **Security Issues**: SQL injection, XSS, CSRF, insecure deserialization, hardcoded secrets
+                2. **Bugs**: Null reference exceptions, race conditions, resource leaks, incorrect async usage
+                3. **Performance**: Boxing/unboxing, string concatenation, excessive allocations, inefficient LINQ
+                4. **Best Practices**: SOLID principles, proper disposal (IDisposable), exception handling, logging
+                5. **Code Quality**: Naming conventions, method complexity, code duplication, accessibility modifiers
+                6. **.NET-Specific**: Proper use of async/await, ConfigureAwait, CancellationToken, modern C# features
+                """;
 
             var prompt = $$$"""
                 Review ONLY THE CHANGES in the following C#/.NET file from a pull request.
@@ -128,13 +139,7 @@ public class DotNetReviewAgent : ILanguageReviewAgent
                 Codebase Context:
                 {{{codebaseContext}}}
 
-                Provide a thorough code review focusing on:
-                1. **Security Issues**: SQL injection, XSS, CSRF, insecure deserialization, hardcoded secrets
-                2. **Bugs**: Null reference exceptions, race conditions, resource leaks, incorrect async usage
-                3. **Performance**: Boxing/unboxing, string concatenation, excessive allocations, inefficient LINQ
-                4. **Best Practices**: SOLID principles, proper disposal (IDisposable), exception handling, logging
-                5. **Code Quality**: Naming conventions, method complexity, code duplication, accessibility modifiers
-                6. **.NET-Specific**: Proper use of async/await, ConfigureAwait, CancellationToken, modern C# features
+                {{{reviewSection}}}
                 """;
 
             // Log LLM request details

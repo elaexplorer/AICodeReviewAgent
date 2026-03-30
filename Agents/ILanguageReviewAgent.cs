@@ -18,9 +18,12 @@ public interface ILanguageReviewAgent
     string[] FileExtensions { get; }
 
     /// <summary>
-    /// Review a single file and return code review comments
+    /// Review a single file and return code review comments.
+    /// When focusArea is set to one of the FocusPassHelper constants (security/bugs/performance),
+    /// the agent narrows its review to that category only.
     /// </summary>
     Task<List<CodeReviewComment>> ReviewFileAsync(
         PullRequestFile file,
-        string codebaseContext);
+        string codebaseContext,
+        string? focusArea = null);
 }

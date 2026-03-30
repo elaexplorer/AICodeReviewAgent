@@ -90,11 +90,22 @@ public class RustReviewAgent : ILanguageReviewAgent
 
     public async Task<List<CodeReviewComment>> ReviewFileAsync(
         PullRequestFile file,
-        string codebaseContext)
+        string codebaseContext,
+        string? focusArea = null)
     {
         try
         {
-            _logger.LogInformation("Reviewing Rust file: {FilePath}", file.Path);
+            _logger.LogInformation("Reviewing Rust file: {FilePath} (focus: {Focus})", file.Path, focusArea ?? "all");
+
+            var reviewSection = FocusPassHelper.GetReviewInstructions(focusArea) ?? """
+                Provide a thorough code review focusing on:
+                1. **Security Issues**: Unsafe code blocks, buffer overflows, integer overflows, race conditions
+                2. **Memory Safety**: Improper use of unsafe, lifetime issues, use-after-free potential
+                3. **Bugs**: Logic errors, panic conditions, incorrect error handling, unwrap usage
+                4. **Performance**: Unnecessary cloning, inefficient algorithms, blocking operations
+                5. **Best Practices**: Proper error propagation, idiomatic Rust patterns, documentation
+                6. **Rust-Specific**: Ownership patterns, trait implementations, lifetime annotations, macro usage
+                """;
 
             var prompt = $$$"""
                 Review ONLY THE CHANGES in the following Rust file from a pull request.
@@ -128,13 +139,7 @@ public class RustReviewAgent : ILanguageReviewAgent
                 Codebase Context:
                 {{{codebaseContext}}}
 
-                Provide a thorough code review focusing on:
-                1. **Security Issues**: Unsafe code blocks, buffer overflows, integer overflows, race conditions
-                2. **Memory Safety**: Improper use of unsafe, lifetime issues, use-after-free potential
-                3. **Bugs**: Logic errors, panic conditions, incorrect error handling, unwrap usage
-                4. **Performance**: Unnecessary cloning, inefficient algorithms, blocking operations
-                5. **Best Practices**: Proper error propagation, idiomatic Rust patterns, documentation
-                6. **Rust-Specific**: Ownership patterns, trait implementations, lifetime annotations, macro usage
+                {{{reviewSection}}}
                 """;
 
             // Log LLM request details

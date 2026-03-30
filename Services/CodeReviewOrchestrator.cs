@@ -169,8 +169,8 @@ public class CodeReviewOrchestrator
                 if (_extensionToLanguage.TryGetValue(extension, out var language) &&
                     _agents.TryGetValue(language, out var agent))
                 {
-                    _logger.LogInformation("Routing {FilePath} to {Language} agent", file.Path, language);
-                    return await agent.ReviewFileAsync(file, codebaseContext);
+                    _logger.LogInformation("Routing {FilePath} to {Language} agent — 3 focused passes", file.Path, language);
+                    return await RunFocusedPassesAsync(agent, file, codebaseContext);
                 }
                 else
                 {
@@ -219,6 +219,56 @@ public class CodeReviewOrchestrator
         
         return allComments;
     }
+
+    /// <summary>
+    /// Runs security, bugs, and performance passes in parallel then merges results.
+    /// Duplicate detections (same startLine + type from multiple passes) are collapsed
+    /// by keeping the comment with the highest confidence.
+    /// </summary>
+    private async Task<List<CodeReviewComment>> RunFocusedPassesAsync(
+        ILanguageReviewAgent agent,
+        PullRequestFile file,
+        string codebaseContext)
+    {
+        var passes = new[]
+        {
+            Agents.FocusPassHelper.Security,
+            Agents.FocusPassHelper.Bugs,
+            Agents.FocusPassHelper.Performance,
+        };
+
+        var passTasks = passes.Select(focus => agent.ReviewFileAsync(file, codebaseContext, focus));
+        var passResults = await Task.WhenAll(passTasks);
+
+        for (var i = 0; i < passes.Length; i++)
+            _logger.LogInformation("   Pass [{Focus}]: {Count} comments", passes[i], passResults[i].Count);
+
+        var merged = MergeAndDedup(passResults.SelectMany(r => r));
+        _logger.LogInformation("   Merged total: {Count} unique comments for {FilePath}", merged.Count, file.Path);
+        return merged;
+    }
+
+    /// <summary>
+    /// Collapses comments with the same (FilePath, StartLine, CommentType) key,
+    /// keeping the highest-confidence one per group.
+    /// </summary>
+    private static List<CodeReviewComment> MergeAndDedup(IEnumerable<CodeReviewComment> comments)
+    {
+        return comments
+            .GroupBy(c => (c.FilePath, c.StartLine, c.CommentType))
+            .Select(g => g.OrderByDescending(c => c.Confidence).ThenByDescending(c => SeverityRank(c.Severity)).First())
+            .OrderBy(c => c.StartLine)
+            .ToList();
+    }
+
+    private static int SeverityRank(string? severity) => severity?.ToLower() switch
+    {
+        "critical" => 4,
+        "high"     => 3,
+        "medium"   => 2,
+        "low"      => 1,
+        _          => 0
+    };
 
     /// <summary>
     /// General review for files without specialized agents
