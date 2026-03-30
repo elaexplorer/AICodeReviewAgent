@@ -889,6 +889,93 @@ public class AzureDevOpsRestClient
     }
 
     /// <summary>
+    /// Returns a markdown summary of existing human reviewer threads on a PR,
+    /// formatted for injection into the LLM review prompt so the AI avoids duplicating feedback.
+    /// Only includes active, non-system threads that have inline file context.
+    /// </summary>
+    public async Task<string> GetExistingThreadSummaryAsync(string project, string repositoryId, int pullRequestId)
+    {
+        const int MaxCommentsToInclude = 40;
+        const int MaxCommentChars = 300;
+
+        try
+        {
+            var url = $"https://dev.azure.com/{_organization}/{project}/_apis/git/repositories/{repositoryId}/pullRequests/{pullRequestId}/threads?api-version=7.1";
+            var response = await _httpClient.GetAsync(url);
+            response.EnsureSuccessStatusCode();
+
+            var content = await response.Content.ReadAsStringAsync();
+            var root = JsonSerializer.Deserialize<JsonElement>(content);
+            if (!root.TryGetProperty("value", out var threads) || threads.ValueKind != JsonValueKind.Array)
+                return string.Empty;
+
+            var sb = new System.Text.StringBuilder();
+            var count = 0;
+
+            foreach (var thread in threads.EnumerateArray())
+            {
+                if (count >= MaxCommentsToInclude) break;
+
+                // Skip system-generated threads (PR status, vote, merge updates)
+                if (thread.TryGetProperty("isDeleted", out var deleted) && deleted.GetBoolean()) continue;
+                if (!thread.TryGetProperty("threadContext", out var threadContext) ||
+                    threadContext.ValueKind != JsonValueKind.Object) continue;
+
+                // Skip threads without file context (PR-level comments)
+                if (!threadContext.TryGetProperty("filePath", out var fpProp)) continue;
+                var filePath = fpProp.GetString() ?? string.Empty;
+                if (string.IsNullOrEmpty(filePath)) continue;
+
+                var line = 0;
+                if (threadContext.TryGetProperty("rightFileStart", out var start) &&
+                    start.ValueKind == JsonValueKind.Object &&
+                    start.TryGetProperty("line", out var lineProp))
+                    line = lineProp.GetInt32();
+
+                var status = thread.TryGetProperty("status", out var statusProp)
+                    ? statusProp.GetString() ?? "active"
+                    : "active";
+
+                if (!thread.TryGetProperty("comments", out var comments) ||
+                    comments.ValueKind != JsonValueKind.Array) continue;
+
+                // First non-system comment is the reviewer's actual text
+                foreach (var comment in comments.EnumerateArray())
+                {
+                    if (comment.TryGetProperty("commentType", out var ct) &&
+                        ct.GetString() == "system") continue;
+
+                    if (!comment.TryGetProperty("content", out var contentProp)) continue;
+                    var text = (contentProp.GetString() ?? string.Empty).Trim();
+                    if (string.IsNullOrEmpty(text)) continue;
+
+                    // Truncate very long comments
+                    var truncated = text.Length > MaxCommentChars
+                        ? text[..MaxCommentChars] + "…"
+                        : text;
+
+                    var lineRef = line > 0 ? $":{line}" : string.Empty;
+                    sb.AppendLine($"- `{filePath}{lineRef}` [{status}]: {truncated}");
+                    count++;
+                    break; // one entry per thread
+                }
+            }
+
+            if (sb.Length == 0) return string.Empty;
+
+            var header = new System.Text.StringBuilder();
+            header.AppendLine("## Existing Review Comments (already raised — do NOT duplicate these)");
+            header.AppendLine(sb.ToString());
+            return header.ToString();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Unable to fetch existing PR threads for context on PR {PullRequestId}", pullRequestId);
+            return string.Empty;
+        }
+    }
+
+    /// <summary>
     /// Get active pull requests for a repository
     /// </summary>
     public async Task<List<PullRequest>> GetActivePullRequestsAsync(string project, string repository)

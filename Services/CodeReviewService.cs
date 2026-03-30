@@ -11,6 +11,7 @@ public class CodeReviewService
     private readonly ILogger<CodeReviewService> _logger;
     private readonly CodeReviewOrchestrator _orchestrator;
     private readonly AzureDevOpsMcpClient _adoClient;
+    private readonly AzureDevOpsRestClient _adoRestClient;
     private readonly CodebaseContextService _codebaseContextService;
 
     public CodeReviewService(
@@ -18,12 +19,14 @@ public class CodeReviewService
         ILogger<CodeReviewService> logger,
         CodeReviewOrchestrator orchestrator,
         AzureDevOpsMcpClient adoClient,
+        AzureDevOpsRestClient adoRestClient,
         CodebaseContextService codebaseContextService)
     {
         _chatClient = chatClient;
         _logger = logger;
         _orchestrator = orchestrator;
         _adoClient = adoClient;
+        _adoRestClient = adoRestClient;
         _codebaseContextService = codebaseContextService;
     }
 
@@ -34,6 +37,11 @@ public class CodeReviewService
         string repository)
     {
         _logger.LogInformation("Starting code review for PR {PullRequestId}: {Title}", pullRequest.Id, pullRequest.Title);
+
+        // Fetch existing reviewer threads so the LLM avoids duplicating already-raised feedback
+        var existingThreadSummary = await _adoRestClient.GetExistingThreadSummaryAsync(project, repository, pullRequest.Id);
+        if (!string.IsNullOrEmpty(existingThreadSummary))
+            _logger.LogInformation("📝 Fetched existing PR threads for context ({Chars} chars)", existingThreadSummary.Length);
 
         // Build basic codebase context from changed files only (no REST API calls)
         var basicContext = BuildCodebaseContextFromChangedFiles(files);
@@ -82,6 +90,10 @@ public class CodeReviewService
             _logger.LogInformation("Using basic directory-based context instead");
             codebaseContext = basicContext;
         }
+
+        // Prepend existing reviewer comments so agents know what's already been flagged
+        if (!string.IsNullOrEmpty(existingThreadSummary))
+            codebaseContext = existingThreadSummary + "\n" + codebaseContext;
 
         // Use orchestrator to route reviews to language-specific agents
         var comments = await _orchestrator.ReviewFilesAsync(files, codebaseContext);
