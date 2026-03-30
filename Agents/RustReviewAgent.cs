@@ -47,20 +47,34 @@ public class RustReviewAgent : ILanguageReviewAgent
                 4. The 'lineNumber' in your response MUST be the exact number from the [Lxx] tag on the '+' line you are commenting on
                 5. Provide your response as a JSON array of review comments
 
+                Severity values — choose exactly one:
+                - "critical" : security vulnerability, data loss, crash, or auth bypass — MUST fix before merge
+                - "high"     : bug causing incorrect or undefined behaviour
+                - "medium"   : performance issue, resource leak, or non-critical bug
+                - "low"      : minor improvement opportunity
+
+                Type values — choose exactly one:
+                - "issue"      : a bug or incorrect behaviour in the changed code
+                - "suggestion" : a correctness or performance improvement
+                - "compliance" : PII/sensitive data logging, missing audit trail, data-retention violation
+                - "testing"    : missing or inadequate test coverage for a critical code path
+                - "nitpick"    : minor style improvement (use sparingly)
+
                 For each issue found, provide:
-                - lineNumber: The EXACT number from the [Lxx] tag on the '+' line containing the issue
-                - Severity (high/medium/low)
-                - Type (issue/suggestion/nitpick)
-                - Clear explanation of the problem
-                - Specific recommendation for fixing it
+                - lineNumber    : The EXACT number from the [Lxx] tag on the '+' line containing the issue
+                - severity      : one of critical/high/medium/low
+                - type          : one of issue/suggestion/compliance/testing/nitpick
+                - comment       : clear explanation of the problem
+                - suggestedFix  : a concrete fix — a code snippet showing the corrected code, or step-by-step instructions. ALWAYS provide this field.
 
                 Return your response as a JSON array of objects with this structure:
                 [
                   {
                     "lineNumber": 42,
-                    "severity": "high",
+                    "severity": "critical",
                     "type": "issue",
-                    "comment": "Detailed explanation and recommendation"
+                    "comment": "Clear explanation of the problem",
+                    "suggestedFix": "Concrete code snippet or step-by-step fix"
                   }
                 ]
 
@@ -87,7 +101,7 @@ public class RustReviewAgent : ILanguageReviewAgent
                 CHANGES TO REVIEW ('+' lines annotated with [Lxx] actual line numbers):
                 ========================================
                 ```diff
-                {{{AnnotateDiffWithLineNumbers(file.UnifiedDiff)}}}
+                {{{file.UnifiedDiff}}}
                 ```
 
                 ========================================
@@ -214,7 +228,8 @@ public class RustReviewAgent : ILanguageReviewAgent
                 LineNumber = c.LineNumber,
                 Severity = c.Severity?.ToLower() ?? "low",
                 CommentType = c.Type?.ToLower() ?? "suggestion",
-                CommentText = c.Comment ?? string.Empty
+                CommentText = c.Comment ?? string.Empty,
+                SuggestedFix = c.SuggestedFix ?? string.Empty
             }).ToList();
         }
         catch (Exception ex)
@@ -224,9 +239,6 @@ public class RustReviewAgent : ILanguageReviewAgent
             return new List<CodeReviewComment>();
         }
     }
-
-    private static string AnnotateDiffWithLineNumbers(string? unifiedDiff) =>
-        Services.DiffAnnotator.AnnotateDiffWithLineNumbers(unifiedDiff);
 
     private static string ExtractJsonPayload(string response)
     {
@@ -279,5 +291,6 @@ public class RustReviewAgent : ILanguageReviewAgent
         public string? Severity { get; set; }
         public string? Type { get; set; }
         public string? Comment { get; set; }
+        public string? SuggestedFix { get; set; }
     }
 }

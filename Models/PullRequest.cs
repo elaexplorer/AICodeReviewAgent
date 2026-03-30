@@ -62,8 +62,22 @@ public class CodeReviewComment
     public string FilePath { get; set; } = string.Empty;
     public int LineNumber { get; set; }
     public string CommentText { get; set; } = string.Empty;
-    public string CommentType { get; set; } = string.Empty; // "suggestion", "issue", "nitpick"
-    public string Severity { get; set; } = string.Empty; // "low", "medium", "high"
+
+    // "issue" | "suggestion" | "compliance" | "testing" | "nitpick"
+    // compliance = PII logging, audit gaps, data-retention violations
+    // testing    = missing coverage on critical paths
+    public string CommentType { get; set; } = string.Empty;
+
+    // "critical" | "high" | "medium" | "low"
+    // critical = security vulnerability / data loss / crash — must fix before merge
+    // high     = bug causing incorrect behaviour
+    // medium   = performance issue or non-critical bug
+    // low      = minor improvement
+    public string Severity { get; set; } = string.Empty;
+
+    // Concrete fix: code snippet or step-by-step instructions provided by the LLM
+    public string SuggestedFix { get; set; } = string.Empty;
+
     public bool Posted { get; set; } = false;
 }
 

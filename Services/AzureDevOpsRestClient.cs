@@ -730,7 +730,10 @@ public class AzureDevOpsRestClient
     {
         var lineNumber = comment.LineNumber > 0 ? comment.LineNumber : 1;
         var anchorTitle = $"**[{comment.Severity.ToUpper()}] {comment.CommentType}**";
-        return $"{anchorTitle} (Line {lineNumber})\n\n{comment.CommentText}";
+        var body = $"{anchorTitle} (Line {lineNumber})\n\n{comment.CommentText}";
+        if (!string.IsNullOrWhiteSpace(comment.SuggestedFix))
+            body += $"\n\n**Suggested fix:**\n{comment.SuggestedFix}";
+        return body;
     }
 
     public static string BuildCommentFingerprint(CodeReviewComment comment)
