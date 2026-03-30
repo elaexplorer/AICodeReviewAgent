@@ -889,6 +889,66 @@ public class AzureDevOpsRestClient
     }
 
     /// <summary>
+    /// Returns the last N commit messages that touched a specific file, formatted for
+    /// LLM context injection. Helps the reviewer detect regressions — e.g. if a line
+    /// was intentionally fixed in a previous commit and this PR reverts it.
+    /// </summary>
+    public async Task<string> GetFileCommitHistoryAsync(
+        string project,
+        string repositoryId,
+        string filePath,
+        int maxCommits = 5)
+    {
+        try
+        {
+            // Normalize path — ADO expects leading slash
+            var normalizedPath = filePath.StartsWith('/') ? filePath : "/" + filePath;
+            var url = $"https://dev.azure.com/{_organization}/{project}/_apis/git/repositories/{repositoryId}/commits" +
+                      $"?searchCriteria.itemPath={Uri.EscapeDataString(normalizedPath)}" +
+                      $"&$top={maxCommits}&api-version=7.1";
+
+            var response = await _httpClient.GetAsync(url);
+            response.EnsureSuccessStatusCode();
+
+            var content = await response.Content.ReadAsStringAsync();
+            var root = System.Text.Json.JsonSerializer.Deserialize<System.Text.Json.JsonElement>(content);
+
+            if (!root.TryGetProperty("value", out var commits) || commits.ValueKind != System.Text.Json.JsonValueKind.Array)
+                return string.Empty;
+
+            var sb = new System.Text.StringBuilder();
+            foreach (var commit in commits.EnumerateArray())
+            {
+                var sha = commit.TryGetProperty("commitId", out var id) ? id.GetString()?[..8] ?? "?" : "?";
+                var msg = commit.TryGetProperty("comment", out var c) ? c.GetString() ?? string.Empty : string.Empty;
+                // First line of commit message only
+                msg = msg.Split('\n')[0].Trim();
+                if (msg.Length > 120) msg = msg[..120] + "…";
+
+                var date = string.Empty;
+                if (commit.TryGetProperty("author", out var author) &&
+                    author.TryGetProperty("date", out var dateProp))
+                    date = dateProp.GetString()?[..10] ?? string.Empty;
+
+                var authorName = string.Empty;
+                if (commit.TryGetProperty("author", out var auth2) &&
+                    auth2.TryGetProperty("name", out var nameProp))
+                    authorName = nameProp.GetString() ?? string.Empty;
+
+                if (!string.IsNullOrEmpty(msg))
+                    sb.AppendLine($"  - `{sha}` ({date}, {authorName}): {msg}");
+            }
+
+            return sb.Length > 0 ? sb.ToString() : string.Empty;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Unable to fetch commit history for {FilePath}", filePath);
+            return string.Empty;
+        }
+    }
+
+    /// <summary>
     /// Returns a markdown summary of existing human reviewer threads on a PR,
     /// formatted for injection into the LLM review prompt so the AI avoids duplicating feedback.
     /// Only includes active, non-system threads that have inline file context.
