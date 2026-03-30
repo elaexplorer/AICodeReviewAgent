@@ -10,6 +10,8 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.AI.Evaluation" Version="10.4.0" />
+    <PackageReference Include="Microsoft.Extensions.AI.Evaluation.Quality" Version="10.4.0" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.3.0" />
     <PackageReference Include="Microsoft.AspNetCore.Mvc.Testing" Version="9.0.0" />
     <PackageReference Include="FluentAssertions" Version="8.8.0" />
@@ -27,6 +29,8 @@
 
   <ItemGroup>
     <Compile Include="Tests\Smoke\**\*.cs" />
+    <Compile Include="Tests\Evals\**\*.cs" />
+    <Compile Include="Tests\UnitTests\Services\DiffAnnotatorTests.cs" />
   </ItemGroup>
 
 </Project>
