@@ -457,8 +457,10 @@ def review_pr(pr: dict, dry_run: bool):
     # 4. Consolidate
     consolidated = consolidate_comments(cloud_comments, claude_comments)
 
-    # 5. Post
-    post_comments(pr_id, consolidated, dry_run)
+    # 5. Post — high severity only
+    high_only = [c for c in consolidated if c.get("severity", "").lower() == "high"]
+    print(f"  [Filter] {len(consolidated)} total -> {len(high_only)} high severity")
+    post_comments(pr_id, high_only, dry_run)
 
 
 def main():
