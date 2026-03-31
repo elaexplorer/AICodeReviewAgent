@@ -135,6 +135,7 @@ builder.Services.AddSingleton<EmbeddingPersistenceService>(provider =>
         string.Empty, // DB always uses local temp path; see EmbeddingPersistenceService ctor
         provider.GetRequiredService<ILogger<EmbeddingPersistenceService>>()));
 builder.Services.AddHostedService<IndexRestoreHostedService>();
+builder.Services.AddHostedService<RagAutoIndexHostedService>();
 
 // Add RAG context service
 builder.Services.AddSingleton<CodebaseContextService>();

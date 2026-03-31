@@ -514,9 +514,11 @@ public class CodeReviewOrchestrator
                 4. **New public methods or behaviours** added in a source file but not covered by tests in the corresponding test file
                 5. **Inconsistent values** — the same literal value hardcoded differently across multiple changed files that should share a constant
                 6. **Missing paired changes** — e.g. a feature flag added in code but not in the feature flag config file
+                7. **Newly added files (changeType=add) and their integration assumptions** — does the new file depend on infrastructure, configuration, upstream services, or runtime state that is not guaranteed to exist? For example: a new config template that references a DNS zone, a new service that assumes a sidecar is present, a new script that expects an env var to be set. Flag any assumption the new file makes that is not validated or provisioned elsewhere in this PR or the codebase context.
 
                 IMPORTANT RULES:
                 - ONLY report issues that require looking at MORE THAN ONE file to detect. Do not repeat single-file issues.
+                - Pay special attention to files with changeType="add" — new files often introduce unvalidated integration assumptions.
                 - For each issue, set "filePath" to the file that should receive the comment (the one missing the update, or the most relevant file).
                 - Set startLine/endLine to the relevant line numbers in that file (use 1 if the issue is file-level with no specific line).
                 - Be conservative — only report issues you are confident about (confidence >= 0.7).
@@ -645,7 +647,45 @@ public class CodeReviewOrchestrator
                 ? $"Previous Content:\n```\n{file.PreviousContent}\n```\n"
                 : string.Empty;
 
-            var prompt = $$$"""
+            var isNewFile = string.Equals(file.ChangeType, "add", StringComparison.OrdinalIgnoreCase);
+
+            var prompt = isNewFile
+                ? $$$"""
+                You are a senior code reviewer performing an INTEGRATION REVIEW of a newly added file.
+                This file did not exist before — focus on whether it integrates correctly with the rest of the system.
+
+                File Path: {{{file.Path}}}
+
+                File Content:
+                {{{contentSection}}}
+
+                Codebase Context (existing code for reference):
+                {{{codebaseContext}}}
+
+                Review this NEW file focusing on:
+                1. **Integration assumptions** — does it depend on infrastructure, services, config, env vars, sidecars, DNS zones, or runtime state that may not exist or be provisioned? Flag anything assumed but not guaranteed.
+                2. **Missing wiring** — is there a registration, config entry, pipeline step, or deployment resource that needs to reference this new file but is not present in this PR?
+                3. **Security** — does the new file introduce a new attack surface, expose secrets, or bypass existing controls?
+                4. **Correctness** — are there bugs, bad defaults, or unsafe operations that would cause failures at runtime?
+                5. **Operational readiness** — logging, error handling, observability hooks appropriate for a new component?
+
+                For each issue, return:
+                - Line number (1 if file-level)
+                - Severity (high/medium/low)
+                - Type (issue/suggestion/nitpick)
+                - Clear explanation referencing what the new file assumes and why that assumption may be wrong
+
+                Return a JSON array (empty array [] if no issues):
+                [
+                  {
+                    "lineNumber": 1,
+                    "severity": "high",
+                    "type": "issue",
+                    "comment": "Detailed explanation"
+                  }
+                ]
+                """
+                : $$$"""
                 You are a general code reviewer with broad knowledge of software engineering best practices.
 
                 Review the following file that was changed in a pull request:
@@ -685,15 +725,19 @@ public class CodeReviewOrchestrator
                 If no issues are found, return an empty array: []
                 """;
 
+            var systemPrompt = isNewFile
+                ? "You are a senior code reviewer specialising in integration review of newly added files. Focus on unvalidated assumptions, missing wiring, and runtime integration gaps."
+                : "You are a general code reviewer with broad knowledge of software engineering best practices.";
+
             var messages = new List<ChatMessage>
             {
-                new(ChatRole.System, "You are a general code reviewer with broad knowledge of software engineering best practices."),
+                new(ChatRole.System, systemPrompt),
                 new(ChatRole.User, prompt)
             };
 
             // Log LLM request details
             _logger.LogInformation("╔════════════════════════════════════════════════════════════╗");
-            _logger.LogInformation("║ LLM REQUEST: General Code Review                           ║");
+            _logger.LogInformation("║ LLM REQUEST: {ReviewType}                           ║", isNewFile ? "New File Integration Review" : "General Code Review");
             _logger.LogInformation("╚════════════════════════════════════════════════════════════╝");
             _logger.LogInformation("📤 SENDING TO LLM:");
             _logger.LogInformation("   File: {FilePath}", file.Path);

@@ -1614,24 +1614,23 @@ public class CodebaseContextService
             var uri = new Uri(originalUrl);
             if (uri.Host.Contains("dev.azure.com"))
             {
-                // Convert dev.azure.com URL to visualstudio.com format for better compatibility
+                // Embed credentials directly in dev.azure.com URL
                 // Original: https://dev.azure.com/organization/project/_git/repository
-                // Target:   https://git:pat@organization.visualstudio.com/DefaultCollection/project/_git/repository
-                
-                var pathParts = uri.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
-                if (pathParts.Length >= 3)
-                {
-                    var organization = pathParts[0]; // "organization"
-                    var project = pathParts[1]; // "project"
-                    var repoPath = string.Join("/", pathParts.Skip(2)); // "_git/repository"
-                    var credentialToken = !string.IsNullOrWhiteSpace(preferredToken) ? preferredToken : fallbackPat;
-                    var credentialSource = !string.IsNullOrWhiteSpace(preferredToken) ? "X-Ado-Access-Token" : "ADO_PAT";
-                    
-                    // Use visualstudio.com format with username and DefaultCollection
-                    var authenticatedUrl = $"https://git:{credentialToken}@{organization.ToLower()}.visualstudio.com/DefaultCollection/{project}/{repoPath}";
-                    _logger.LogInformation("🔐 Using {CredentialSource} as primary clone credential for Azure DevOps", credentialSource);
-                    return authenticatedUrl;
-                }
+                // Target:   https://git:pat@dev.azure.com/organization/project/_git/repository
+                var credentialToken = !string.IsNullOrWhiteSpace(preferredToken) ? preferredToken : fallbackPat;
+                var credentialSource = !string.IsNullOrWhiteSpace(preferredToken) ? "X-Ado-Access-Token" : "ADO_PAT";
+                var authenticatedUrl = $"https://git:{Uri.EscapeDataString(credentialToken!)}@dev.azure.com{uri.AbsolutePath}";
+                _logger.LogInformation("🔐 Using {CredentialSource} as primary clone credential for Azure DevOps", credentialSource);
+                return authenticatedUrl;
+            }
+            else if (uri.Host.Contains("visualstudio.com"))
+            {
+                // Embed credentials in visualstudio.com URL
+                var credentialToken = !string.IsNullOrWhiteSpace(preferredToken) ? preferredToken : fallbackPat;
+                var credentialSource = !string.IsNullOrWhiteSpace(preferredToken) ? "X-Ado-Access-Token" : "ADO_PAT";
+                var authenticatedUrl = $"https://git:{Uri.EscapeDataString(credentialToken!)}@{uri.Host}{uri.AbsolutePath}";
+                _logger.LogInformation("🔐 Using {CredentialSource} as primary clone credential for Azure DevOps", credentialSource);
+                return authenticatedUrl;
             }
         }
         catch (Exception ex)
