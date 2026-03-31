@@ -378,6 +378,13 @@ public class AzureDevOpsMcpClient : IAsyncDisposable
         _logger.LogInformation("Updated ADO client configuration for organization: {Organization}", organization);
     }
 
+    public async Task<RepositoryInfo?> GetRepositoryAsync(string project, string repository)
+        => await _restClient.GetRepositoryAsync(project, repository);
+
+    public async Task<List<AgentThreadStatus>> GetAgentThreadStatusesAsync(
+        string project, string repositoryId, int pullRequestId)
+        => await _restClient.GetAgentThreadStatusesAsync(project, repositoryId, pullRequestId);
+
     public async ValueTask DisposeAsync()
     {
         if (_mcpClient is not null)

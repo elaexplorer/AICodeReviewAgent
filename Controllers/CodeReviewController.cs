@@ -1242,6 +1242,39 @@ public class CodeReviewController : ControllerBase
     }
 
     /// <summary>
+    /// Fetches current ADO thread statuses for a PR and records fixed/wontFix/etc. per comment.
+    /// Call this after reviewers have had time to act on comments.
+    /// POST /api/codereview/feedback/sync
+    /// Body: { "project": "...", "repository": "...", "pullRequestId": 123 }
+    /// </summary>
+    [HttpPost("feedback/sync")]
+    public async Task<IActionResult> SyncResolutions([FromBody] FeedbackSyncRequest request)
+    {
+        if (string.IsNullOrWhiteSpace(request.Project) || string.IsNullOrWhiteSpace(request.Repository) || request.PullRequestId <= 0)
+            return BadRequest("project, repository, and pullRequestId are required");
+
+        var repoInfo = await _adoClient.GetRepositoryAsync(request.Project, request.Repository);
+        if (repoInfo == null)
+            return NotFound($"Repository '{request.Repository}' not found in project '{request.Project}'");
+
+        var statuses = await _adoClient.GetAgentThreadStatusesAsync(request.Project, repoInfo.Id, request.PullRequestId);
+        var synced = await _feedbackService.SyncResolutionsAsync(request.Project, request.Repository, request.PullRequestId, statuses);
+
+        var summary = statuses.GroupBy(s => s.Status)
+            .ToDictionary(g => g.Key, g => g.Count());
+
+        _logger.LogInformation("Synced {Count} thread resolutions for PR {PrId}: {Summary}",
+            synced, request.PullRequestId, string.Join(", ", summary.Select(kv => $"{kv.Key}={kv.Value}")));
+
+        return Ok(new
+        {
+            synced,
+            pullRequestId = request.PullRequestId,
+            summary
+        });
+    }
+
+    /// <summary>
     /// Returns aggregated feedback metrics.
     /// GET /api/codereview/feedback/metrics
     /// </summary>
@@ -1289,6 +1322,13 @@ public class IndexRequest
     public string Project { get; set; } = "MyProject";
     public string Repository { get; set; } = "";
     public string Branch { get; set; } = "master";
+}
+
+public class FeedbackSyncRequest
+{
+    public string Project { get; set; } = string.Empty;
+    public string Repository { get; set; } = string.Empty;
+    public int PullRequestId { get; set; }
 }
 
 public class ReviewResult
