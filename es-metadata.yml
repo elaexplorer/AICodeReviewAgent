@@ -1,0 +1,12 @@
+schemaVersion: 1.0.0
+providers:
+- provider: InventoryAsCode
+  version: 1.0.0
+  metadata:
+    isProduction: false
+    accountableOwners:
+      service: cd0d22a5-bba5-4e02-b4f5-3cc38c524ddf
+    routing:
+      defaultAreaPath:
+        org: skype
+        path: SCC\IC3AI
