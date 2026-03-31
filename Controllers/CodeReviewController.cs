@@ -617,6 +617,122 @@ public class CodeReviewController : ControllerBase
         return fullRef;
     }
 
+    /// <summary>
+    /// Accepts a pre-computed list of review comments (e.g. from a local Claude review),
+    /// deduplicates against comments already posted on the PR, and posts only the net-new ones.
+    /// Designed for the daily local script that consolidates multi-model reviews before posting.
+    /// </summary>
+    [HttpPost("comments/post")]
+    public async Task<IActionResult> PostConsolidatedComments([FromBody] PostConsolidatedCommentsRequest request)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(request.Project) ||
+                string.IsNullOrWhiteSpace(request.Repository) ||
+                request.PullRequestId <= 0 ||
+                request.Comments == null || request.Comments.Count == 0)
+            {
+                return BadRequest(new { error = "project, repository, pullRequestId and at least one comment are required" });
+            }
+
+            var adoAccessTokenOverride = GetOptionalAdoAccessTokenHeader();
+
+            _logger.LogInformation(
+                "POST comments/post: {Count} candidate comments for PR {PrId} in {Project}/{Repository}",
+                request.Comments.Count, request.PullRequestId, request.Project, request.Repository);
+
+            // Fetch PR files so we can remap comment lines to valid diff positions
+            var files = await _adoClient.GetPullRequestFilesAsync(
+                request.Project, request.Repository, request.PullRequestId);
+
+            var validRightSideLinesByFile = BuildValidRightSideLineLookup(files);
+
+            // Fetch fingerprints + position keys already on the PR
+            var existingFingerprints = await _adoClient.GetExistingCommentFingerprintsAsync(
+                request.Project, request.Repository, request.PullRequestId);
+
+            var existingPositionKeys = await _adoClient.GetExistingCommentPositionKeysAsync(
+                request.Project, request.Repository, request.PullRequestId);
+
+            var postedCount  = 0;
+            var skippedCount = 0;
+            var failedCount  = 0;
+            var postedComments  = new List<object>();
+            var skippedComments = new List<object>();
+
+            foreach (var incoming in request.Comments)
+            {
+                // Map to CodeReviewComment
+                var comment = new CodeReviewComment
+                {
+                    Id          = Guid.NewGuid().ToString(),
+                    FilePath    = incoming.FilePath,
+                    StartLine   = incoming.StartLine,
+                    EndLine     = incoming.EndLine > 0 ? incoming.EndLine : incoming.StartLine,
+                    CommentText = incoming.CommentText,
+                    CommentType = incoming.CommentType ?? "issue",
+                    Severity    = incoming.Severity    ?? "medium",
+                    SuggestedFix = incoming.SuggestedFix ?? string.Empty,
+                    Confidence  = incoming.Confidence
+                };
+
+                RemapToNearestValidRightSideLine(comment, validRightSideLinesByFile);
+
+                var fingerprint = AzureDevOpsRestClient.BuildCommentFingerprint(comment);
+                var positionKey = AzureDevOpsRestClient.BuildCommentPositionKey(comment);
+
+                if (existingFingerprints.Contains(fingerprint) || existingPositionKeys.Contains(positionKey))
+                {
+                    skippedCount++;
+                    skippedComments.Add(new { comment.FilePath, comment.StartLine, reason = "duplicate" });
+                    _logger.LogInformation(
+                        "Skipping duplicate comment at {FilePath}:{Line}", comment.FilePath, comment.StartLine);
+                    continue;
+                }
+
+                var postResult = await _adoClient.PostCommentWithResultAsync(
+                    request.Project, request.Repository, request.PullRequestId,
+                    comment, adoAccessTokenOverride);
+
+                if (postResult.Success)
+                {
+                    postedCount++;
+                    existingFingerprints.Add(fingerprint);
+                    existingPositionKeys.Add(positionKey);
+                    postedComments.Add(new { comment.FilePath, comment.StartLine, comment.Severity });
+                    _logger.LogInformation(
+                        "Posted comment at {FilePath}:{Line} severity={Severity}",
+                        comment.FilePath, comment.StartLine, comment.Severity);
+                }
+                else
+                {
+                    failedCount++;
+                    _logger.LogWarning(
+                        "Failed to post comment at {FilePath}:{Line} — {Error}",
+                        comment.FilePath, comment.StartLine, postResult.ErrorMessage);
+                }
+            }
+
+            _logger.LogInformation(
+                "POST comments/post complete: posted={Posted} skipped={Skipped} failed={Failed}",
+                postedCount, skippedCount, failedCount);
+
+            return Ok(new
+            {
+                posted   = postedCount,
+                skipped  = skippedCount,
+                failed   = failedCount,
+                postedComments,
+                skippedComments
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error in POST comments/post");
+            return StatusCode(500, new { error = ex.Message });
+        }
+    }
+
     [HttpPost("comment")]
     public async Task<IActionResult> PostComment([FromBody] PostCommentRequest request)
     {
@@ -1329,6 +1445,26 @@ public class FeedbackSyncRequest
     public string Project { get; set; } = string.Empty;
     public string Repository { get; set; } = string.Empty;
     public int PullRequestId { get; set; }
+}
+
+public class PostConsolidatedCommentsRequest
+{
+    public string Project       { get; set; } = string.Empty;
+    public string Repository    { get; set; } = string.Empty;
+    public int    PullRequestId { get; set; }
+    public List<IncomingReviewComment> Comments { get; set; } = new();
+}
+
+public class IncomingReviewComment
+{
+    public string FilePath     { get; set; } = string.Empty;
+    public int    StartLine    { get; set; } = 1;
+    public int    EndLine      { get; set; }
+    public string CommentText  { get; set; } = string.Empty;
+    public string? Severity    { get; set; }   // high | medium | low
+    public string? CommentType { get; set; }   // issue | suggestion | nitpick
+    public string? SuggestedFix { get; set; }
+    public double  Confidence  { get; set; }
 }
 
 public class ReviewResult
