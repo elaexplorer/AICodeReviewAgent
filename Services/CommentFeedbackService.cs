@@ -134,16 +134,16 @@ public class CommentFeedbackService
         {
             cmd.CommandText = """
                 SELECT
-                    COUNT(*)                                    AS total,
-                    SUM(CASE WHEN is_helpful=1 THEN 1 ELSE 0 END) AS helpful,
-                    SUM(CASE WHEN is_helpful=0 THEN 1 ELSE 0 END) AS not_helpful
+                    COUNT(*)                                                   AS total,
+                    COALESCE(SUM(CASE WHEN is_helpful=1 THEN 1 ELSE 0 END),0) AS helpful,
+                    COALESCE(SUM(CASE WHEN is_helpful=0 THEN 1 ELSE 0 END),0) AS not_helpful
                 FROM feedback;
                 """;
             using var r = cmd.ExecuteReader();
             if (r.Read())
             {
-                metrics.TotalFeedback  = r.GetInt32(0);
-                metrics.HelpfulCount   = r.GetInt32(1);
+                metrics.TotalFeedback   = r.GetInt32(0);
+                metrics.HelpfulCount    = r.GetInt32(1);
                 metrics.NotHelpfulCount = r.GetInt32(2);
             }
         }
@@ -153,8 +153,8 @@ public class CommentFeedbackService
         {
             cmd.CommandText = """
                 SELECT severity,
-                       SUM(CASE WHEN is_helpful=1 THEN 1 ELSE 0 END) AS helpful,
-                       SUM(CASE WHEN is_helpful=0 THEN 1 ELSE 0 END) AS not_helpful
+                       COALESCE(SUM(CASE WHEN is_helpful=1 THEN 1 ELSE 0 END),0) AS helpful,
+                       COALESCE(SUM(CASE WHEN is_helpful=0 THEN 1 ELSE 0 END),0) AS not_helpful
                 FROM feedback
                 GROUP BY severity;
                 """;
@@ -174,8 +174,8 @@ public class CommentFeedbackService
         {
             cmd.CommandText = """
                 SELECT comment_type,
-                       SUM(CASE WHEN is_helpful=1 THEN 1 ELSE 0 END) AS helpful,
-                       SUM(CASE WHEN is_helpful=0 THEN 1 ELSE 0 END) AS not_helpful
+                       COALESCE(SUM(CASE WHEN is_helpful=1 THEN 1 ELSE 0 END),0) AS helpful,
+                       COALESCE(SUM(CASE WHEN is_helpful=0 THEN 1 ELSE 0 END),0) AS not_helpful
                 FROM feedback
                 GROUP BY comment_type;
                 """;
