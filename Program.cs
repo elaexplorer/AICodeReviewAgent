@@ -125,6 +125,13 @@ builder.Services.AddSingleton(provider =>
         provider.GetRequiredService<AzureDevOpsRestClient>(),
         provider.GetRequiredService<CodebaseCache>()));
 
+// Embedding persistence (SQLite) and startup restore
+builder.Services.AddSingleton<EmbeddingPersistenceService>(provider =>
+    new EmbeddingPersistenceService(
+        string.Empty, // DB always uses local temp path; see EmbeddingPersistenceService ctor
+        provider.GetRequiredService<ILogger<EmbeddingPersistenceService>>()));
+builder.Services.AddHostedService<IndexRestoreHostedService>();
+
 // Add RAG context service
 builder.Services.AddSingleton<CodebaseContextService>();
 

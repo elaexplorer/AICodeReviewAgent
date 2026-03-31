@@ -14,6 +14,7 @@ public class CodebaseContextService
     private readonly IEmbeddingGenerator<string, Embedding<float>> _embeddingGenerator;
     private readonly AzureDevOpsRestClient _adoClient;
     private readonly ILogger<CodebaseContextService> _logger;
+    private readonly EmbeddingPersistenceService _persistence;
     private readonly Dictionary<string, List<CodeChunk>> _inMemoryStore;
     private const string COLLECTION_NAME = "codebase";
     private const int CloneTimeoutSeconds = 60;
@@ -21,12 +22,157 @@ public class CodebaseContextService
     public CodebaseContextService(
         IEmbeddingGenerator<string, Embedding<float>> embeddingGenerator,
         AzureDevOpsRestClient adoClient,
+        EmbeddingPersistenceService persistence,
         ILogger<CodebaseContextService> logger)
     {
         _embeddingGenerator = embeddingGenerator;
         _adoClient = adoClient;
+        _persistence = persistence;
         _logger = logger;
         _inMemoryStore = new Dictionary<string, List<CodeChunk>>();
+    }
+
+    /// <summary>
+    /// Reload a repository's chunks from the SQLite persistence store into memory.
+    /// Called by IndexRestoreHostedService on startup.
+    /// </summary>
+    public async Task RestoreIndexFromDiskAsync(string repositoryId)
+    {
+        var chunks = await _persistence.LoadAsync(repositoryId);
+        if (chunks == null || chunks.Count == 0)
+        {
+            _logger.LogInformation("📦 No persisted chunks found for '{Repo}'", repositoryId);
+            return;
+        }
+        _inMemoryStore[repositoryId] = chunks;
+        _logger.LogInformation("✅ Restored {Count} chunks for '{Repo}' from SQLite", chunks.Count, repositoryId);
+    }
+
+    /// <summary>
+    /// Incrementally refresh the index for a repository.
+    /// Fetches the latest commits, re-embeds only changed files, and persists.
+    /// Returns the number of chunks updated (0 = already up-to-date, -1 = fell back to full re-index).
+    /// </summary>
+    public async Task<int> RefreshIndexAsync(
+        string project,
+        string repositoryId,
+        string branch = "master",
+        string? accessTokenOverride = null)
+    {
+        _logger.LogInformation("🔄 RefreshIndex: Starting incremental refresh for '{Repo}' branch '{Branch}'", repositoryId, branch);
+
+        var tempReposDir = Environment.GetEnvironmentVariable("RagRuntime__TempReposRootPath")
+            ?? Path.Combine(Directory.GetCurrentDirectory(), "temp_repos");
+        var tempDir  = Path.Combine(tempReposDir, repositoryId);
+        var cloneDir = Path.Combine(tempDir, "repo");
+
+        // If no clone on disk, fall back to a full re-index
+        if (!Directory.Exists(cloneDir) || !Directory.Exists(Path.Combine(cloneDir, ".git")))
+        {
+            _logger.LogInformation("📂 No local clone found — falling back to full re-index");
+            await IndexRepositoryWithCloneAsync(project, repositoryId, branch, null, accessTokenOverride);
+            return -1;
+        }
+
+        // Retrieve the hash we indexed last time
+        var storedHash = await _persistence.GetCommitHashAsync(repositoryId);
+        _logger.LogInformation("📌 Stored commit hash: {Hash}", storedHash ?? "(none)");
+
+        // Fetch latest from remote (shallow, up to 50 commits so we can diff)
+        var fetchResult = await RunGitCommandAsync($"fetch origin {branch} --depth=50", cloneDir, 60);
+        if (!fetchResult.Success)
+        {
+            _logger.LogWarning("⚠️ git fetch failed: {Error} — falling back to full re-index", fetchResult.Error);
+            await IndexRepositoryWithCloneAsync(project, repositoryId, branch, null, accessTokenOverride);
+            return -1;
+        }
+
+        // Resolve FETCH_HEAD hash
+        var fetchHeadResult = await RunGitCommandAsync("rev-parse FETCH_HEAD", cloneDir, 10);
+        var currentHash = fetchHeadResult.Success ? fetchHeadResult.Output.Trim() : null;
+        _logger.LogInformation("📌 FETCH_HEAD hash: {Hash}", currentHash ?? "(unknown)");
+
+        if (!string.IsNullOrWhiteSpace(storedHash) &&
+            string.Equals(storedHash, currentHash, StringComparison.OrdinalIgnoreCase))
+        {
+            _logger.LogInformation("✅ Index is already up-to-date (hash={Hash})", storedHash);
+            return 0;
+        }
+
+        // Get the list of changed files
+        List<string> changedFiles;
+        if (!string.IsNullOrWhiteSpace(storedHash))
+        {
+            var diffResult = await RunGitCommandAsync($"diff --name-only {storedHash} FETCH_HEAD", cloneDir, 30);
+            if (!diffResult.Success)
+            {
+                _logger.LogWarning("⚠️ git diff failed — falling back to full re-index");
+                await IndexRepositoryWithCloneAsync(project, repositoryId, branch, null, accessTokenOverride);
+                return -1;
+            }
+            changedFiles = diffResult.Output
+                .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                .Select(f => f.Trim())
+                .Where(f => !string.IsNullOrWhiteSpace(f))
+                .ToList();
+        }
+        else
+        {
+            var lsResult = await RunGitCommandAsync("ls-files", cloneDir, 30);
+            changedFiles = lsResult.Success
+                ? lsResult.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries).Select(f => f.Trim()).ToList()
+                : new List<string>();
+        }
+
+        _logger.LogInformation("📝 {Count} files changed since last index", changedFiles.Count);
+
+        if (changedFiles.Count == 0)
+        {
+            _logger.LogInformation("✅ No changed files — index is current");
+            return 0;
+        }
+
+        // Advance the local branch to FETCH_HEAD
+        var resetResult = await RunGitCommandAsync("reset --hard FETCH_HEAD", cloneDir, 30);
+        if (!resetResult.Success)
+        {
+            _logger.LogWarning("⚠️ git reset failed — falling back to full re-index");
+            await IndexRepositoryWithCloneAsync(project, repositoryId, branch, null, accessTokenOverride);
+            return -1;
+        }
+
+        // Re-embed only the changed files that still exist on disk
+        var existingChanged = changedFiles
+            .Where(f => File.Exists(Path.Combine(cloneDir, f)))
+            .ToList();
+
+        _logger.LogInformation("🔢 Re-embedding {Count} files…", existingChanged.Count);
+        var newChunks = await ProcessFilesFromDiskAsync(cloneDir, existingChanged);
+
+        // Merge into in-memory store
+        var normalizedChanged = changedFiles
+            .Select(f => f.Replace('\\', '/').TrimStart('/').ToLowerInvariant())
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        if (_inMemoryStore.TryGetValue(repositoryId, out var existing))
+        {
+            var kept = existing.Where(c =>
+                !normalizedChanged.Contains(c.FilePath.Replace('\\', '/').TrimStart('/').ToLowerInvariant()))
+                .ToList();
+            kept.AddRange(newChunks);
+            _inMemoryStore[repositoryId] = kept;
+        }
+        else
+        {
+            _inMemoryStore[repositoryId] = newChunks;
+        }
+
+        var totalChunks = _inMemoryStore[repositoryId].Count;
+        _logger.LogInformation("✅ Refresh complete: {New} new chunks, {Total} total", newChunks.Count, totalChunks);
+
+        _ = _persistence.SaveAsync(repositoryId, _inMemoryStore[repositoryId], currentHash);
+
+        return newChunks.Count;
     }
 
     /// <summary>
@@ -92,9 +238,10 @@ public class CodebaseContextService
         _logger.LogInformation("Project: {Project}", project);
         _logger.LogInformation("Branch: {Branch}", branch);
 
-        // Step 1: Prepare clone directory (in current codebase for easy access)
+        // Step 1: Prepare clone directory — prefer mounted persistent path if set
         var currentDir = Directory.GetCurrentDirectory();
-        var tempReposDir = Path.Combine(currentDir, "temp_repos");
+        var tempReposDir = Environment.GetEnvironmentVariable("RagRuntime__TempReposRootPath")
+            ?? Path.Combine(currentDir, "temp_repos");
         var tempDir = Path.Combine(tempReposDir, repositoryId);
         var cloneDir = Path.Combine(tempDir, "repo");
         
@@ -179,8 +326,14 @@ public class CodebaseContextService
             _logger.LogInformation("✅ Repository cloned successfully");
 
             ProcessFiles:
-            // Step 3: Discover all files using file system
-            _logger.LogInformation("Step 3: Discovering files using file system traversal...");
+            // Step 3: Capture HEAD commit hash for incremental refresh
+            var headHashResult = await RunGitCommandAsync("rev-parse HEAD", cloneDir, 10);
+            var headCommitHash = headHashResult.Success ? headHashResult.Output.Trim() : null;
+            if (!string.IsNullOrWhiteSpace(headCommitHash))
+                _logger.LogInformation("📌 HEAD commit hash: {Hash}", headCommitHash);
+
+            // Step 4: Discover all files using file system
+            _logger.LogInformation("Step 4: Discovering files using file system traversal...");
             var allFiles = Directory.GetFiles(cloneDir, "*.*", SearchOption.AllDirectories)
                 .Where(f => !IsGitFile(f)) // Skip .git directory files
                 .Select(f => Path.GetRelativePath(cloneDir, f).Replace('\\', '/')) // Normalize to forward slashes
@@ -188,12 +341,13 @@ public class CodebaseContextService
 
             _logger.LogInformation("Found {FileCount} total files via file system (vs API discovery)", allFiles.Count);
 
-            // Step 4: Process files with actual content from disk
+            // Step 5: Process files with actual content from disk
             var chunks = await ProcessFilesFromDiskAsync(cloneDir, allFiles);
 
-            // Step 5: Store in memory index
+            // Step 6: Store in memory index and persist to SQLite (with commit hash)
             _inMemoryStore[repositoryId] = chunks;
-            
+            _ = _persistence.SaveAsync(repositoryId, chunks, headCommitHash); // fire-and-forget
+
             _logger.LogInformation("╔════════════════════════════════════════════════════════════╗");
             _logger.LogInformation("║ RAG INDEXING: Git Clone-Based Indexing Complete            ║");
             _logger.LogInformation("╚════════════════════════════════════════════════════════════╝");
@@ -210,22 +364,8 @@ public class CodebaseContextService
             _logger.LogError(ex, "❌ Git clone-based indexing failed");
             return 0;
         }
-        finally
-        {
-            // Cleanup
-            try
-            {
-                if (Directory.Exists(tempDir))
-                {
-                    _logger.LogInformation("🧹 Cleaning up clone directory...");
-                    await CleanupCloneDirectoryAsync(tempDir);
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "⚠️  Failed to cleanup clone directory: {TempDir}", tempDir);
-            }
-        }
+        // Clone directory is intentionally preserved so RefreshIndexAsync can do
+        // incremental git fetch + diff instead of a full re-clone next time.
     }
 
     /// <summary>
@@ -473,8 +613,9 @@ public class CodebaseContextService
                 }
             }
             
-            // Store all chunks in memory
+            // Store all chunks in memory and persist to SQLite
             _inMemoryStore[repositoryId] = chunks;
+            _ = _persistence.SaveAsync(repositoryId, chunks); // fire-and-forget
 
             _logger.LogInformation("✅ API Method: Indexed {Count} chunks from {Files} files", indexed, files.Count);
             return (true, indexed, null);
@@ -779,71 +920,498 @@ public class CodebaseContextService
     }
 
     /// <summary>
-    /// Get dependency-based context (files that import/are imported by this file)
+    /// Build 2-level dependency graph context from the in-memory chunk store (no ADO calls).
+    /// Supports TypeScript/JS relative imports, C#, Python, Rust.
     /// </summary>
-    public async Task<string> GetDependencyContextAsync(
+    public Task<string> BuildDependencyGraphContextAsync(
         PullRequestFile file,
-        string project,
         string repositoryId)
     {
-        var context = new StringBuilder();
+        if (!_inMemoryStore.TryGetValue(repositoryId, out var allChunks) || allChunks.Count == 0)
+            return Task.FromResult(string.Empty);
 
-        // Parse imports/dependencies from file content
-        var dependencies = ParseDependencies(file.Content, file.Path);
+        // Build lookup: normalized path → chunks for that file
+        var chunksByPath = allChunks
+            .GroupBy(c => NormalizeDepPath(c.FilePath))
+            .ToDictionary(g => g.Key, g => g.ToList());
 
-        if (!dependencies.Any())
+        const int MAX_DEP_FILES = 8;
+        const int CHAR_BUDGET = 8000;
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var result = new StringBuilder();
+        result.AppendLine("## Dependency Context (import graph)");
+        int totalChars = 0;
+        int fetched = 0;
+
+        // Level 1: direct imports of the changed file
+        var level1Paths = ResolveImports(file.Content, file.Path, chunksByPath);
+        _logger.LogInformation("🔗 Dep graph L1: {Count} imports from {File}", level1Paths.Count, file.Path);
+
+        var queue = new Queue<(string path, int level)>();
+        foreach (var p in level1Paths)
+            queue.Enqueue((p, 1));
+
+        while (queue.Count > 0 && fetched < MAX_DEP_FILES && totalChars < CHAR_BUDGET)
         {
-            _logger.LogInformation("No dependencies found in {FilePath}", file.Path);
-            return string.Empty;
-        }
+            var (depPath, level) = queue.Dequeue();
+            if (!seen.Add(depPath)) continue;
 
-        _logger.LogInformation("Found {Count} dependencies in {FilePath}:", dependencies.Count, file.Path);
-        foreach (var dep in dependencies)
-        {
-            _logger.LogInformation("  - {Dependency}", dep);
-        }
+            if (!chunksByPath.TryGetValue(depPath, out var depChunks)) continue;
 
-        context.AppendLine("## Related Files (Dependencies)");
-        context.AppendLine();
+            var depContent = string.Join("\n", depChunks.OrderBy(c => c.StartLine).Select(c => c.Content));
+            var declarations = ExtractDeclarations(depContent, depChunks[0].FilePath);
+            if (string.IsNullOrWhiteSpace(declarations)) continue;
 
-        int fetchedCount = 0;
-        foreach (var dep in dependencies.Take(3)) // Limit to top 3
-        {
-            try
+            var remaining = CHAR_BUDGET - totalChars;
+            if (declarations.Length > remaining)
+                declarations = declarations.Substring(0, remaining) + "\n// [truncated]";
+
+            result.AppendLine($"### {depChunks[0].FilePath} (L{level} dep)");
+            result.AppendLine("```");
+            result.AppendLine(declarations);
+            result.AppendLine("```");
+            result.AppendLine();
+
+            totalChars += declarations.Length;
+            fetched++;
+
+            // Enqueue level-2 imports
+            if (level == 1)
             {
-                _logger.LogInformation("Fetching dependency file: {Dependency}", dep);
-                var depContent = await _adoClient.GetFileContentAsync(
-                    project, repositoryId, dep, "main");
+                var level2Paths = ResolveImports(depContent, depChunks[0].FilePath, chunksByPath);
+                foreach (var p2 in level2Paths.Where(p => !seen.Contains(p)))
+                    queue.Enqueue((p2, 2));
+            }
+        }
 
-                if (string.IsNullOrEmpty(depContent))
+        if (fetched == 0) return Task.FromResult(string.Empty);
+
+        _logger.LogInformation("🔗 Dependency graph: {Count} files, {Chars} chars", fetched, totalChars);
+        return Task.FromResult(result.ToString());
+    }
+
+    /// <summary>
+    /// Resolve imports/using statements to normalized chunk paths present in the in-memory store.
+    /// </summary>
+    private List<string> ResolveImports(string? content, string sourceFilePath, Dictionary<string, List<CodeChunk>> chunksByPath)
+    {
+        if (string.IsNullOrEmpty(content)) return new List<string>();
+
+        var ext = Path.GetExtension(sourceFilePath).ToLowerInvariant();
+        var sourceDir = (Path.GetDirectoryName(sourceFilePath.Replace('\\', '/')) ?? string.Empty).TrimStart('/');
+        var rawImports = new List<string>();
+
+        if (ext is ".ts" or ".tsx" or ".js" or ".jsx" or ".mts" or ".cts")
+        {
+            // import ... from './foo'  |  export ... from './foo'
+            var fromMatches = Regex.Matches(content,
+                @"(?:import|export)\s+(?:[\w\s{},*]+\s+from\s+)?[""'`](\.\.?/[^""'`\n]+)[""'`]");
+            foreach (Match m in fromMatches)
+                rawImports.Add(m.Groups[1].Value);
+
+            // require('./foo')  |  import('./foo')
+            var requireMatches = Regex.Matches(content,
+                @"(?:require|import)\s*\(\s*[""'`](\.\.?/[^""'`\n]+)[""'`]\s*\)");
+            foreach (Match m in requireMatches)
+                rawImports.Add(m.Groups[1].Value);
+        }
+        else if (ext == ".cs")
+        {
+            // Match using statements and search by type name in indexed filenames
+            var usingMatches = Regex.Matches(content, @"using\s+([A-Za-z0-9_.]+);");
+            var resolved = new List<string>();
+            foreach (Match m in usingMatches)
+            {
+                var typeName = m.Groups[1].Value.Split('.').Last();
+                var found = chunksByPath.Keys.FirstOrDefault(k =>
+                    string.Equals(Path.GetFileNameWithoutExtension(k), typeName, StringComparison.OrdinalIgnoreCase));
+                if (found != null) resolved.Add(found);
+            }
+            return resolved.Distinct().Take(6).ToList();
+        }
+        else if (ext == ".py")
+        {
+            // from .module import X  |  from module import X
+            var fromMatches = Regex.Matches(content, @"from\s+(\.?[A-Za-z0-9_.]+)\s+import");
+            foreach (Match m in fromMatches)
+            {
+                var mod = m.Groups[1].Value.TrimStart('.');
+                rawImports.Add(mod.StartsWith('.') ? "./" + mod.Replace('.', '/') : "/" + mod.Replace('.', '/'));
+            }
+        }
+        else if (ext == ".rs")
+        {
+            var useMatches = Regex.Matches(content, @"use\s+(?:crate::)?([A-Za-z0-9_:]+)");
+            foreach (Match m in useMatches)
+            {
+                var segs = m.Groups[1].Value
+                    .Split("::", StringSplitOptions.RemoveEmptyEntries)
+                    .Where(s => !s.Equals("self", StringComparison.OrdinalIgnoreCase)
+                             && !s.Equals("super", StringComparison.OrdinalIgnoreCase)
+                             && !s.Equals("crate", StringComparison.OrdinalIgnoreCase))
+                    .ToList();
+                if (segs.Count > 0 && char.IsUpper(segs[^1][0])) segs.RemoveAt(segs.Count - 1);
+                if (segs.Count > 0) rawImports.Add("/src/" + string.Join("/", segs));
+            }
+        }
+
+        // Resolve relative paths and find matching keys in chunk store
+        var tsExtensions = new[] { ".ts", ".tsx", ".js", ".jsx", ".mts", ".cts" };
+        var resolved2 = new List<string>();
+        foreach (var raw in rawImports.Distinct())
+        {
+            string basePath = raw.StartsWith('/')
+                ? raw.TrimStart('/')
+                : ResolveRelativePath(sourceDir, raw);
+
+            basePath = NormalizeDepPath(basePath);
+            // Strip query strings / hash fragments
+            var qIdx = basePath.IndexOfAny(new[] { '?', '#' });
+            if (qIdx >= 0) basePath = basePath.Substring(0, qIdx);
+
+            // Try exact match
+            if (chunksByPath.ContainsKey(basePath)) { resolved2.Add(basePath); continue; }
+
+            // Try adding extensions
+            bool found = false;
+            foreach (var tryExt in tsExtensions)
+            {
+                var candidate = NormalizeDepPath(basePath + tryExt);
+                if (chunksByPath.ContainsKey(candidate)) { resolved2.Add(candidate); found = true; break; }
+            }
+            if (found) continue;
+
+            // Try /index.* barrel files
+            foreach (var tryExt in tsExtensions)
+            {
+                var candidate = NormalizeDepPath(basePath + "/index" + tryExt);
+                if (chunksByPath.ContainsKey(candidate)) { resolved2.Add(candidate); break; }
+            }
+        }
+
+        return resolved2.Distinct().Take(6).ToList();
+    }
+
+    private string ResolveRelativePath(string sourceDir, string relativePath)
+    {
+        var combined = string.IsNullOrEmpty(sourceDir) ? relativePath : sourceDir + "/" + relativePath;
+        var parts = combined.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        var stack = new Stack<string>();
+        foreach (var part in parts)
+        {
+            if (part == "..") { if (stack.Count > 0) stack.Pop(); }
+            else if (part != ".") stack.Push(part);
+        }
+        return string.Join("/", stack.Reverse());
+    }
+
+    private static string NormalizeDepPath(string path) =>
+        path.Replace('\\', '/').TrimStart('/').ToLowerInvariant();
+
+    /// <summary>
+    /// Extract only exported/public declarations from file content (not full file body).
+    /// </summary>
+    private string ExtractDeclarations(string content, string filePath)
+    {
+        if (string.IsNullOrEmpty(content)) return string.Empty;
+
+        var ext = Path.GetExtension(filePath).ToLowerInvariant();
+        var lines = content.Split('\n');
+        var kept = new List<string>();
+
+        if (ext is ".ts" or ".tsx" or ".js" or ".jsx" or ".mts" or ".cts")
+        {
+            int braceDepth = 0;
+            bool capturing = false;
+            foreach (var line in lines)
+            {
+                var t = line.TrimStart();
+                bool isDecl = t.StartsWith("export ") || t.StartsWith("interface ") ||
+                              t.StartsWith("type ") || t.StartsWith("abstract class") ||
+                              t.StartsWith("declare ") || t.StartsWith("class ") ||
+                              t.StartsWith("enum ") || t.StartsWith("/** ") ||
+                              t.StartsWith(" * ") || t.StartsWith("*/");
+
+                if (isDecl || capturing)
                 {
-                    _logger.LogInformation("Dependency file {Dependency} is empty", dep);
-                    continue;
+                    kept.Add(line);
+                    braceDepth += line.Count(c => c == '{') - line.Count(c => c == '}');
+                    capturing = braceDepth > 0;
                 }
-
-                // Get summary (first 20 lines or class/interface definitions)
-                var summary = GetFileSummary(depContent, 20);
-
-                context.AppendLine($"### {dep}");
-                context.AppendLine("```");
-                context.AppendLine(summary);
-                context.AppendLine("```");
-                context.AppendLine();
-
-                fetchedCount++;
-                _logger.LogInformation("Successfully fetched dependency: {Dependency} ({Length} chars)",
-                    dep, summary.Length);
             }
-            catch (Exception ex)
+        }
+        else if (ext == ".cs")
+        {
+            foreach (var line in lines)
             {
-                _logger.LogWarning(ex, "Could not fetch dependency {Dependency}", dep);
+                var t = line.TrimStart();
+                if (Regex.IsMatch(t, @"^(public|internal|protected)\s") &&
+                    (t.Contains("class ") || t.Contains("interface ") || t.Contains("record ") ||
+                     t.Contains("enum ") || t.Contains("(") || t.Contains("=>")))
+                    kept.Add(line);
+            }
+        }
+        else if (ext == ".py")
+        {
+            foreach (var line in lines)
+            {
+                var t = line.TrimStart();
+                if (t.StartsWith("class ") || t.StartsWith("def ") || t.StartsWith("async def ") ||
+                    t.StartsWith("@") || t.StartsWith("\"\"\""))
+                    kept.Add(line);
+            }
+        }
+        else if (ext == ".rs")
+        {
+            foreach (var line in lines)
+            {
+                var t = line.TrimStart();
+                if (t.StartsWith("pub ") || t.StartsWith("pub(") || t.StartsWith("struct ") ||
+                    t.StartsWith("trait ") || t.StartsWith("impl ") || t.StartsWith("fn ") ||
+                    t.StartsWith("type ") || t.StartsWith("enum ") || t.StartsWith("///"))
+                    kept.Add(line);
+            }
+        }
+        else
+        {
+            return string.Join("\n", lines.Take(30));
+        }
+
+        return kept.Count > 0 ? string.Join("\n", kept) : string.Join("\n", lines.Take(30));
+    }
+
+    /// <summary>
+    /// Caller search: find call sites in the indexed repo for functions modified in this file's diff.
+    /// Catches breaking API changes — shows which files call functions that were renamed/changed.
+    /// Pure in-memory scan, no embeddings needed.
+    /// </summary>
+    public string GetCallerContext(PullRequestFile file, string repositoryId)
+    {
+        if (!_inMemoryStore.TryGetValue(repositoryId, out var allChunks) || allChunks.Count == 0)
+            return string.Empty;
+
+        var modifiedFunctions = ExtractModifiedFunctionNames(file.UnifiedDiff, file.Path);
+        if (modifiedFunctions.Count == 0) return string.Empty;
+
+        _logger.LogInformation("🔍 Caller search: {Count} modified functions [{Names}]",
+            modifiedFunctions.Count, string.Join(", ", modifiedFunctions));
+
+        var sourceNormalized = NormalizeDepPath(file.Path);
+        const int MAX_CALLERS = 5;
+        const int CHAR_BUDGET = 4000;
+
+        var result = new StringBuilder();
+        result.AppendLine("## Caller Context (who calls modified functions)");
+
+        var seenFilePerFn = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        int totalChars = 0;
+        int callerCount = 0;
+
+        foreach (var fnName in modifiedFunctions)
+        {
+            if (callerCount >= MAX_CALLERS || totalChars >= CHAR_BUDGET) break;
+
+            foreach (var chunk in allChunks)
+            {
+                if (callerCount >= MAX_CALLERS || totalChars >= CHAR_BUDGET) break;
+                if (NormalizeDepPath(chunk.FilePath) == sourceNormalized) continue;
+
+                var key = $"{chunk.FilePath}|{fnName}";
+                if (seenFilePerFn.Contains(key)) continue;
+
+                if (!chunk.Content.Contains(fnName + "(", StringComparison.Ordinal) &&
+                    !chunk.Content.Contains(fnName + " (", StringComparison.Ordinal))
+                    continue;
+
+                seenFilePerFn.Add(key);
+
+                var snippet = ExtractCallSiteSnippet(chunk.Content, fnName, contextLines: 3);
+                if (string.IsNullOrWhiteSpace(snippet)) continue;
+
+                var remaining = CHAR_BUDGET - totalChars;
+                if (snippet.Length > remaining)
+                    snippet = snippet.Substring(0, remaining) + "\n// [truncated]";
+
+                result.AppendLine($"### {chunk.FilePath} (calls `{fnName}`)");
+                result.AppendLine("```");
+                result.AppendLine(snippet);
+                result.AppendLine("```");
+                result.AppendLine();
+
+                totalChars += snippet.Length;
+                callerCount++;
             }
         }
 
-        _logger.LogInformation("Successfully fetched {Count} out of {Total} dependencies",
-            fetchedCount, Math.Min(3, dependencies.Count));
+        if (callerCount == 0) return string.Empty;
 
-        return context.ToString();
+        _logger.LogInformation("🔍 Caller search: {Count} callers found, {Chars} chars", callerCount, totalChars);
+        return result.ToString();
+    }
+
+    private List<string> ExtractModifiedFunctionNames(string? unifiedDiff, string filePath) =>
+        ExtractFunctionNamesFromDiffLines(unifiedDiff, filePath, addedLines: true);
+
+    private List<string> ExtractFunctionNamesFromDiffLines(string? unifiedDiff, string filePath, bool addedLines)
+    {
+        if (string.IsNullOrEmpty(unifiedDiff)) return new List<string>();
+
+        var ext    = Path.GetExtension(filePath).ToLowerInvariant();
+        var names  = new List<string>();
+        var prefix = addedLines ? '+' : '-';
+        var skipPrefix = addedLines ? "+++" : "---";
+
+        var lines = unifiedDiff
+            .Split('\n')
+            .Where(l => l.Length > 0 && l[0] == prefix && !l.StartsWith(skipPrefix))
+            .Select(l => l.Substring(1).TrimStart());
+
+        foreach (var line in lines)
+        {
+            string? name = null;
+
+            if (ext is ".ts" or ".tsx" or ".js" or ".jsx" or ".mts" or ".cts")
+            {
+                var m = Regex.Match(line, @"(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*[(<]");
+                if (m.Success) name = m.Groups[1].Value;
+                if (name == null)
+                {
+                    m = Regex.Match(line, @"(?:export\s+)?(?:const|let)\s+(\w+)\s*=\s*(?:async\s*)?\(");
+                    if (m.Success) name = m.Groups[1].Value;
+                }
+                if (name == null)
+                {
+                    m = Regex.Match(line, @"^\s*(?:public|private|protected|static|async|override)[\s\w]*\s+(\w+)\s*\(");
+                    if (m.Success && !IsKeyword(m.Groups[1].Value)) name = m.Groups[1].Value;
+                }
+            }
+            else if (ext == ".cs")
+            {
+                var m = Regex.Match(line,
+                    @"(?:public|private|protected|internal|static|async|virtual|override|abstract)\s+(?:[\w<>\[\]?,\s]+\s+)+(\w+)\s*\(");
+                if (m.Success && !IsKeyword(m.Groups[1].Value)) name = m.Groups[1].Value;
+            }
+            else if (ext == ".py")
+            {
+                var m = Regex.Match(line, @"(?:async\s+)?def\s+(\w+)\s*\(");
+                if (m.Success) name = m.Groups[1].Value;
+            }
+            else if (ext == ".rs")
+            {
+                var m = Regex.Match(line, @"(?:pub\s+)?(?:async\s+)?fn\s+(\w+)\s*[(<]");
+                if (m.Success) name = m.Groups[1].Value;
+            }
+
+            if (name != null && name.Length > 2 && !IsKeyword(name) && !names.Contains(name))
+                names.Add(name);
+        }
+
+        return names.Take(8).ToList();
+    }
+
+    private (List<string> SignatureChanged, List<string> Deleted) ExtractSignatureChangedFunctions(
+        string? unifiedDiff, string filePath)
+    {
+        if (string.IsNullOrEmpty(unifiedDiff)) return (new(), new());
+        var added   = ExtractFunctionNamesFromDiffLines(unifiedDiff, filePath, addedLines: true);
+        var removed = ExtractFunctionNamesFromDiffLines(unifiedDiff, filePath, addedLines: false);
+        var changed = removed.Intersect(added, StringComparer.Ordinal).ToList();
+        var deleted = removed.Except(added, StringComparer.Ordinal).ToList();
+        return (changed, deleted);
+    }
+
+    public string GetSignatureChangeImpactContext(PullRequestFile file, string repositoryId)
+    {
+        if (!_inMemoryStore.TryGetValue(repositoryId, out var allChunks) || allChunks.Count == 0)
+            return string.Empty;
+
+        var (signatureChanged, deleted) = ExtractSignatureChangedFunctions(file.UnifiedDiff, file.Path);
+        var impactedFunctions = signatureChanged.Concat(deleted).Distinct().ToList();
+        if (impactedFunctions.Count == 0) return string.Empty;
+
+        _logger.LogInformation("⚠️ Impact scan: {Sig} signature-changed, {Del} deleted functions [{Names}]",
+            signatureChanged.Count, deleted.Count, string.Join(", ", impactedFunctions));
+
+        var sourceNormalized = NormalizeDepPath(file.Path);
+        const int MAX_CALLERS = 6;
+        const int CHAR_BUDGET = 4000;
+
+        var result = new StringBuilder();
+        result.AppendLine("## ⚠️ Cross-File Impact Warning");
+        result.AppendLine("The following functions had their **signatures changed or were deleted**.");
+        result.AppendLine("Each call site below may need to be updated to match the new signature.");
+        result.AppendLine();
+
+        if (signatureChanged.Count > 0)
+            result.AppendLine($"**Signature changed:** `{string.Join("`, `", signatureChanged)}`");
+        if (deleted.Count > 0)
+            result.AppendLine($"**Deleted:** `{string.Join("`, `", deleted)}`");
+        result.AppendLine();
+
+        var seenKey    = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        int totalChars = 0;
+        int callerCount = 0;
+
+        foreach (var fnName in impactedFunctions)
+        {
+            if (callerCount >= MAX_CALLERS || totalChars >= CHAR_BUDGET) break;
+            foreach (var chunk in allChunks)
+            {
+                if (callerCount >= MAX_CALLERS || totalChars >= CHAR_BUDGET) break;
+                if (NormalizeDepPath(chunk.FilePath) == sourceNormalized) continue;
+                var key = $"{chunk.FilePath}|{fnName}";
+                if (seenKey.Contains(key)) continue;
+                if (!chunk.Content.Contains(fnName + "(", StringComparison.Ordinal) &&
+                    !chunk.Content.Contains(fnName + " (", StringComparison.Ordinal)) continue;
+                seenKey.Add(key);
+                var snippet = ExtractCallSiteSnippet(chunk.Content, fnName, contextLines: 3);
+                if (string.IsNullOrWhiteSpace(snippet)) continue;
+                var remaining = CHAR_BUDGET - totalChars;
+                if (snippet.Length > remaining) snippet = snippet[..remaining] + "\n// [truncated]";
+                var label = deleted.Contains(fnName) ? "calls deleted" : "calls changed";
+                result.AppendLine($"### {chunk.FilePath} ({label} `{fnName}`)");
+                result.AppendLine("```");
+                result.AppendLine(snippet);
+                result.AppendLine("```");
+                result.AppendLine();
+                totalChars += snippet.Length;
+                callerCount++;
+            }
+        }
+
+        if (callerCount == 0) return string.Empty;
+
+        _logger.LogInformation("⚠️ Impact scan: {Count} call sites found", callerCount);
+        return result.ToString();
+    }
+
+    private static bool IsKeyword(string name) =>
+        name is "if" or "else" or "for" or "while" or "do" or "switch" or "case" or "return"
+              or "new" or "const" or "let" or "var" or "class" or "interface" or "type" or "enum"
+              or "import" or "export" or "async" or "await" or "void" or "null" or "true" or "false"
+              or "this" or "super" or "static" or "public" or "private" or "protected" or "override"
+              or "get" or "set" or "constructor" or "extends" or "implements";
+
+    private static string ExtractCallSiteSnippet(string content, string fnName, int contextLines)
+    {
+        var lines = content.Split('\n');
+        var result = new List<string>();
+        var p1 = fnName + "(";
+        var p2 = fnName + " (";
+
+        for (int i = 0; i < lines.Length; i++)
+        {
+            if (!lines[i].Contains(p1, StringComparison.Ordinal) &&
+                !lines[i].Contains(p2, StringComparison.Ordinal)) continue;
+
+            var start = Math.Max(0, i - contextLines);
+            var end = Math.Min(lines.Length - 1, i + contextLines);
+            if (result.Count > 0) result.Add("// ...");
+            result.AddRange(lines[start..(end + 1)]);
+            i = end;
+        }
+
+        return string.Join("\n", result.Take(40));
     }
 
     /// <summary>
@@ -889,18 +1457,18 @@ public class CodebaseContextService
             _logger.LogInformation("❌ No semantic context found ({ElapsedMs}ms)", semanticStopwatch.ElapsedMilliseconds);
         }
 
-        // 3. Dependency context (related files)
+        // 3. Dependency context (related files) — 2-level import graph from in-memory store
         _logger.LogInformation("Step 2: Searching for dependency context...");
         var depStopwatch = System.Diagnostics.Stopwatch.StartNew();
-        var depContext = await GetDependencyContextAsync(file, project, repositoryId);
+        var depContext = await BuildDependencyGraphContextAsync(file, repositoryId);
         depStopwatch.Stop();
-        
+
         if (!string.IsNullOrEmpty(depContext))
         {
             context.AppendLine(depContext);
             _logger.LogInformation("✅ Dependency Context Added in {ElapsedMs}ms:", depStopwatch.ElapsedMilliseconds);
             _logger.LogInformation("   Length: {Length} chars", depContext.Length);
-            _logger.LogInformation("   Content Preview:\n{Preview}", 
+            _logger.LogInformation("   Content Preview:\n{Preview}",
                 depContext.Length > 500 ? depContext.Substring(0, 500) + "\n... [TRUNCATED]" : depContext);
         }
         else
@@ -908,8 +1476,42 @@ public class CodebaseContextService
             _logger.LogInformation("❌ No dependency context found ({ElapsedMs}ms)", depStopwatch.ElapsedMilliseconds);
         }
 
-        // 4. Test context (test files likely covering the target file)
-        _logger.LogInformation("Step 3: Searching for related test context...");
+        // 4. Caller search — who calls the functions modified in this diff
+        _logger.LogInformation("Step 3: Searching for callers of modified functions...");
+        var callerStopwatch = System.Diagnostics.Stopwatch.StartNew();
+        var callerContext = GetCallerContext(file, repositoryId);
+        callerStopwatch.Stop();
+
+        if (!string.IsNullOrEmpty(callerContext))
+        {
+            context.AppendLine(callerContext);
+            _logger.LogInformation("✅ Caller Context Added in {ElapsedMs}ms: {Length} chars",
+                callerStopwatch.ElapsedMilliseconds, callerContext.Length);
+        }
+        else
+        {
+            _logger.LogInformation("❌ No caller context found ({ElapsedMs}ms)", callerStopwatch.ElapsedMilliseconds);
+        }
+
+        // 5. Signature-change cross-file impact
+        _logger.LogInformation("Step 4: Scanning for cross-file signature-change impact...");
+        var impactStopwatch = System.Diagnostics.Stopwatch.StartNew();
+        var impactContext = GetSignatureChangeImpactContext(file, repositoryId);
+        impactStopwatch.Stop();
+
+        if (!string.IsNullOrEmpty(impactContext))
+        {
+            context.AppendLine(impactContext);
+            _logger.LogInformation("⚠️ Signature Impact Context Added in {ElapsedMs}ms: {Length} chars",
+                impactStopwatch.ElapsedMilliseconds, impactContext.Length);
+        }
+        else
+        {
+            _logger.LogInformation("✅ No signature-change impact detected ({ElapsedMs}ms)", impactStopwatch.ElapsedMilliseconds);
+        }
+
+        // 6. Test context (test files likely covering the target file)
+        _logger.LogInformation("Step 5: Searching for related test context...");
         var testStopwatch = System.Diagnostics.Stopwatch.StartNew();
         var testContext = GetRelatedTestContext(file, repositoryId, maxFiles: 2, maxChunksPerFile: 2);
         testStopwatch.Stop();
@@ -927,13 +1529,15 @@ public class CodebaseContextService
 
         overallStopwatch.Stop();
         var finalContext = context.ToString();
-        
+
         _logger.LogInformation("╔════════════════════════════════════════════════════════════╗");
         _logger.LogInformation("║ FINAL RAG CONTEXT SENT TO LLM                             ║");
         _logger.LogInformation("╚════════════════════════════════════════════════════════════╝");
         _logger.LogInformation("⏱️  RAG TIMING BREAKDOWN:");
         _logger.LogInformation("   Semantic search: {SemanticMs}ms", semanticStopwatch?.ElapsedMilliseconds ?? 0);
         _logger.LogInformation("   Dependency search: {DepMs}ms", depStopwatch?.ElapsedMilliseconds ?? 0);
+        _logger.LogInformation("   Caller search: {CallerMs}ms", callerStopwatch?.ElapsedMilliseconds ?? 0);
+        _logger.LogInformation("   Impact scan: {ImpactMs}ms", impactStopwatch?.ElapsedMilliseconds ?? 0);
         _logger.LogInformation("   Test search: {TestMs}ms", testStopwatch?.ElapsedMilliseconds ?? 0);
         _logger.LogInformation("   Total RAG time: {TotalMs}ms ({TotalSec:F2} seconds)", 
             overallStopwatch.ElapsedMilliseconds, overallStopwatch.Elapsed.TotalSeconds);
@@ -1144,7 +1748,7 @@ public class CodebaseContextService
         }
     }
 
-    private async Task<(bool Success, string Error)> RunGitCommandAsync(string arguments, string workingDirectory, int timeoutSeconds = 180)
+    private async Task<(bool Success, string Output, string Error)> RunGitCommandAsync(string arguments, string workingDirectory, int timeoutSeconds = 180)
     {
         try
         {
@@ -1166,19 +1770,19 @@ public class CodebaseContextService
 
             _logger.LogInformation("🔧 Running git command: git {Arguments}", safeArguments);
             _logger.LogInformation("   Timeout: {TimeoutSeconds} seconds", timeoutSeconds);
-            
+
             var stopwatch = System.Diagnostics.Stopwatch.StartNew();
             process.Start();
 
             // Create cancellation token for timeout
             using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
-            
+
             try
             {
                 // Use Task.WhenAny for proper timeout handling
                 var processTask = process.WaitForExitAsync();
                 var timeoutTask = Task.Delay(TimeSpan.FromSeconds(timeoutSeconds));
-                
+
                 var completedTask = await Task.WhenAny(processTask, timeoutTask);
                 stopwatch.Stop();
 
@@ -1186,7 +1790,7 @@ public class CodebaseContextService
                 {
                     // Timeout occurred
                     _logger.LogWarning("⚠️ Git command timed out after {TimeoutSeconds} seconds", timeoutSeconds);
-                    
+
                     try
                     {
                         if (!process.HasExited)
@@ -1200,8 +1804,8 @@ public class CodebaseContextService
                     {
                         _logger.LogWarning(killEx, "⚠️ Failed to kill git process");
                     }
-                    
-                    return (false, $"Git command timed out after {timeoutSeconds} seconds");
+
+                    return (false, string.Empty, $"Git command timed out after {timeoutSeconds} seconds");
                 }
 
                 // Process completed within timeout
@@ -1210,10 +1814,10 @@ public class CodebaseContextService
 
                 if (process.ExitCode != 0)
                 {
-                    _logger.LogError("❌ Git command failed with exit code {ExitCode} after {ElapsedMs}ms", 
+                    _logger.LogError("❌ Git command failed with exit code {ExitCode} after {ElapsedMs}ms",
                         process.ExitCode, stopwatch.ElapsedMilliseconds);
                     _logger.LogError("Error output: {Error}", error);
-                    return (false, error);
+                    return (false, string.Empty, error);
                 }
 
                 _logger.LogInformation("✅ Git command completed successfully in {ElapsedMs}ms", stopwatch.ElapsedMilliseconds);
@@ -1222,12 +1826,12 @@ public class CodebaseContextService
                     _logger.LogDebug("Command output: {Output}", output);
                 }
 
-                return (true, string.Empty);
+                return (true, output, string.Empty);
             }
             catch (OperationCanceledException)
             {
                 _logger.LogWarning("⚠️ Git command timed out after {TimeoutSeconds} seconds", timeoutSeconds);
-                
+
                 // Kill the process if it's still running
                 try
                 {
@@ -1242,14 +1846,14 @@ public class CodebaseContextService
                 {
                     _logger.LogWarning(killEx, "⚠️ Failed to kill git process");
                 }
-                
-                return (false, $"Git command timed out after {timeoutSeconds} seconds");
+
+                return (false, string.Empty, $"Git command timed out after {timeoutSeconds} seconds");
             }
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "❌ Exception running git command: git {Arguments}", RedactSecrets(arguments));
-            return (false, ex.Message);
+            return (false, string.Empty, ex.Message);
         }
     }
 
@@ -1740,81 +2344,8 @@ public class CodebaseContextService
             .ToList();
     }
 
-    private List<string> ParseDependencies(string? content, string filePath)
-    {
-        if (string.IsNullOrEmpty(content))
-            return new List<string>();
-
-        var dependencies = new List<string>();
-        var ext = Path.GetExtension(filePath);
-
-        // Language-specific import parsing
-        if (ext == ".cs")
-        {
-            // Parse: using Namespace.ClassName;
-            var usingMatches = Regex.Matches(content, @"using\s+([A-Za-z0-9_.]+);");
-            foreach (Match match in usingMatches)
-            {
-                var ns = match.Groups[1].Value;
-                // Try to guess file path from namespace
-                var potentialPath = "/" + ns.Replace(".", "/") + ".cs";
-                dependencies.Add(potentialPath);
-            }
-        }
-        else if (ext == ".py")
-        {
-            // Parse: from module import something / import module
-            var importMatches = Regex.Matches(content, @"(?:from|import)\s+([A-Za-z0-9_.]+)");
-            foreach (Match match in importMatches)
-            {
-                var module = match.Groups[1].Value;
-                var potentialPath = "/" + module.Replace(".", "/") + ".py";
-                dependencies.Add(potentialPath);
-            }
-        }
-        else if (ext == ".rs")
-        {
-            // Parse: use crate::module::Type;
-            var useMatches = Regex.Matches(content, @"use\s+(?:crate::)?([A-Za-z0-9_:]+)");
-            foreach (Match match in useMatches)
-            {
-                var raw = match.Groups[1].Value;
-                var segments = raw
-                    .Split("::", StringSplitOptions.RemoveEmptyEntries)
-                    .Where(s => !string.Equals(s, "self", StringComparison.OrdinalIgnoreCase))
-                    .Where(s => !string.Equals(s, "super", StringComparison.OrdinalIgnoreCase))
-                    .Where(s => !string.Equals(s, "crate", StringComparison.OrdinalIgnoreCase))
-                    .ToList();
-
-                if (segments.Count == 0)
-                {
-                    continue;
-                }
-
-                // If the last segment is likely a type, keep only module path parts.
-                if (segments.Count > 1 && char.IsUpper(segments[^1][0]))
-                {
-                    segments.RemoveAt(segments.Count - 1);
-                }
-
-                if (segments.Count == 0)
-                {
-                    continue;
-                }
-
-                var modulePath = string.Join("/", segments);
-                dependencies.Add($"/src/{modulePath}.rs");
-            }
-        }
-
-        return dependencies.Distinct().Take(5).ToList();
-    }
-
-    private string GetFileSummary(string content, int maxLines)
-    {
-        var lines = content.Split('\n').Take(maxLines);
-        return string.Join('\n', lines);
-    }
+    // ParseDependencies and GetFileSummary removed — replaced by BuildDependencyGraphContextAsync,
+    // ResolveImports, and ExtractDeclarations (2-level import graph with proper TS/JS relative resolution).
 
     private string GetRelatedTestContext(
         PullRequestFile file,

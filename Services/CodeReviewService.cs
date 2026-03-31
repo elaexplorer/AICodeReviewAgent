@@ -74,6 +74,26 @@ public class CodeReviewService
         _logger.LogInformation("Basic codebase context built for {ChangedFileCount} changed files",
             files.Count);
 
+        // Auto-refresh the RAG index if the repo has new commits since last index
+        if (_codebaseContextService.IsRepositoryIndexed(repository))
+        {
+            var branch = StripRefHeadsPrefix(pullRequest.TargetBranch);
+            try
+            {
+                var refreshed = await _codebaseContextService.RefreshIndexAsync(project, repository, branch);
+                _logger.LogInformation(refreshed switch
+                {
+                    0  => "✅ RAG index is up-to-date",
+                    -1 => "🔄 RAG index rebuilt (full re-index)",
+                    _  => $"🔄 RAG index refreshed ({refreshed} chunks updated)"
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "⚠️ Auto-refresh failed — proceeding with existing index");
+            }
+        }
+
         // Check if RAG indexing is available
         string codebaseContext;
         if (_codebaseContextService.IsRepositoryIndexed(repository))
@@ -312,5 +332,14 @@ public class CodeReviewService
         }
 
         return comments;
+    }
+
+    private static string StripRefHeadsPrefix(string? fullRef)
+    {
+        if (string.IsNullOrWhiteSpace(fullRef)) return "master";
+        const string prefix = "refs/heads/";
+        return fullRef.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
+            ? fullRef[prefix.Length..]
+            : fullRef;
     }
 }
