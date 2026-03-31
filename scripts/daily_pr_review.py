@@ -77,7 +77,7 @@ def get_updated_prs(since: datetime) -> list[dict]:
     """Return active PRs whose last update time is >= since."""
     data = ado_get(
         f"git/repositories/{ADO_REPOSITORY}/pullRequests",
-        **{"searchCriteria.status": "active", "api-version": "7.0", "$top": "100"}
+        **{"searchCriteria.status": "active", "searchCriteria.isDraft": "false", "api-version": "7.0", "$top": "100"}
     )
     since_utc = since.astimezone(timezone.utc)
     prs = []
@@ -88,7 +88,7 @@ def get_updated_prs(since: datetime) -> list[dict]:
             updated_dt = datetime.fromisoformat(updated.replace("Z", "+00:00"))
         except ValueError:
             continue
-        if updated_dt >= since_utc:
+        if updated_dt >= since_utc and not pr.get("isDraft", False):
             prs.append(pr)
     return prs
 
