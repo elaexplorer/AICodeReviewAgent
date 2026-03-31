@@ -56,6 +56,7 @@ var azureOpenAiEmbeddingEndpoint = GetEnvVar("AZURE_OPENAI_EMBEDDING_ENDPOINT") 
 var adoOrganization = forceUiConfig ? string.Empty : (GetEnvVar("ADO_ORGANIZATION") ?? "SPOOL");
 var adoPat = forceUiConfig ? string.Empty : (GetEnvVar("ADO_PAT") ?? string.Empty);
 var mcpServerUrl = GetEnvVar("MCP_SERVER_URL") ?? "http://localhost:3000";
+var agentPublicUrl = GetEnvVar("AGENT_PUBLIC_URL") ?? string.Empty;
 
 if (forceUiConfig)
 {
@@ -114,7 +115,10 @@ builder.Services.AddSingleton(provider =>
     new AzureDevOpsRestClient(
         provider.GetRequiredService<ILogger<AzureDevOpsRestClient>>(),
         adoOrganization,
-        adoPat));
+        adoPat,
+        agentPublicUrl));
+
+builder.Services.AddSingleton<CommentFeedbackService>();
 
 builder.Services.AddSingleton(provider =>
     new AzureDevOpsMcpClient(

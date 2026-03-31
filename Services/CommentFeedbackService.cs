@@ -1,0 +1,214 @@
+using Microsoft.Data.Sqlite;
+using Microsoft.Extensions.Logging;
+using System.Runtime.InteropServices;
+
+namespace CodeReviewAgent.Services;
+
+/// <summary>
+/// Stores thumbs-up / thumbs-down feedback for posted review comments.
+/// Backed by SQLite so metrics survive restarts.
+/// </summary>
+public class CommentFeedbackService
+{
+    private readonly string _dbPath;
+    private readonly ILogger<CommentFeedbackService> _logger;
+
+    public CommentFeedbackService(ILogger<CommentFeedbackService> logger)
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "code-review-agent");
+        Directory.CreateDirectory(dir);
+        _dbPath = Path.Combine(dir, "feedback.db");
+        _logger = logger;
+        InitDb();
+    }
+
+    private void InitDb()
+    {
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            CREATE TABLE IF NOT EXISTS feedback (
+                comment_id   TEXT    NOT NULL,
+                pr_id        INTEGER NOT NULL,
+                project      TEXT    NOT NULL,
+                repository   TEXT    NOT NULL,
+                file_path    TEXT    NOT NULL,
+                severity     TEXT    NOT NULL,
+                comment_type TEXT    NOT NULL,
+                is_helpful   INTEGER NOT NULL,   -- 1 = helpful, 0 = not helpful
+                recorded_at  TEXT    NOT NULL,
+                PRIMARY KEY (comment_id, is_helpful)
+            );
+            """;
+        cmd.ExecuteNonQuery();
+    }
+
+    public async Task RecordAsync(
+        string commentId,
+        int prId,
+        string project,
+        string repository,
+        string filePath,
+        string severity,
+        string commentType,
+        bool isHelpful)
+    {
+        await Task.Run(() =>
+        {
+            using var conn = Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = """
+                INSERT OR REPLACE INTO feedback
+                    (comment_id, pr_id, project, repository, file_path, severity, comment_type, is_helpful, recorded_at)
+                VALUES
+                    ($cid, $prid, $proj, $repo, $fp, $sev, $ct, $helpful, $ts);
+                """;
+            cmd.Parameters.AddWithValue("$cid", commentId);
+            cmd.Parameters.AddWithValue("$prid", prId);
+            cmd.Parameters.AddWithValue("$proj", project);
+            cmd.Parameters.AddWithValue("$repo", repository);
+            cmd.Parameters.AddWithValue("$fp", filePath);
+            cmd.Parameters.AddWithValue("$sev", severity);
+            cmd.Parameters.AddWithValue("$ct", commentType);
+            cmd.Parameters.AddWithValue("$helpful", isHelpful ? 1 : 0);
+            cmd.Parameters.AddWithValue("$ts", DateTime.UtcNow.ToString("o"));
+            cmd.ExecuteNonQuery();
+            _logger.LogInformation("Recorded feedback commentId={CommentId} helpful={Helpful}", commentId, isHelpful);
+        });
+    }
+
+    public CommentFeedbackMetrics GetMetrics()
+    {
+        using var conn = Open();
+
+        var metrics = new CommentFeedbackMetrics();
+
+        // Total counts
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = """
+                SELECT
+                    COUNT(*)                                    AS total,
+                    SUM(CASE WHEN is_helpful=1 THEN 1 ELSE 0 END) AS helpful,
+                    SUM(CASE WHEN is_helpful=0 THEN 1 ELSE 0 END) AS not_helpful
+                FROM feedback;
+                """;
+            using var r = cmd.ExecuteReader();
+            if (r.Read())
+            {
+                metrics.TotalFeedback  = r.GetInt32(0);
+                metrics.HelpfulCount   = r.GetInt32(1);
+                metrics.NotHelpfulCount = r.GetInt32(2);
+            }
+        }
+
+        // By severity
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = """
+                SELECT severity,
+                       SUM(CASE WHEN is_helpful=1 THEN 1 ELSE 0 END) AS helpful,
+                       SUM(CASE WHEN is_helpful=0 THEN 1 ELSE 0 END) AS not_helpful
+                FROM feedback
+                GROUP BY severity;
+                """;
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+            {
+                metrics.BySeverity[r.GetString(0)] = new FeedbackBucket
+                {
+                    Helpful    = r.GetInt32(1),
+                    NotHelpful = r.GetInt32(2)
+                };
+            }
+        }
+
+        // By comment type
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = """
+                SELECT comment_type,
+                       SUM(CASE WHEN is_helpful=1 THEN 1 ELSE 0 END) AS helpful,
+                       SUM(CASE WHEN is_helpful=0 THEN 1 ELSE 0 END) AS not_helpful
+                FROM feedback
+                GROUP BY comment_type;
+                """;
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+            {
+                metrics.ByCommentType[r.GetString(0)] = new FeedbackBucket
+                {
+                    Helpful    = r.GetInt32(1),
+                    NotHelpful = r.GetInt32(2)
+                };
+            }
+        }
+
+        // Recent 20 entries
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = """
+                SELECT comment_id, pr_id, repository, file_path, severity, comment_type, is_helpful, recorded_at
+                FROM feedback
+                ORDER BY recorded_at DESC
+                LIMIT 20;
+                """;
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+            {
+                metrics.RecentFeedback.Add(new FeedbackEntry
+                {
+                    CommentId   = r.GetString(0),
+                    PrId        = r.GetInt32(1),
+                    Repository  = r.GetString(2),
+                    FilePath    = r.GetString(3),
+                    Severity    = r.GetString(4),
+                    CommentType = r.GetString(5),
+                    IsHelpful   = r.GetInt32(6) == 1,
+                    RecordedAt  = r.GetString(7)
+                });
+            }
+        }
+
+        return metrics;
+    }
+
+    private SqliteConnection Open()
+    {
+        var conn = new SqliteConnection($"Data Source={_dbPath}");
+        conn.Open();
+        return conn;
+    }
+}
+
+public class CommentFeedbackMetrics
+{
+    public int TotalFeedback  { get; set; }
+    public int HelpfulCount   { get; set; }
+    public int NotHelpfulCount { get; set; }
+    public double HelpfulPercent =>
+        TotalFeedback > 0 ? Math.Round(HelpfulCount * 100.0 / TotalFeedback, 1) : 0;
+    public Dictionary<string, FeedbackBucket> BySeverity    { get; set; } = new();
+    public Dictionary<string, FeedbackBucket> ByCommentType { get; set; } = new();
+    public List<FeedbackEntry> RecentFeedback { get; set; } = new();
+}
+
+public class FeedbackBucket
+{
+    public int Helpful    { get; set; }
+    public int NotHelpful { get; set; }
+    public double HelpfulPercent =>
+        (Helpful + NotHelpful) > 0 ? Math.Round(Helpful * 100.0 / (Helpful + NotHelpful), 1) : 0;
+}
+
+public class FeedbackEntry
+{
+    public string CommentId   { get; set; } = string.Empty;
+    public int    PrId        { get; set; }
+    public string Repository  { get; set; } = string.Empty;
+    public string FilePath    { get; set; } = string.Empty;
+    public string Severity    { get; set; } = string.Empty;
+    public string CommentType { get; set; } = string.Empty;
+    public bool   IsHelpful   { get; set; }
+    public string RecordedAt  { get; set; } = string.Empty;
+}

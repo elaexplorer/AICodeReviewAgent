@@ -21,6 +21,7 @@ public class CodeReviewController : ControllerBase
     private readonly ChatConfigurationService _chatConfig;
     private readonly EmbeddingConfigurationService _embeddingConfig;
     private readonly CodebaseContextService _codebaseContextService;
+    private readonly CommentFeedbackService _feedbackService;
     private readonly ILogger<CodeReviewController> _logger;
     private static ReviewResult? _currentReview;
     private static readonly HashSet<string> _indexingInProgress = new();
@@ -36,6 +37,7 @@ public class CodeReviewController : ControllerBase
         ChatConfigurationService chatConfig,
         EmbeddingConfigurationService embeddingConfig,
         CodebaseContextService codebaseContextService,
+        CommentFeedbackService feedbackService,
         ILogger<CodeReviewController> logger)
     {
         _codeReviewAgent = codeReviewAgent;
@@ -45,6 +47,7 @@ public class CodeReviewController : ControllerBase
         _chatConfig = chatConfig;
         _embeddingConfig = embeddingConfig;
         _codebaseContextService = codebaseContextService;
+        _feedbackService = feedbackService;
         _logger = logger;
     }
 
@@ -1204,6 +1207,49 @@ public class CodeReviewController : ControllerBase
 
         var token = headerValues.FirstOrDefault()?.Trim();
         return string.IsNullOrWhiteSpace(token) ? null : token;
+    }
+
+    /// <summary>
+    /// Records a thumbs-up / thumbs-down for a posted review comment.
+    /// Invoked via a clickable link embedded in the comment footer.
+    /// GET /api/codereview/feedback?id={commentId}&rating=1|0
+    /// </summary>
+    [HttpGet("feedback")]
+    public async Task<IActionResult> RecordFeedback(
+        [FromQuery] string id,
+        [FromQuery] int rating,
+        [FromQuery] int prId = 0,
+        [FromQuery] string project = "",
+        [FromQuery] string repository = "",
+        [FromQuery] string filePath = "",
+        [FromQuery] string severity = "",
+        [FromQuery] string commentType = "")
+    {
+        if (string.IsNullOrWhiteSpace(id))
+            return BadRequest("id is required");
+        if (rating != 0 && rating != 1)
+            return BadRequest("rating must be 0 (not helpful) or 1 (helpful)");
+
+        await _feedbackService.RecordAsync(id, prId, project, repository, filePath, severity, commentType, rating == 1);
+
+        _logger.LogInformation("Feedback recorded: commentId={CommentId} helpful={Helpful}", id, rating == 1);
+
+        return Content(
+            rating == 1
+                ? "Thanks for the feedback! 👍 We're glad the comment was helpful."
+                : "Thanks for the feedback! 👎 We'll use this to improve future reviews.",
+            "text/plain");
+    }
+
+    /// <summary>
+    /// Returns aggregated feedback metrics.
+    /// GET /api/codereview/feedback/metrics
+    /// </summary>
+    [HttpGet("feedback/metrics")]
+    public IActionResult GetFeedbackMetrics()
+    {
+        var metrics = _feedbackService.GetMetrics();
+        return Ok(metrics);
     }
 }
 
