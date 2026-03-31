@@ -812,6 +812,45 @@ public class CodeReviewController : ControllerBase
     }
 
     /// <summary>
+    /// Incrementally refresh the RAG index for a repository (re-embed only changed files).
+    /// </summary>
+    [HttpPost("index/refresh")]
+    public async Task<IActionResult> RefreshIndex([FromBody] IndexRequest request)
+    {
+        try
+        {
+            _logger.LogInformation("🔄 API: Incremental refresh requested for '{Repository}'", request.Repository);
+
+            var updatedChunks = await _codebaseContextService.RefreshIndexAsync(
+                request.Project,
+                request.Repository,
+                request.Branch,
+                GetOptionalAdoAccessTokenHeader());
+
+            var message = updatedChunks switch
+            {
+                0  => "Index is already up-to-date",
+                -1 => "Fell back to full re-index",
+                _  => $"Refreshed {updatedChunks} chunks"
+            };
+
+            return Ok(new
+            {
+                success = true,
+                message,
+                chunksUpdated = updatedChunks,
+                totalChunks = _codebaseContextService.GetChunkCount(request.Repository),
+                repositoryId = request.Repository
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "❌ Error refreshing index for '{Repository}'", request.Repository);
+            return StatusCode(500, new { error = ex.Message });
+        }
+    }
+
+    /// <summary>
     /// Get RAG indexing status for a repository
     /// </summary>
     [HttpGet("index/status/{repositoryId}")]
