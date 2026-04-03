@@ -23,10 +23,13 @@ import argparse
 import base64
 import json
 import os
+import smtplib
 import subprocess
 import sys
 import textwrap
 from datetime import datetime, timedelta, timezone
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from pathlib import Path
 
 import requests
@@ -59,6 +62,15 @@ CLOUD_AGENT_URL  = os.environ.get("CLOUD_AGENT_URL",
 CLAUDE_MODEL     = os.environ.get("CLAUDE_REVIEW_MODEL", "claude-sonnet-4-6")
 LOOKBACK_HOURS   = int(os.environ.get("LOOKBACK_HOURS", "24"))
 
+# Email config (optional — set in .env to enable)
+EMAIL_FROM       = os.environ.get("REPORT_EMAIL_FROM", "")
+EMAIL_TO         = os.environ.get("REPORT_EMAIL_TO", "")        # comma-separated
+EMAIL_SMTP_HOST  = os.environ.get("REPORT_SMTP_HOST", "smtp.office365.com")
+EMAIL_SMTP_PORT  = int(os.environ.get("REPORT_SMTP_PORT", "587"))
+EMAIL_SMTP_USER  = os.environ.get("REPORT_SMTP_USER", "")
+EMAIL_SMTP_PASS  = os.environ.get("REPORT_SMTP_PASS", "")
+REPORTS_DIR      = REPO_ROOT / "reports"
+
 # ---------------------------------------------------------------------------
 # ADO REST helpers
 # ---------------------------------------------------------------------------
@@ -73,17 +85,24 @@ def ado_get(path: str, **kwargs) -> dict:
     r.raise_for_status()
     return r.json()
 
-def get_updated_prs(since: datetime) -> list[dict]:
-    """Return active PRs whose last update time is >= since."""
+def get_all_active_prs() -> list[dict]:
+    """Return all active non-draft PRs regardless of age."""
     data = ado_get(
         f"git/repositories/{ADO_REPOSITORY}/pullRequests",
-        **{"searchCriteria.status": "active", "searchCriteria.isDraft": "false", "api-version": "7.0", "$top": "100"}
+        **{"searchCriteria.status": "active", "searchCriteria.isDraft": "false", "api-version": "7.0", "$top": "200"}
+    )
+    return [pr for pr in data.get("value", []) if not pr.get("isDraft", False)]
+
+def get_updated_prs(since: datetime) -> list[dict]:
+    """Return active non-draft PRs whose creation date is >= since."""
+    data = ado_get(
+        f"git/repositories/{ADO_REPOSITORY}/pullRequests",
+        **{"searchCriteria.status": "active", "searchCriteria.isDraft": "false", "api-version": "7.0", "$top": "200"}
     )
     since_utc = since.astimezone(timezone.utc)
     prs = []
     for pr in data.get("value", []):
         updated = pr.get("creationDate") or ""
-        # also check last merge source commit date if available
         try:
             updated_dt = datetime.fromisoformat(updated.replace("Z", "+00:00"))
         except ValueError:
@@ -432,41 +451,205 @@ def pr_link(pr_id: int) -> str:
 # Main
 # ---------------------------------------------------------------------------
 
-def review_pr(pr: dict, dry_run: bool):
+def review_pr(pr: dict, dry_run: bool) -> dict:
+    """Review a single PR and return a report entry."""
     pr_id = pr["pullRequestId"]
     title = pr.get("title", "")
+    author = pr.get("createdBy", {}).get("displayName", "Unknown")
     print(f"\n{'='*60}")
     print(f"PR #{pr_id}: {title}")
     print(f"Link: {pr_link(pr_id)}")
     print(f"{'='*60}")
 
-    # 1. Fetch diff
-    print("  [Diff] Fetching changed files...")
-    diff = get_pr_diff(pr_id)
+    report_entry = {
+        "pr_id": pr_id,
+        "title": title,
+        "author": author,
+        "link": pr_link(pr_id),
+        "claude_count": 0,
+        "cloud_count": 0,
+        "consolidated_count": 0,
+        "posted_count": 0,
+        "skipped_count": 0,
+        "posted_comments": [],
+        "error": None,
+    }
 
-    # 2. Claude local review + 3. Cloud agent review (in parallel via threads)
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        f_claude = executor.submit(run_claude_review, pr, diff)
-        f_cloud  = executor.submit(run_cloud_agent_review, pr_id)
-        claude_comments = f_claude.result()
-        cloud_comments  = f_cloud.result()
+    try:
+        # 1. Fetch diff
+        print("  [Diff] Fetching changed files...")
+        diff = get_pr_diff(pr_id)
 
-    print(f"  [Results] Claude: {len(claude_comments)}  Cloud agent: {len(cloud_comments)}")
+        # 2. Claude local review + 3. Cloud agent review (in parallel via threads)
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            f_claude = executor.submit(run_claude_review, pr, diff)
+            f_cloud  = executor.submit(run_cloud_agent_review, pr_id)
+            claude_comments = f_claude.result()
+            cloud_comments  = f_cloud.result()
 
-    # 4. Consolidate
-    consolidated = consolidate_comments(cloud_comments, claude_comments)
+        report_entry["claude_count"] = len(claude_comments)
+        report_entry["cloud_count"]  = len(cloud_comments)
+        print(f"  [Results] Claude: {len(claude_comments)}  Cloud agent: {len(cloud_comments)}")
 
-    # 5. Post — high severity only
-    high_only = [c for c in consolidated if c.get("severity", "").lower() == "high"]
-    print(f"  [Filter] {len(consolidated)} total -> {len(high_only)} high severity")
-    post_comments(pr_id, high_only, dry_run)
+        # 4. Consolidate
+        consolidated = consolidate_comments(cloud_comments, claude_comments)
+        report_entry["consolidated_count"] = len(consolidated)
+
+        # 5. Post — high severity only
+        high_only = [c for c in consolidated if c.get("severity", "").lower() == "high"]
+        print(f"  [Filter] {len(consolidated)} total -> {len(high_only)} high severity")
+        result = post_comments(pr_id, high_only, dry_run)
+
+        report_entry["posted_count"]   = result.get("posted", 0)
+        report_entry["skipped_count"]  = result.get("skipped", 0)
+        report_entry["posted_comments"] = high_only if dry_run else result.get("postedComments", high_only)
+
+    except Exception as e:
+        report_entry["error"] = str(e)
+
+    return report_entry
+
+
+# ---------------------------------------------------------------------------
+# Report generation + email
+# ---------------------------------------------------------------------------
+
+SEVERITY_COLOR = {"high": "#d73a49", "critical": "#d73a49", "medium": "#e36209", "low": "#6a737d"}
+SEVERITY_BADGE = {"high": "#ffeef0", "critical": "#ffeef0", "medium": "#fff5b1", "low": "#f1f8ff"}
+
+def build_html_report(report_entries: list[dict], run_date: str, dry_run: bool) -> str:
+    total_prs     = len(report_entries)
+    total_posted  = sum(e["posted_count"] for e in report_entries)
+    total_skipped = sum(e["skipped_count"] for e in report_entries)
+    errors        = [e for e in report_entries if e.get("error")]
+    dry_label     = " (DRY RUN)" if dry_run else ""
+
+    rows = ""
+    for e in report_entries:
+        status = "ERROR" if e.get("error") else ("OK" if not dry_run else "DRY RUN")
+        status_color = "#d73a49" if e.get("error") else "#28a745"
+        comments_html = ""
+        for c in e.get("posted_comments", []):
+            sev   = c.get("severity", "medium").lower()
+            color = SEVERITY_COLOR.get(sev, "#6a737d")
+            badge = SEVERITY_BADGE.get(sev, "#f6f8fa")
+            file_path = c.get("filePath", "")
+            line      = c.get("startLine", 1)
+            text      = c.get("commentText", "").replace("<", "&lt;").replace(">", "&gt;")
+            fix       = c.get("suggestedFix", "")
+            fix_html  = f'<div style="margin-top:4px;font-size:12px;color:#555"><b>Suggested fix:</b> {fix.replace("<","&lt;").replace(">","&gt;")}</div>' if fix else ""
+            comments_html += f"""
+            <div style="margin:8px 0;padding:10px 12px;border-left:3px solid {color};background:{badge};border-radius:0 4px 4px 0">
+              <div style="font-size:11px;font-weight:600;color:{color};text-transform:uppercase;margin-bottom:4px">{sev}</div>
+              <div style="font-size:12px;color:#586069;margin-bottom:4px"><code>{file_path}:{line}</code></div>
+              <div style="font-size:13px;color:#24292e">{text}</div>
+              {fix_html}
+            </div>"""
+
+        if not e.get("posted_comments"):
+            comments_html = '<div style="color:#6a737d;font-size:13px;padding:8px 0">No high severity comments posted.</div>'
+
+        error_html = f'<div style="color:#d73a49;font-size:12px;margin-top:6px">Error: {e["error"]}</div>' if e.get("error") else ""
+
+        rows += f"""
+        <tr>
+          <td style="padding:16px;vertical-align:top;border-bottom:1px solid #e1e4e8">
+            <div style="margin-bottom:4px">
+              <a href="{e['link']}" style="font-weight:600;color:#0366d6;text-decoration:none">PR #{e['pr_id']}: {e['title']}</a>
+            </div>
+            <div style="font-size:12px;color:#586069;margin-bottom:8px">Author: {e['author']}</div>
+            <div style="font-size:12px;color:#586069;margin-bottom:8px">
+              Claude: {e['claude_count']} &nbsp;|&nbsp; Cloud Agent: {e['cloud_count']} &nbsp;|&nbsp;
+              Consolidated: {e['consolidated_count']} &nbsp;|&nbsp;
+              <b>Posted: {e['posted_count']}</b> &nbsp; Skipped (dup): {e['skipped_count']}
+            </div>
+            {comments_html}
+            {error_html}
+          </td>
+          <td style="padding:16px;vertical-align:top;border-bottom:1px solid #e1e4e8;text-align:center;white-space:nowrap">
+            <span style="color:{status_color};font-weight:600;font-size:12px">{status}</span>
+          </td>
+        </tr>"""
+
+    error_summary = ""
+    if errors:
+        error_summary = f'<div style="background:#ffeef0;border:1px solid #fca5a5;border-radius:6px;padding:12px;margin-bottom:16px"><b>{len(errors)} PR(s) had errors.</b></div>'
+
+    html = f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Daily PR Review Report{dry_label}</title></head>
+<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f6f8fa;margin:0;padding:24px">
+  <div style="max-width:900px;margin:0 auto;background:#fff;border:1px solid #e1e4e8;border-radius:8px;overflow:hidden">
+    <div style="background:#24292e;padding:20px 24px">
+      <h1 style="color:#fff;margin:0;font-size:20px">AI Code Review — Daily Report{dry_label}</h1>
+      <div style="color:#8b949e;font-size:13px;margin-top:4px">{run_date} &nbsp;·&nbsp; {ADO_PROJECT} / {ADO_REPOSITORY}</div>
+    </div>
+    <div style="padding:20px 24px;background:#f6f8fa;border-bottom:1px solid #e1e4e8;display:flex;gap:32px">
+      <div><div style="font-size:28px;font-weight:700;color:#24292e">{total_prs}</div><div style="font-size:12px;color:#586069">PRs Reviewed</div></div>
+      <div><div style="font-size:28px;font-weight:700;color:#d73a49">{total_posted}</div><div style="font-size:12px;color:#586069">Comments Posted</div></div>
+      <div><div style="font-size:28px;font-weight:700;color:#6a737d">{total_skipped}</div><div style="font-size:12px;color:#586069">Duplicates Skipped</div></div>
+    </div>
+    <div style="padding:20px 24px">
+      {error_summary}
+      <table style="width:100%;border-collapse:collapse">
+        <thead>
+          <tr style="background:#f6f8fa">
+            <th style="padding:10px 16px;text-align:left;font-size:12px;color:#586069;border-bottom:2px solid #e1e4e8">Pull Request & Comments</th>
+            <th style="padding:10px 16px;text-align:center;font-size:12px;color:#586069;border-bottom:2px solid #e1e4e8;width:80px">Status</th>
+          </tr>
+        </thead>
+        <tbody>{rows}</tbody>
+      </table>
+    </div>
+    <div style="padding:16px 24px;background:#f6f8fa;border-top:1px solid #e1e4e8;font-size:11px;color:#586069">
+      Generated by AI Code Review Agent &nbsp;·&nbsp; Claude Sonnet + GPT-4 dual-model pipeline
+    </div>
+  </div>
+</body>
+</html>"""
+    return html
+
+
+def save_report(html: str, run_date: str) -> Path:
+    REPORTS_DIR.mkdir(exist_ok=True)
+    path = REPORTS_DIR / f"pr_review_{run_date.replace(' ', '_').replace(':', '-')}.html"
+    path.write_text(html, encoding="utf-8")
+    print(f"\n[Report] Saved to {path}")
+    return path
+
+
+def send_email_report(html: str, run_date: str, pr_count: int, comment_count: int):
+    if not all([EMAIL_FROM, EMAIL_TO, EMAIL_SMTP_USER, EMAIL_SMTP_PASS]):
+        print("[Email] Skipped — REPORT_EMAIL_* not configured in .env")
+        return
+
+    recipients = [r.strip() for r in EMAIL_TO.split(",") if r.strip()]
+    subject = f"AI Code Review Report — {run_date} ({pr_count} PRs, {comment_count} comments posted)"
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"]    = EMAIL_FROM
+    msg["To"]      = ", ".join(recipients)
+    msg.attach(MIMEText(html, "html", "utf-8"))
+
+    try:
+        print(f"[Email] Sending to {', '.join(recipients)}...")
+        with smtplib.SMTP(EMAIL_SMTP_HOST, EMAIL_SMTP_PORT) as server:
+            server.ehlo()
+            server.starttls()
+            server.login(EMAIL_SMTP_USER, EMAIL_SMTP_PASS)
+            server.sendmail(EMAIL_FROM, recipients, msg.as_string())
+        print("[Email] Sent successfully")
+    except Exception as e:
+        print(f"[Email] Failed: {e}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Daily PR review — dual model + consolidate + post")
     parser.add_argument("--pr",      type=int, help="Review a specific PR by ID")
     parser.add_argument("--dry-run", action="store_true", help="Review and consolidate but don't post")
+    parser.add_argument("--all",     action="store_true", help="Review ALL active non-draft PRs (ignores --hours)")
     parser.add_argument("--hours",   type=int, default=LOOKBACK_HOURS, help="Look-back window in hours (default 24)")
     args = parser.parse_args()
 
@@ -474,23 +657,36 @@ def main():
         print("ERROR: ADO_PAT is not set. Add it to .env or set as environment variable.")
         sys.exit(1)
 
+    run_date = datetime.now().strftime("%Y-%m-%d %H:%M")
+    report_entries = []
+
     if args.pr:
         pr = get_pr_by_id(args.pr)
-        review_pr(pr, args.dry_run)
+        entry = review_pr(pr, args.dry_run)
+        report_entries.append(entry)
     else:
-        since = datetime.now(timezone.utc) - timedelta(hours=args.hours)
-        print(f"Looking for PRs updated since {since.strftime('%Y-%m-%d %H:%M UTC')} "
-              f"({args.hours}h lookback)")
-        prs = get_updated_prs(since)
+        if args.all:
+            print("Fetching ALL active non-draft PRs...")
+            prs = get_all_active_prs()
+        else:
+            since = datetime.now(timezone.utc) - timedelta(hours=args.hours)
+            print(f"Looking for PRs updated since {since.strftime('%Y-%m-%d %H:%M UTC')} "
+                  f"({args.hours}h lookback)")
+            prs = get_updated_prs(since)
         if not prs:
             print("No PRs updated in the lookback window. Nothing to do.")
             return
         print(f"Found {len(prs)} PR(s) to review")
         for pr in prs:
-            try:
-                review_pr(pr, args.dry_run)
-            except Exception as e:
-                print(f"  ERROR reviewing PR #{pr.get('pullRequestId')}: {e}")
+            entry = review_pr(pr, args.dry_run)
+            report_entries.append(entry)
+
+    # Generate report
+    if report_entries:
+        html = build_html_report(report_entries, run_date, args.dry_run)
+        save_report(html, run_date)
+        total_posted = sum(e["posted_count"] for e in report_entries)
+        send_email_report(html, run_date, len(report_entries), total_posted)
 
     print("\nDone.")
 

@@ -49,3 +49,4 @@ remote-test-output.txt
 local-pr-*.json
 FOUNDRY_AGENT_CARD.md
 pp.xml
+reports/
