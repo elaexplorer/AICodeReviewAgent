@@ -54,6 +54,7 @@ def load_env():
 load_env()
 
 ADO_PAT          = os.environ.get("ADO_PAT", "")
+ADO_BOT_PAT      = os.environ.get("ADO_BOT_PAT", "")   # if set, used for posting so comments appear under a bot identity
 ADO_ORGANIZATION = os.environ.get("ADO_ORGANIZATION", "Skype")
 ADO_PROJECT      = os.environ.get("ADO_PROJECT", "SCC")
 ADO_REPOSITORY   = os.environ.get("ADO_REPOSITORY", "service-shared_framework_waimea")
@@ -393,11 +394,14 @@ def post_comments(pr_id: int, comments: list[dict], dry_run: bool) -> dict:
         "pullRequestId": pr_id,
         "comments":      comments,
     }
+    # Use bot PAT if configured so comments appear under a service identity,
+    # otherwise fall back to personal PAT.
+    posting_token = ADO_BOT_PAT if ADO_BOT_PAT else ADO_PAT
     try:
         r = requests.post(
             f"{CLOUD_AGENT_URL}/api/codereview/comments/post",
             json=payload,
-            headers={"X-Ado-Access-Token": ADO_PAT},
+            headers={"X-Ado-Access-Token": posting_token},
             timeout=120,
         )
         r.raise_for_status()
