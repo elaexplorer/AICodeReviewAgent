@@ -6,6 +6,8 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using System.Collections.Concurrent;
 using System.Net.Http.Headers;
+using System.Net.Mail;
+using System.Net;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -285,6 +287,7 @@ public class CodeReviewController : ControllerBase
 
                 var postedCount = 0;
                 var skippedCount = 0;
+                var postedComments  = new List<CodeReviewComment>();
                 var postingFailures = new List<ReviewPostingFailure>();
                 foreach (var comment in highPriorityComments)
                 {
@@ -329,6 +332,7 @@ public class CodeReviewController : ControllerBase
                         comment.StartLine = commentToPost.StartLine;
                         comment.EndLine = commentToPost.EndLine;
                         postedCount++;
+                        postedComments.Add(commentToPost);
                         existingFingerprints.Add(fingerprint);
                         existingPositionKeys.Add(positionKey);
                     }
@@ -356,6 +360,17 @@ public class CodeReviewController : ControllerBase
                             postResult.ErrorMessage);
                     }
                 }
+
+                // Send email summary — fire and forget, don't block job completion
+                _ = SendReviewEmailAsync(
+                    request.PullRequestLink,
+                    reviewOutput.PullRequestId,
+                    reviewOutput.Project,
+                    reviewOutput.Repository,
+                    postedComments,
+                    skippedCount,
+                    claudeComments.Count > 0,
+                    _logger);
 
                 _reviewByLinkAndPostJobs[jobId] = new ReviewByLinkAndPostJobStatus
                 {
@@ -1197,6 +1212,131 @@ public class CodeReviewController : ControllerBase
         };
     }
 
+    private static async Task SendReviewEmailAsync(
+        string prLink,
+        int prId,
+        string project,
+        string repository,
+        List<CodeReviewComment> postedComments,
+        int skippedCount,
+        bool dualModel,
+        ILogger logger)
+    {
+        var emailFrom = Environment.GetEnvironmentVariable("REPORT_EMAIL_FROM") ?? "";
+        var emailTo   = Environment.GetEnvironmentVariable("REPORT_EMAIL_TO")   ?? "";
+        var smtpHost  = Environment.GetEnvironmentVariable("REPORT_SMTP_HOST")  ?? "smtp.office365.com";
+        var smtpUser  = Environment.GetEnvironmentVariable("REPORT_SMTP_USER")  ?? "";
+        var smtpPass  = Environment.GetEnvironmentVariable("REPORT_SMTP_PASS")  ?? "";
+        var smtpPort  = int.TryParse(Environment.GetEnvironmentVariable("REPORT_SMTP_PORT"), out var p) ? p : 587;
+
+        if (string.IsNullOrWhiteSpace(emailFrom) || string.IsNullOrWhiteSpace(emailTo))
+        {
+            logger.LogInformation("Email skipped — REPORT_EMAIL_FROM/TO not configured");
+            return;
+        }
+
+        var subject = postedComments.Count > 0
+            ? $"AI Code Review — PR #{prId} ({project}/{repository}) — {postedComments.Count} critical comments posted"
+            : $"AI Code Review — PR #{prId} ({project}/{repository}) — no critical issues found";
+
+        var html = BuildReviewEmailHtml(prLink, prId, project, repository,
+                                        postedComments, skippedCount, dualModel);
+        try
+        {
+            using var mail = new MailMessage();
+            mail.From    = new MailAddress(emailFrom);
+            mail.Subject = subject;
+            mail.Body    = html;
+            mail.IsBodyHtml = true;
+            foreach (var to in emailTo.Split(',', StringSplitOptions.RemoveEmptyEntries))
+                mail.To.Add(to.Trim());
+
+            using var smtp = new SmtpClient(smtpHost, smtpPort)
+            {
+                EnableSsl   = true,
+                Credentials = new NetworkCredential(smtpUser, smtpPass)
+            };
+            await smtp.SendMailAsync(mail);
+            logger.LogInformation("Review email sent to {Recipients} for PR #{PrId}", emailTo, prId);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning("Failed to send review email for PR #{PrId}: {Error}", prId, ex.Message);
+        }
+    }
+
+    private static string BuildReviewEmailHtml(
+        string prLink,
+        int prId,
+        string project,
+        string repository,
+        List<CodeReviewComment> postedComments,
+        int skippedCount,
+        bool dualModel)
+    {
+        var runDate  = DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm UTC");
+        var modelTag = dualModel ? "GPT + Claude (dual-model intersection)" : "GPT only";
+
+        var commentsHtml = new StringBuilder();
+        if (postedComments.Count == 0)
+        {
+            commentsHtml.Append(
+                "<div style=\"color:#6a737d;padding:12px 0\">No critical comments posted.</div>");
+        }
+        else
+        {
+            foreach (var c in postedComments)
+            {
+                var text       = System.Web.HttpUtility.HtmlEncode(c.CommentText ?? "");
+                var fix        = System.Web.HttpUtility.HtmlEncode(c.SuggestedFix ?? "");
+                var confidence = $"{c.Confidence * 100:F0}%";
+                var fixHtml    = string.IsNullOrWhiteSpace(fix) ? "" :
+                    $"<div style=\"margin-top:4px;font-size:12px;color:#555\"><b>Suggested fix:</b> {fix}</div>";
+
+                commentsHtml.Append($"""
+                    <div style="margin:10px 0;padding:10px 14px;border-left:3px solid #d73a49;background:#ffeef0;border-radius:0 4px 4px 0">
+                      <div style="font-size:11px;font-weight:600;color:#d73a49;text-transform:uppercase;margin-bottom:4px">
+                        CRITICAL &nbsp;·&nbsp; confidence {confidence}
+                      </div>
+                      <div style="font-size:12px;color:#586069;margin-bottom:4px">
+                        <code>{System.Web.HttpUtility.HtmlEncode(c.FilePath ?? "")}:{c.StartLine}</code>
+                      </div>
+                      <div style="font-size:13px;color:#24292e">{text}</div>
+                      {fixHtml}
+                    </div>
+                    """);
+            }
+        }
+
+        return $"""
+            <!DOCTYPE html>
+            <html>
+            <head><meta charset="utf-8"><title>AI Code Review — PR #{prId}</title></head>
+            <body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f6f8fa;margin:0;padding:24px">
+              <div style="max-width:800px;margin:0 auto;background:#fff;border:1px solid #e1e4e8;border-radius:8px;overflow:hidden">
+                <div style="background:#24292e;padding:20px 24px">
+                  <h1 style="color:#fff;margin:0;font-size:18px">AI Code Review Report</h1>
+                  <div style="color:#8b949e;font-size:12px;margin-top:4px">{runDate} &nbsp;·&nbsp; {project}/{repository} &nbsp;·&nbsp; {modelTag}</div>
+                </div>
+                <div style="padding:20px 24px;background:#f6f8fa;border-bottom:1px solid #e1e4e8;display:flex;gap:32px">
+                  <div><div style="font-size:26px;font-weight:700;color:#d73a49">{postedComments.Count}</div><div style="font-size:12px;color:#586069">Critical Comments Posted</div></div>
+                  <div><div style="font-size:26px;font-weight:700;color:#6a737d">{skippedCount}</div><div style="font-size:12px;color:#586069">Duplicates Skipped</div></div>
+                </div>
+                <div style="padding:20px 24px">
+                  <div style="margin-bottom:12px">
+                    <a href="{prLink}" style="font-weight:600;color:#0366d6;text-decoration:none;font-size:15px">PR #{prId}: {project}/{repository}</a>
+                  </div>
+                  {commentsHtml}
+                </div>
+                <div style="padding:14px 24px;background:#f6f8fa;border-top:1px solid #e1e4e8;font-size:11px;color:#586069">
+                  Generated by AI Code Review Agent &nbsp;·&nbsp; {modelTag}
+                </div>
+              </div>
+            </body>
+            </html>
+            """;
+    }
+
     private async Task<List<CodeReviewComment>> CallLocalClaudeAgentAsync(
         string localAgentUrl, string pullRequestLink, string? adoToken)
     {
@@ -1271,8 +1411,7 @@ public class CodeReviewController : ControllerBase
         if (comment.Confidence < 0.7)
             return false;
         var severity = comment.Severity?.Trim();
-        return string.Equals(severity, "critical", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(severity, "high", StringComparison.OrdinalIgnoreCase);
+        return string.Equals(severity, "critical", StringComparison.OrdinalIgnoreCase);
     }
 
     private static CodeReviewComment CloneComment(CodeReviewComment comment)
