@@ -5,6 +5,9 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using System.Collections.Concurrent;
+using System.Net.Http.Headers;
+using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 
 namespace CodeReviewAgent.Controllers;
@@ -28,6 +31,7 @@ public class CodeReviewController : ControllerBase
     private static readonly object _indexingLock = new();
     private static readonly ConcurrentDictionary<string, ReviewByLinkAndPostJobStatus> _reviewByLinkAndPostJobs = new();
     private static readonly TimeSpan ReviewByLinkAndPostSyncWait = TimeSpan.FromSeconds(220);
+    private static readonly HttpClient _localClaudeHttpClient = new() { Timeout = TimeSpan.FromMinutes(5) };
 
     public CodeReviewController(
         CodeReviewAgentService codeReviewAgent,
@@ -218,6 +222,7 @@ public class CodeReviewController : ControllerBase
         }
 
         var adoAccessTokenOverride = GetOptionalAdoAccessTokenHeader();
+        var localClaudeUrl = Environment.GetEnvironmentVariable("LOCAL_CLAUDE_AGENT_URL");
 
         var jobId = Guid.NewGuid().ToString("N");
         _reviewByLinkAndPostJobs[jobId] = new ReviewByLinkAndPostJobStatus
@@ -236,16 +241,38 @@ public class CodeReviewController : ControllerBase
             try
             {
                 _logger.LogInformation(
-                    "Starting review-by-link-and-post job {JobId} for PR {PullRequestId} in {Project}/{Repository}",
-                    jobId,
-                    parsed.PullRequestId,
-                    parsed.Project,
-                    parsed.Repository);
+                    "Starting review-by-link-and-post job {JobId} for PR {PullRequestId} in {Project}/{Repository} (local Claude: {LocalClaude})",
+                    jobId, parsed.PullRequestId, parsed.Project, parsed.Repository,
+                    string.IsNullOrWhiteSpace(localClaudeUrl) ? "disabled" : localClaudeUrl);
 
-                var reviewOutput = await RunReviewByLinkCoreAsync(request.PullRequestLink, parsed, adoAccessTokenOverride);
+                // Run GPT-4 and local Claude in parallel
+                var gptTask    = RunReviewByLinkCoreAsync(request.PullRequestLink, parsed, adoAccessTokenOverride);
+                var claudeTask = string.IsNullOrWhiteSpace(localClaudeUrl)
+                    ? Task.FromResult<List<CodeReviewComment>>([])
+                    : CallLocalClaudeAgentAsync(localClaudeUrl, request.PullRequestLink, adoAccessTokenOverride);
+
+                await Task.WhenAll(gptTask, claudeTask);
+
+                var reviewOutput    = await gptTask;
+                var claudeComments  = await claudeTask;
+
+                _logger.LogInformation(
+                    "Parallel review complete — GPT-4: {GptCount} comments, Claude: {ClaudeCount} comments",
+                    reviewOutput.Comments.Count, claudeComments.Count);
+
+                // If local Claude is available, only post comments found by both models
                 var highPriorityComments = reviewOutput.Comments
                     .Where(IsHighPriorityComment)
                     .ToList();
+
+                if (claudeComments.Count > 0)
+                {
+                    var before = highPriorityComments.Count;
+                    highPriorityComments = IntersectWithClaudeComments(highPriorityComments, claudeComments);
+                    _logger.LogInformation(
+                        "Intersection filter: {Before} GPT-4 comments → {After} found by both models",
+                        before, highPriorityComments.Count);
+                }
                 var validRightSideLinesByFile = BuildValidRightSideLineLookup(reviewOutput.Files);
                 var existingFingerprints = await _adoClient.GetExistingCommentFingerprintsAsync(
                     reviewOutput.Project,
@@ -1168,6 +1195,75 @@ public class CodeReviewController : ControllerBase
             Files = files,
             Comments = comments
         };
+    }
+
+    private async Task<List<CodeReviewComment>> CallLocalClaudeAgentAsync(
+        string localAgentUrl, string pullRequestLink, string? adoToken)
+    {
+        try
+        {
+            var payload = JsonSerializer.Serialize(new { pullRequestLink });
+            var req = new HttpRequestMessage(HttpMethod.Post, $"{localAgentUrl.TrimEnd('/')}/review")
+            {
+                Content = new StringContent(payload, Encoding.UTF8, "application/json")
+            };
+            if (!string.IsNullOrWhiteSpace(adoToken))
+                req.Headers.TryAddWithoutValidation("X-Ado-Access-Token", adoToken);
+
+            var resp = await _localClaudeHttpClient.SendAsync(req);
+            if (!resp.IsSuccessStatusCode)
+            {
+                _logger.LogWarning("Local Claude agent returned {Status}", resp.StatusCode);
+                return [];
+            }
+
+            var json = await resp.Content.ReadAsStringAsync();
+            var doc  = JsonDocument.Parse(json);
+            if (!doc.RootElement.TryGetProperty("comments", out var arr) ||
+                arr.ValueKind != JsonValueKind.Array)
+                return [];
+
+            var comments = new List<CodeReviewComment>();
+            foreach (var item in arr.EnumerateArray())
+            {
+                comments.Add(new CodeReviewComment
+                {
+                    Id          = Guid.NewGuid().ToString(),
+                    FilePath    = item.TryGetProperty("filePath",    out var fp)  ? fp.GetString()  ?? "" : "",
+                    StartLine   = item.TryGetProperty("startLine",   out var sl)  ? sl.GetInt32()        : 1,
+                    EndLine     = item.TryGetProperty("endLine",     out var el)  ? el.GetInt32()        : 1,
+                    Severity    = item.TryGetProperty("severity",    out var sev) ? sev.GetString() ?? "medium" : "medium",
+                    CommentType = item.TryGetProperty("commentType", out var ct)  ? ct.GetString()  ?? "issue"  : "issue",
+                    CommentText = item.TryGetProperty("commentText", out var txt) ? txt.GetString() ?? "" : "",
+                    Confidence  = item.TryGetProperty("confidence",  out var conf) ? conf.GetDouble() : 0.8,
+                });
+            }
+            _logger.LogInformation("Local Claude agent returned {Count} comments", comments.Count);
+            return comments;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("Local Claude agent call failed — {Error}. Proceeding with GPT-4 only.", ex.Message);
+            return [];
+        }
+    }
+
+    /// <summary>
+    /// Returns GPT-4 comments that have a matching Claude comment on the same file
+    /// within ±10 lines. If Claude returned nothing (unreachable), returns GPT-4 comments as-is.
+    /// </summary>
+    private static List<CodeReviewComment> IntersectWithClaudeComments(
+        List<CodeReviewComment> gptComments,
+        List<CodeReviewComment> claudeComments)
+    {
+        if (claudeComments.Count == 0)
+            return gptComments;
+
+        return gptComments
+            .Where(gpt => claudeComments.Any(c =>
+                NormalizePath(c.FilePath) == NormalizePath(gpt.FilePath) &&
+                Math.Abs(c.StartLine - gpt.StartLine) <= 10))
+            .ToList();
     }
 
     private static bool IsHighPriorityComment(CodeReviewComment comment)
