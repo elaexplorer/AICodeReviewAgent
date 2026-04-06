@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import sys, io
+import sys, io, os
+os.environ.setdefault("PYTHONUTF8", "1")
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 """
@@ -199,6 +200,7 @@ def run_skill_review(pr_link: str, repo_dir: Path) -> list[dict]:
     print(f"[Skill] Running from: {repo_dir}")
 
     env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_LOG"}
+    env["PYTHONUTF8"] = "1"
     try:
         result = subprocess.run(
             ["claude", "--print", "--output-format", "json", "--model", CLAUDE_MODEL],
@@ -285,7 +287,7 @@ def parse_pr_link(pr_link: str) -> tuple[int, str, str] | None:
 # Async job store  (in-memory — survives the request, cleared on restart)
 # ---------------------------------------------------------------------------
 
-# job_id → {"status": "pending"|"done"|"error", "pullRequestId": int, "comments": [...], "error": str}
+# job_id -> {"status": "pending"|"done"|"error", "pullRequestId": int, "comments": [...], "error": str}
 _jobs: dict[str, dict] = {}
 _jobs_lock = threading.Lock()
 
@@ -299,7 +301,7 @@ def _run_review_job(job_id: str, pr_link: str, ado_pat: str,
         checkout_pr_branch(repo_dir, pr)
 
         comments = run_skill_review(pr_link, repo_dir)
-        print(f"[Job {job_id[:8]}] PR #{pr_id} → {len(comments)} comments from skill")
+        print(f"[Job {job_id[:8]}] PR #{pr_id} -> {len(comments)} comments from skill")
 
         with _jobs_lock:
             _jobs[job_id] = {
