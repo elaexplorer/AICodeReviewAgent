@@ -35,6 +35,8 @@ import json
 import os
 import subprocess
 import textwrap
+import threading
+import uuid
 from pathlib import Path
 
 from flask import Flask, jsonify, request
@@ -276,6 +278,41 @@ def parse_pr_link(pr_link: str) -> tuple[int, str, str] | None:
 
 
 # ---------------------------------------------------------------------------
+# Async job store  (in-memory — survives the request, cleared on restart)
+# ---------------------------------------------------------------------------
+
+# job_id → {"status": "pending"|"done"|"error", "pullRequestId": int, "comments": [...], "error": str}
+_jobs: dict[str, dict] = {}
+_jobs_lock = threading.Lock()
+
+
+def _run_review_job(job_id: str, pr_link: str, ado_pat: str,
+                    pr_id: int, project: str, repo: str):
+    """Background thread: run the Claude skill and store the result."""
+    try:
+        pr       = get_pr_metadata(ado_pat, pr_id)
+        repo_dir = ensure_repo_cloned(ado_pat)
+        checkout_pr_branch(repo_dir, pr)
+
+        comments = run_skill_review(pr_link, repo_dir)
+        print(f"[Job {job_id[:8]}] PR #{pr_id} → {len(comments)} comments from skill")
+
+        with _jobs_lock:
+            _jobs[job_id] = {
+                "status":        "done",
+                "pullRequestId": pr_id,
+                "comments":      comments,
+            }
+    except Exception as e:
+        print(f"[Job {job_id[:8]}] Error: {e}")
+        with _jobs_lock:
+            _jobs[job_id] = {
+                "status": "error",
+                "error":  str(e),
+            }
+
+
+# ---------------------------------------------------------------------------
 # Flask app
 # ---------------------------------------------------------------------------
 
@@ -294,6 +331,11 @@ def health():
 
 @app.post("/claudeCodeReview")
 def review():
+    """
+    Submit a review job.  Returns immediately with {"jobId": "..."} and
+    starts the Claude skill in a background thread.
+    Poll GET /claudeCodeReview/<jobId> for the result.
+    """
     data    = request.get_json(force=True) or {}
     pr_link = data.get("pullRequestLink", "")
 
@@ -312,23 +354,44 @@ def review():
         return jsonify({"error": f"Could not parse PR ID from: {pr_link}"}), 400
 
     pr_id, project, repo = parsed
-    print(f"\n[Review] PR #{pr_id} ({project}/{repo})")
+    job_id = str(uuid.uuid4())
+    print(f"\n[Review] PR #{pr_id} ({project}/{repo}) → job {job_id[:8]}")
 
-    try:
-        # Ensure local repo is cloned and on the PR branch (for CLAUDE.md)
-        pr       = get_pr_metadata(ado_pat, pr_id)
-        repo_dir = ensure_repo_cloned(ado_pat)
-        checkout_pr_branch(repo_dir, pr)
+    with _jobs_lock:
+        _jobs[job_id] = {"status": "pending", "pullRequestId": pr_id}
 
-        # Run the code-review:code-review skill — returns JSON, does not post
-        comments = run_skill_review(pr_link, repo_dir)
-        print(f"[Review] PR #{pr_id} → {len(comments)} comments from skill")
+    t = threading.Thread(
+        target=_run_review_job,
+        args=(job_id, pr_link, ado_pat, pr_id, project, repo),
+        daemon=True,
+    )
+    t.start()
 
-        return jsonify({"pullRequestId": pr_id, "comments": comments})
+    return jsonify({"jobId": job_id, "pullRequestId": pr_id, "status": "pending"})
 
-    except Exception as e:
-        print(f"[Review] Error: {e}")
-        return jsonify({"error": str(e)}), 500
+
+@app.get("/claudeCodeReview/<job_id>")
+def review_result(job_id: str):
+    """Poll for job result.  Returns 202 while pending, 200 when done."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+
+    if job is None:
+        return jsonify({"error": "Job not found"}), 404
+
+    if job["status"] == "pending":
+        return jsonify({"jobId": job_id, "status": "pending"}), 202
+
+    if job["status"] == "error":
+        return jsonify({"jobId": job_id, "status": "error", "error": job.get("error")}), 500
+
+    # done
+    return jsonify({
+        "jobId":         job_id,
+        "status":        "done",
+        "pullRequestId": job.get("pullRequestId"),
+        "comments":      job.get("comments", []),
+    })
 
 
 # ---------------------------------------------------------------------------

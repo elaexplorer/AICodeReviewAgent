@@ -6,8 +6,6 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using System.Collections.Concurrent;
 using System.Net.Http.Headers;
-using System.Net.Mail;
-using System.Net;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -1212,6 +1210,17 @@ public class CodeReviewController : ControllerBase
         };
     }
 
+    /// <summary>
+    /// Sends a review summary email via Microsoft Graph API (avoids SMTP AUTH, which is
+    /// disabled in most Microsoft 365 tenants).
+    ///
+    /// Required env vars:
+    ///   REPORT_EMAIL_TO          — recipient(s), comma-separated
+    ///   REPORT_GRAPH_TENANT_ID   — Azure AD tenant ID
+    ///   REPORT_GRAPH_CLIENT_ID   — App registration client ID (needs Mail.Send permission)
+    ///   REPORT_GRAPH_CLIENT_SECRET — App registration client secret
+    ///   REPORT_GRAPH_SENDER_UPN  — UPN of the mailbox to send from (e.g. elavarasid@microsoft.com)
+    /// </summary>
     private static async Task SendReviewEmailAsync(
         string prLink,
         int prId,
@@ -1222,16 +1231,19 @@ public class CodeReviewController : ControllerBase
         bool dualModel,
         ILogger logger)
     {
-        var emailFrom = Environment.GetEnvironmentVariable("REPORT_EMAIL_FROM") ?? "";
-        var emailTo   = Environment.GetEnvironmentVariable("REPORT_EMAIL_TO")   ?? "";
-        var smtpHost  = Environment.GetEnvironmentVariable("REPORT_SMTP_HOST")  ?? "smtp.office365.com";
-        var smtpUser  = Environment.GetEnvironmentVariable("REPORT_SMTP_USER")  ?? "";
-        var smtpPass  = Environment.GetEnvironmentVariable("REPORT_SMTP_PASS")  ?? "";
-        var smtpPort  = int.TryParse(Environment.GetEnvironmentVariable("REPORT_SMTP_PORT"), out var p) ? p : 587;
+        var emailTo    = Environment.GetEnvironmentVariable("REPORT_EMAIL_TO")            ?? "";
+        var tenantId   = Environment.GetEnvironmentVariable("REPORT_GRAPH_TENANT_ID")     ?? "";
+        var clientId   = Environment.GetEnvironmentVariable("REPORT_GRAPH_CLIENT_ID")     ?? "";
+        var clientSec  = Environment.GetEnvironmentVariable("REPORT_GRAPH_CLIENT_SECRET") ?? "";
+        var senderUpn  = Environment.GetEnvironmentVariable("REPORT_GRAPH_SENDER_UPN")    ?? "";
 
-        if (string.IsNullOrWhiteSpace(emailFrom) || string.IsNullOrWhiteSpace(emailTo))
+        if (string.IsNullOrWhiteSpace(emailTo) ||
+            string.IsNullOrWhiteSpace(tenantId) ||
+            string.IsNullOrWhiteSpace(clientId) ||
+            string.IsNullOrWhiteSpace(clientSec) ||
+            string.IsNullOrWhiteSpace(senderUpn))
         {
-            logger.LogInformation("Email skipped — REPORT_EMAIL_FROM/TO not configured");
+            logger.LogInformation("Email skipped — Graph API env vars not fully configured");
             return;
         }
 
@@ -1243,21 +1255,51 @@ public class CodeReviewController : ControllerBase
                                         postedComments, skippedCount, dualModel);
         try
         {
-            using var mail = new MailMessage();
-            mail.From    = new MailAddress(emailFrom);
-            mail.Subject = subject;
-            mail.Body    = html;
-            mail.IsBodyHtml = true;
-            foreach (var to in emailTo.Split(',', StringSplitOptions.RemoveEmptyEntries))
-                mail.To.Add(to.Trim());
+            // Acquire OAuth2 token via client credentials
+            using var http = new HttpClient();
+            var tokenResp = await http.PostAsync(
+                $"https://login.microsoftonline.com/{tenantId}/oauth2/v2.0/token",
+                new FormUrlEncodedContent(new Dictionary<string, string>
+                {
+                    ["grant_type"]    = "client_credentials",
+                    ["client_id"]     = clientId,
+                    ["client_secret"] = clientSec,
+                    ["scope"]         = "https://graph.microsoft.com/.default",
+                }));
+            tokenResp.EnsureSuccessStatusCode();
+            var tokenDoc   = JsonDocument.Parse(await tokenResp.Content.ReadAsStringAsync());
+            var accessToken = tokenDoc.RootElement.GetProperty("access_token").GetString()!;
 
-            using var smtp = new SmtpClient(smtpHost, smtpPort)
+            // Build Graph sendMail payload
+            var recipients = emailTo
+                .Split(',', StringSplitOptions.RemoveEmptyEntries)
+                .Select(e => new { emailAddress = new { address = e.Trim() } })
+                .ToArray();
+
+            var message = new
             {
-                EnableSsl   = true,
-                Credentials = new NetworkCredential(smtpUser, smtpPass)
+                message = new
+                {
+                    subject,
+                    body = new { contentType = "HTML", content = html },
+                    toRecipients = recipients,
+                },
+                saveToSentItems = false,
             };
-            await smtp.SendMailAsync(mail);
-            logger.LogInformation("Review email sent to {Recipients} for PR #{PrId}", emailTo, prId);
+
+            var graphReq = new HttpRequestMessage(
+                HttpMethod.Post,
+                $"https://graph.microsoft.com/v1.0/users/{Uri.EscapeDataString(senderUpn)}/sendMail")
+            {
+                Content = new StringContent(
+                    JsonSerializer.Serialize(message), Encoding.UTF8, "application/json")
+            };
+            graphReq.Headers.Authorization =
+                new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", accessToken);
+
+            var sendResp = await http.SendAsync(graphReq);
+            sendResp.EnsureSuccessStatusCode();
+            logger.LogInformation("Review email sent (Graph) to {Recipients} for PR #{PrId}", emailTo, prId);
         }
         catch (Exception ex)
         {
@@ -1337,55 +1379,103 @@ public class CodeReviewController : ControllerBase
             """;
     }
 
+    /// <summary>
+    /// Submits a review job to the local Claude server, then polls until done (up to 12 min).
+    /// The server returns immediately with a jobId; the skill runs asynchronously in the background
+    /// so the devtunnel proxy never hits its gateway timeout.
+    /// </summary>
     private async Task<List<CodeReviewComment>> CallLocalClaudeAgentAsync(
         string localAgentUrl, string pullRequestLink, string? adoToken)
     {
+        var baseUrl = localAgentUrl.TrimEnd('/');
         try
         {
+            // Step 1 — submit job
             var payload = JsonSerializer.Serialize(new { pullRequestLink });
-            var req = new HttpRequestMessage(HttpMethod.Post, $"{localAgentUrl.TrimEnd('/')}/claudeCodeReview")
+            var submitReq = new HttpRequestMessage(HttpMethod.Post, $"{baseUrl}/claudeCodeReview")
             {
                 Content = new StringContent(payload, Encoding.UTF8, "application/json")
             };
             if (!string.IsNullOrWhiteSpace(adoToken))
-                req.Headers.TryAddWithoutValidation("X-Ado-Access-Token", adoToken);
+                submitReq.Headers.TryAddWithoutValidation("X-Ado-Access-Token", adoToken);
 
-            var resp = await _localClaudeHttpClient.SendAsync(req);
-            if (!resp.IsSuccessStatusCode)
+            var submitResp = await _localClaudeHttpClient.SendAsync(submitReq);
+            if (!submitResp.IsSuccessStatusCode)
             {
-                _logger.LogWarning("Local Claude agent returned {Status}", resp.StatusCode);
+                _logger.LogWarning("Local Claude agent returned {Status} on submit", submitResp.StatusCode);
                 return [];
             }
 
-            var json = await resp.Content.ReadAsStringAsync();
-            var doc  = JsonDocument.Parse(json);
-            if (!doc.RootElement.TryGetProperty("comments", out var arr) ||
-                arr.ValueKind != JsonValueKind.Array)
-                return [];
-
-            var comments = new List<CodeReviewComment>();
-            foreach (var item in arr.EnumerateArray())
+            var submitJson = await submitResp.Content.ReadAsStringAsync();
+            var submitDoc  = JsonDocument.Parse(submitJson);
+            if (!submitDoc.RootElement.TryGetProperty("jobId", out var jobIdEl))
             {
-                comments.Add(new CodeReviewComment
+                // Older server returning comments directly — parse inline
+                return ParseClaudeComments(submitDoc.RootElement);
+            }
+            var jobId = jobIdEl.GetString() ?? "";
+            _logger.LogInformation("Local Claude job submitted: {JobId}", jobId);
+
+            // Step 2 — poll until done (max 12 min, 20-second intervals)
+            var pollUrl     = $"{baseUrl}/claudeCodeReview/{jobId}";
+            var deadline    = DateTime.UtcNow.AddMinutes(12);
+            var pollInterval = TimeSpan.FromSeconds(20);
+
+            while (DateTime.UtcNow < deadline)
+            {
+                await Task.Delay(pollInterval);
+
+                HttpResponseMessage pollResp;
+                try { pollResp = await _localClaudeHttpClient.SendAsync(new HttpRequestMessage(HttpMethod.Get, pollUrl)); }
+                catch (Exception ex) { _logger.LogWarning("Poll error: {E}", ex.Message); continue; }
+
+                if (pollResp.StatusCode == System.Net.HttpStatusCode.Accepted)
+                    continue; // still pending
+
+                if (!pollResp.IsSuccessStatusCode)
                 {
-                    Id          = Guid.NewGuid().ToString(),
-                    FilePath    = item.TryGetProperty("filePath",    out var fp)  ? fp.GetString()  ?? "" : "",
-                    StartLine   = item.TryGetProperty("startLine",   out var sl)  ? sl.GetInt32()        : 1,
-                    EndLine     = item.TryGetProperty("endLine",     out var el)  ? el.GetInt32()        : 1,
-                    Severity    = item.TryGetProperty("severity",    out var sev) ? sev.GetString() ?? "medium" : "medium",
-                    CommentType = item.TryGetProperty("commentType", out var ct)  ? ct.GetString()  ?? "issue"  : "issue",
-                    CommentText = item.TryGetProperty("commentText", out var txt) ? txt.GetString() ?? "" : "",
-                    Confidence  = item.TryGetProperty("confidence",  out var conf) ? conf.GetDouble() : 0.8,
-                });
+                    _logger.LogWarning("Local Claude agent poll returned {Status}", pollResp.StatusCode);
+                    return [];
+                }
+
+                var pollJson = await pollResp.Content.ReadAsStringAsync();
+                var pollDoc  = JsonDocument.Parse(pollJson);
+                var comments = ParseClaudeComments(pollDoc.RootElement);
+                _logger.LogInformation("Local Claude agent returned {Count} comments", comments.Count);
+                return comments;
             }
-            _logger.LogInformation("Local Claude agent returned {Count} comments", comments.Count);
-            return comments;
+
+            _logger.LogWarning("Local Claude agent timed out after 12 min. Proceeding with GPT-4 only.");
+            return [];
         }
         catch (Exception ex)
         {
             _logger.LogWarning("Local Claude agent call failed — {Error}. Proceeding with GPT-4 only.", ex.Message);
             return [];
         }
+    }
+
+    private static List<CodeReviewComment> ParseClaudeComments(JsonElement root)
+    {
+        if (!root.TryGetProperty("comments", out var arr) || arr.ValueKind != JsonValueKind.Array)
+            return [];
+
+        var comments = new List<CodeReviewComment>();
+        foreach (var item in arr.EnumerateArray())
+        {
+            comments.Add(new CodeReviewComment
+            {
+                Id          = Guid.NewGuid().ToString(),
+                FilePath    = item.TryGetProperty("filePath",    out var fp)   ? fp.GetString()   ?? "" : "",
+                StartLine   = item.TryGetProperty("startLine",   out var sl)   ? sl.GetInt32()         : 1,
+                EndLine     = item.TryGetProperty("endLine",     out var el)   ? el.GetInt32()         : 1,
+                Severity    = item.TryGetProperty("severity",    out var sev)  ? sev.GetString()  ?? "medium" : "medium",
+                CommentType = item.TryGetProperty("commentType", out var ct)   ? ct.GetString()   ?? "issue"  : "issue",
+                CommentText = item.TryGetProperty("commentText", out var txt)  ? txt.GetString()  ?? "" : "",
+                Confidence  = item.TryGetProperty("confidence",  out var conf) ? conf.GetDouble() : 0.8,
+            });
+        }
+        return comments;
     }
 
     /// <summary>
