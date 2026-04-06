@@ -1174,9 +1174,7 @@ public class CodeReviewController : ControllerBase
             return false;
         var severity = comment.Severity?.Trim();
         return string.Equals(severity, "critical", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(severity, "high", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(severity, "medium", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(severity, "low", StringComparison.OrdinalIgnoreCase);
+            || string.Equals(severity, "high", StringComparison.OrdinalIgnoreCase);
     }
 
     private static CodeReviewComment CloneComment(CodeReviewComment comment)
