@@ -197,7 +197,7 @@ CLAUDE_REVIEW_PROMPT = textwrap.dedent("""
       "filePath":    "/path/to/file",
       "startLine":   42,
       "endLine":     42,
-      "severity":    "high" | "medium" | "low",
+      "severity":    "critical" | "medium" | "low",
       "commentType": "issue" | "suggestion" | "nitpick",
       "commentText": "Clear explanation of the problem",
       "suggestedFix": "Optional concrete fix",
@@ -301,7 +301,7 @@ CONSOLIDATION_PROMPT = textwrap.dedent("""
        clearer, more actionable wording; use the higher confidence score.
     2. BOOSTING confidence for comments raised by BOTH models (add 0.1, cap at 1.0).
     3. DROPPING comments where confidence < 0.65 AND only one model raised it.
-    4. KEEPING all high-severity (high) comments regardless of confidence.
+    4. KEEPING all critical-severity (critical) comments regardless of confidence.
     5. PRESERVING unique medium/low comments from either model if confidence >= 0.7.
 
     Model A comments (GPT-4 / cloud agent):
@@ -316,7 +316,7 @@ CONSOLIDATION_PROMPT = textwrap.dedent("""
       "filePath":    "/path/to/file",
       "startLine":   42,
       "endLine":     42,
-      "severity":    "high" | "medium" | "low",
+      "severity":    "critical" | "medium" | "low",
       "commentType": "issue" | "suggestion" | "nitpick",
       "commentText": "Clear explanation",
       "suggestedFix": "",
@@ -496,9 +496,9 @@ def review_pr(pr: dict, dry_run: bool) -> dict:
         consolidated = consolidate_comments(cloud_comments, claude_comments)
         report_entry["consolidated_count"] = len(consolidated)
 
-        # 5. Post — high severity only
-        high_only = [c for c in consolidated if c.get("severity", "").lower() == "high"]
-        print(f"  [Filter] {len(consolidated)} total -> {len(high_only)} high severity")
+        # 5. Post — critical severity only
+        high_only = [c for c in consolidated if c.get("severity", "").lower() == "critical"]
+        print(f"  [Filter] {len(consolidated)} total -> {len(high_only)} critical severity")
         result = post_comments(pr_id, high_only, dry_run)
 
         report_entry["posted_count"]   = result.get("posted", 0)
