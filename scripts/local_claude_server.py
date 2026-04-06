@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import sys, io
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 """
 local_claude_server.py
 
@@ -355,7 +359,7 @@ def review():
 
     pr_id, project, repo = parsed
     job_id = str(uuid.uuid4())
-    print(f"\n[Review] PR #{pr_id} ({project}/{repo}) → job {job_id[:8]}")
+    print(f"\n[Review] PR #{pr_id} ({project}/{repo}) -> job {job_id[:8]}")
 
     with _jobs_lock:
         _jobs[job_id] = {"status": "pending", "pullRequestId": pr_id}
