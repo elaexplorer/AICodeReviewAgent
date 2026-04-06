@@ -292,7 +292,7 @@ def health():
     })
 
 
-@app.post("/review")
+@app.post("/claudeCodeReview")
 def review():
     data    = request.get_json(force=True) or {}
     pr_link = data.get("pullRequestLink", "")

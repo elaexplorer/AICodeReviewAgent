@@ -1203,7 +1203,7 @@ public class CodeReviewController : ControllerBase
         try
         {
             var payload = JsonSerializer.Serialize(new { pullRequestLink });
-            var req = new HttpRequestMessage(HttpMethod.Post, $"{localAgentUrl.TrimEnd('/')}/review")
+            var req = new HttpRequestMessage(HttpMethod.Post, $"{localAgentUrl.TrimEnd('/')}/claudeCodeReview")
             {
                 Content = new StringContent(payload, Encoding.UTF8, "application/json")
             };
