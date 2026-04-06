@@ -2,34 +2,38 @@
 """
 local_claude_server.py
 
-Exposes a local HTTP endpoint so the cloud code review agent can call
-Claude reviews in parallel alongside its own GPT-4 review.
+Exposes a local HTTP endpoint that the cloud code review agent calls to get
+Claude's review comments for a PR.
 
-Claude runs INSIDE a local clone of the repository with full tool access
-(Read, Glob, Grep) so it can explore callers, tests, and related files —
-not just the raw diff.
+When called, it:
+  1. Ensures the ADO repo is cloned/updated locally (for CLAUDE.md context)
+  2. Checks out the PR source branch
+  3. Invokes the code-review:code-review Claude skill with 5 parallel agents
+     (CLAUDE.md compliance, bugs, git history, previous PRs, code comments)
+  4. Instructs the skill to return JSON instead of posting to ADO
+  5. Returns the JSON comment list to the cloud agent
+
+The cloud agent intersects these with its GPT-4/5 comments and only posts
+comments flagged by BOTH models.
 
 Usage:
   pip install flask
   python scripts/local_claude_server.py              # port 5010
-  python scripts/local_claude_server.py --port 5010
 
 Expose via tunnel so the cloud agent can reach it:
   ngrok http 5010
   devtunnel host -p 5010 --allow-anonymous
 
-Then set on the container:
-  az containerapp update --name code-review-agent \
-    --resource-group rg-code-review-agent \
+Set on the container app:
+  az containerapp update --name code-review-agent \\
+    --resource-group rg-code-review-agent \\
     --set-env-vars "LOCAL_CLAUDE_AGENT_URL=https://<tunnel-url>"
 """
 
 import argparse
-import base64
 import json
 import os
 import subprocess
-import sys
 import textwrap
 from pathlib import Path
 
@@ -61,16 +65,17 @@ ADO_PROJECT      = os.environ.get("ADO_PROJECT", "SCC")
 ADO_REPOSITORY   = os.environ.get("ADO_REPOSITORY", "service-shared_framework_waimea")
 CLAUDE_MODEL     = os.environ.get("CLAUDE_REVIEW_MODEL", "claude-sonnet-4-6")
 
-# Where to cache the repo clone — defaults to .repo_cache/<repo> under the project root
 REPO_CACHE_DIR = Path(os.environ.get(
     "REPO_CACHE_DIR",
     str(REPO_ROOT / ".repo_cache" / ADO_REPOSITORY)
 ))
 
 import requests as _requests
+import base64
+
 
 # ---------------------------------------------------------------------------
-# ADO helpers
+# ADO helpers (for repo clone auth + PR metadata)
 # ---------------------------------------------------------------------------
 
 def ado_headers(pat: str) -> dict:
@@ -78,74 +83,12 @@ def ado_headers(pat: str) -> dict:
     return {"Authorization": f"Basic {token}", "Content-Type": "application/json"}
 
 
-def ado_get(pat: str, path: str, **kwargs) -> dict:
-    url = f"https://dev.azure.com/{ADO_ORGANIZATION}/{ADO_PROJECT}/_apis/{path}"
-    r = _requests.get(url, headers=ado_headers(pat), params=kwargs, timeout=30)
+def get_pr_metadata(pat: str, pr_id: int) -> dict:
+    url = (f"https://dev.azure.com/{ADO_ORGANIZATION}/{ADO_PROJECT}/_apis/"
+           f"git/repositories/{ADO_REPOSITORY}/pullRequests/{pr_id}?api-version=7.0")
+    r = _requests.get(url, headers=ado_headers(pat), timeout=30)
     r.raise_for_status()
     return r.json()
-
-
-def get_pr_metadata(pat: str, pr_id: int) -> dict:
-    return ado_get(pat, f"git/repositories/{ADO_REPOSITORY}/pullRequests/{pr_id}",
-                   **{"api-version": "7.0"})
-
-
-def get_changed_file_paths(pat: str, pr_id: int) -> list[str]:
-    """Return list of changed file paths in the PR."""
-    iters = ado_get(pat,
-                    f"git/repositories/{ADO_REPOSITORY}/pullRequests/{pr_id}/iterations",
-                    **{"api-version": "7.0"})
-    latest = iters["value"][-1]["id"]
-    changes = ado_get(pat,
-                      f"git/repositories/{ADO_REPOSITORY}/pullRequests/{pr_id}/iterations/{latest}/changes",
-                      **{"api-version": "7.0", "$top": "100"})
-    return [
-        entry.get("item", {}).get("path", "")
-        for entry in changes.get("changeEntries", [])
-        if entry.get("item", {}).get("path")
-    ]
-
-
-def get_pr_diff_text(pat: str, pr_id: int) -> str:
-    """Fetch a unified diff summary of changed files."""
-    iters = ado_get(pat,
-                    f"git/repositories/{ADO_REPOSITORY}/pullRequests/{pr_id}/iterations",
-                    **{"api-version": "7.0"})
-    latest_id = iters["value"][-1]["id"]
-
-    changes = ado_get(pat,
-                      f"git/repositories/{ADO_REPOSITORY}/pullRequests/{pr_id}/iterations/{latest_id}/changes",
-                      **{"api-version": "7.0", "$top": "100"})
-
-    pr      = get_pr_metadata(pat, pr_id)
-    source_commit = pr.get("lastMergeSourceCommit", {}).get("commitId", "")
-    source_branch = pr.get("sourceRefName", "").replace("refs/heads/", "")
-
-    lines = []
-    for entry in changes.get("changeEntries", []):
-        path        = entry.get("item", {}).get("path", "")
-        change_type = entry.get("changeType", "edit")
-        lines.append(f"\n### {path}  (changeType={change_type})")
-        if change_type == "delete":
-            lines.append("[file deleted]")
-            continue
-        try:
-            params = {"path": path, "api-version": "7.0", "$format": "text"}
-            if source_commit:
-                params["versionDescriptor.versionType"] = "commit"
-                params["versionDescriptor.version"]     = source_commit
-            else:
-                params["versionDescriptor.versionType"] = "branch"
-                params["versionDescriptor.version"]     = source_branch
-            r = _requests.get(
-                f"https://dev.azure.com/{ADO_ORGANIZATION}/{ADO_PROJECT}/_apis/"
-                f"git/repositories/{ADO_REPOSITORY}/items",
-                headers=ado_headers(pat), params=params, timeout=30)
-            lines.append(f"```\n{r.text[:5000]}\n```" if r.status_code == 200 else f"[HTTP {r.status_code}]")
-        except Exception as e:
-            lines.append(f"[error: {e}]")
-
-    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -153,16 +96,11 @@ def get_pr_diff_text(pat: str, pr_id: int) -> str:
 # ---------------------------------------------------------------------------
 
 def ensure_repo_cloned(pat: str) -> Path:
-    """
-    Clone the ADO repo into REPO_CACHE_DIR if not present.
-    If already cloned, fetch latest so branches are up to date.
-    Returns the local repo path.
-    """
+    """Clone the ADO repo locally if not present, otherwise fetch latest."""
     clone_url = (
         f"https://x:{pat}@dev.azure.com/{ADO_ORGANIZATION}/{ADO_PROJECT}"
         f"/_git/{ADO_REPOSITORY}"
     )
-
     if not REPO_CACHE_DIR.exists():
         print(f"[Repo] Cloning {ADO_REPOSITORY} into {REPO_CACHE_DIR} ...")
         REPO_CACHE_DIR.parent.mkdir(parents=True, exist_ok=True)
@@ -174,35 +112,28 @@ def ensure_repo_cloned(pat: str) -> Path:
             raise RuntimeError(f"git clone failed: {result.stderr[:400]}")
         print("[Repo] Clone complete")
     else:
-        print(f"[Repo] Fetching latest into {REPO_CACHE_DIR} ...")
-        # Re-set remote URL in case PAT changed
         subprocess.run(
             ["git", "remote", "set-url", "origin", clone_url],
             cwd=str(REPO_CACHE_DIR), capture_output=True, timeout=15
         )
         subprocess.run(
             ["git", "fetch", "origin", "--depth=50", "--prune"],
-            cwd=str(REPO_CACHE_DIR), capture_output=True, text=True, timeout=120
+            cwd=str(REPO_CACHE_DIR), capture_output=True, timeout=120
         )
-
     return REPO_CACHE_DIR
 
 
 def checkout_pr_branch(repo_dir: Path, pr: dict):
-    """
-    Fetch and check out the PR source branch so Claude sees the exact
-    state of the code being reviewed.
-    """
-    source_ref    = pr.get("sourceRefName", "").replace("refs/heads/", "")
+    """Check out the PR source branch so CLAUDE.md reflects the PR state."""
     source_commit = pr.get("lastMergeSourceCommit", {}).get("commitId", "")
+    source_ref    = pr.get("sourceRefName", "").replace("refs/heads/", "")
 
     if source_commit:
-        # Detach HEAD at the exact PR tip commit
-        result = subprocess.run(
+        r = subprocess.run(
             ["git", "checkout", "--detach", source_commit],
             cwd=str(repo_dir), capture_output=True, text=True, timeout=30
         )
-        if result.returncode == 0:
+        if r.returncode == 0:
             print(f"[Repo] Checked out commit {source_commit[:8]}")
             return
 
@@ -213,100 +144,69 @@ def checkout_pr_branch(repo_dir: Path, pr: dict):
         )
         subprocess.run(
             ["git", "checkout", "-B", source_ref, f"origin/{source_ref}"],
-            cwd=str(repo_dir), capture_output=True, text=True, timeout=30
+            cwd=str(repo_dir), capture_output=True, timeout=30
         )
         print(f"[Repo] Checked out branch {source_ref}")
 
 
 # ---------------------------------------------------------------------------
-# Claude review — full codebase context
+# Claude skill invocation
 # ---------------------------------------------------------------------------
 
-REVIEW_PROMPT = textwrap.dedent("""
-    You are a senior code reviewer with full access to this repository.
+# Instruct the skill to run its full multi-agent pipeline but return JSON
+# instead of posting to ADO/GitHub.
+SKILL_PROMPT = textwrap.dedent("""
+    Run the code-review:code-review skill for this pull request:
+    {pr_link}
 
-    PR Title:      {title}
-    Source Branch: {source}
-    Target Branch: {target}
-    PR Author:     {author}
+    IMPORTANT: Do NOT post any comments to ADO or GitHub.
+    Instead, after completing the full review (all 5 parallel agents,
+    confidence scoring, and filtering), return ONLY a raw JSON array of
+    issues with confidence >= 80. No prose, no markdown fences — raw JSON only.
 
-    Changed files in this PR:
-    {changed_files}
-
-    PR content (changed file contents at PR head):
-    {diff}
-
-    You have Read, Glob, and Grep tools available to explore the full repository.
-    Before writing comments, use your tools to:
-    1. Read the complete changed files for full context beyond the diff
-    2. Find and read callers or consumers of any changed functions / classes / interfaces
-    3. Check related tests to understand expected behaviour
-    4. Grep for similar patterns elsewhere to judge consistency
-    5. Read any interfaces or base classes that changed code implements
-
-    This context will help you catch real issues (broken callers, violated contracts,
-    missing test coverage) rather than surface-level observations.
-
-    After exploring the codebase, return ONLY a raw JSON array — no prose, no markdown
-    fences. Each element must have exactly these fields:
+    Each element must have exactly these fields:
     {{
       "filePath":    "/path/to/file",
       "startLine":   42,
       "endLine":     42,
       "severity":    "critical" | "medium" | "low",
       "commentType": "issue" | "suggestion" | "nitpick",
-      "commentText": "Clear explanation, referencing what you found in the codebase",
+      "commentText": "Clear description of the issue",
       "suggestedFix": "Optional concrete fix",
       "confidence":  0.0-1.0
     }}
 
-    Focus on:
-    - Bugs and logic errors
-    - Security vulnerabilities
-    - Breaking changes to callers
-    - Missing error handling
-    - Inconsistency with patterns in the rest of the codebase
-
-    Only include comments with confidence >= 0.7.
-    Return [] if no issues found.
+    Return [] if no issues survive the confidence filter.
 """).strip()
 
 
-def run_claude_review(pr: dict, diff: str, changed_files: list[str], repo_dir: Path) -> list[dict]:
+def run_skill_review(pr_link: str, repo_dir: Path) -> list[dict]:
     """
-    Run Claude inside the local repo clone so it has full tool access
-    (Read, Glob, Grep) to explore the codebase before commenting.
+    Invoke the code-review:code-review Claude skill from within the local
+    repo clone. The skill runs 5 parallel agents + confidence scoring.
+    No --allowedTools restriction so the skill can use MCP, Bash, git, etc.
+    Timeout is generous (10 min) to accommodate multi-agent execution.
     """
-    changed_files_str = "\n".join(f"  - {f}" for f in changed_files) or "  (none)"
-    prompt = REVIEW_PROMPT.format(
-        title=pr.get("title", ""),
-        source=pr.get("sourceRefName", ""),
-        target=pr.get("targetRefName", ""),
-        author=pr.get("createdBy", {}).get("displayName", ""),
-        changed_files=changed_files_str,
-        diff=diff[:20000],
-    )
+    prompt = SKILL_PROMPT.format(pr_link=pr_link)
 
-    print(f"[Claude] Running review in {repo_dir} with full repo context...")
+    print(f"[Skill] Invoking code-review:code-review for {pr_link}")
+    print(f"[Skill] Running from: {repo_dir}")
+
+    env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_LOG"}
     try:
-        env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_LOG"}
         result = subprocess.run(
-            [
-                "claude", "--print",
-                "--output-format", "json",
-                "--model", CLAUDE_MODEL,
-                "--allowedTools", "Read,Glob,Grep",
-            ],
+            ["claude", "--print", "--output-format", "json", "--model", CLAUDE_MODEL],
             input=prompt,
             capture_output=True,
             text=True,
             encoding="utf-8",
-            timeout=300,
+            timeout=600,          # 10 min — skill runs 5 parallel agents
             env=env,
-            cwd=str(repo_dir),   # <-- run inside the repo
+            cwd=str(repo_dir),    # run inside repo so skill finds CLAUDE.md
         )
+
         if result.returncode != 0:
-            print(f"[Claude] Error exit {result.returncode}: {result.stderr[:300]}")
+            print(f"[Skill] Exit {result.returncode}: {result.stderr[:300]}")
             return []
 
         stdout = "\n".join(
@@ -314,17 +214,18 @@ def run_claude_review(pr: dict, diff: str, changed_files: list[str], repo_dir: P
             if not l.startswith("process.env[")
         ).strip()
 
+        # claude --output-format json wraps output in {"result": "...", ...}
         outer = json.loads(stdout)
         text  = outer.get("result", stdout)
         comments = parse_json_comments(text)
-        print(f"[Claude] {len(comments)} comments generated")
+        print(f"[Skill] {len(comments)} comments returned")
         return comments
 
     except subprocess.TimeoutExpired:
-        print("[Claude] Timed out after 5 minutes")
+        print("[Skill] Timed out after 10 minutes")
         return []
     except Exception as e:
-        print(f"[Claude] Failed: {e}")
+        print(f"[Skill] Failed: {e}")
         return []
 
 
@@ -384,9 +285,9 @@ app = Flask(__name__)
 @app.get("/health")
 def health():
     return jsonify({
-        "status":   "ok",
-        "model":    CLAUDE_MODEL,
-        "repoDir":  str(REPO_CACHE_DIR),
+        "status":     "ok",
+        "model":      CLAUDE_MODEL,
+        "repoCache":  str(REPO_CACHE_DIR),
         "repoCached": REPO_CACHE_DIR.exists(),
     })
 
@@ -414,18 +315,14 @@ def review():
     print(f"\n[Review] PR #{pr_id} ({project}/{repo})")
 
     try:
-        pr            = get_pr_metadata(ado_pat, pr_id)
-        changed_files = get_changed_file_paths(ado_pat, pr_id)
-        diff          = get_pr_diff_text(ado_pat, pr_id)
-
-        print(f"[Review] {len(changed_files)} changed files: {', '.join(changed_files[:5])}")
-
-        # Ensure repo is cloned locally and checked out at PR head
+        # Ensure local repo is cloned and on the PR branch (for CLAUDE.md)
+        pr       = get_pr_metadata(ado_pat, pr_id)
         repo_dir = ensure_repo_cloned(ado_pat)
         checkout_pr_branch(repo_dir, pr)
 
-        comments = run_claude_review(pr, diff, changed_files, repo_dir)
-        print(f"[Review] PR #{pr_id} → {len(comments)} comments")
+        # Run the code-review:code-review skill — returns JSON, does not post
+        comments = run_skill_review(pr_link, repo_dir)
+        print(f"[Review] PR #{pr_id} → {len(comments)} comments from skill")
 
         return jsonify({"pullRequestId": pr_id, "comments": comments})
 
@@ -439,11 +336,12 @@ def review():
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Local Claude review server — full repo context")
+    parser = argparse.ArgumentParser(description="Local Claude skill review server")
     parser.add_argument("--port", type=int, default=5010)
     args = parser.parse_args()
 
     print(f"Local Claude review server")
+    print(f"  Skill:    code-review:code-review")
     print(f"  Model:    {CLAUDE_MODEL}")
     print(f"  Repo:     {ADO_ORGANIZATION}/{ADO_PROJECT}/{ADO_REPOSITORY}")
     print(f"  Cache:    {REPO_CACHE_DIR}")
