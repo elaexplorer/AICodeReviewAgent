@@ -637,9 +637,15 @@ public class CodeReviewController : ControllerBase
 
             var adoAccessTokenOverride = GetOptionalAdoAccessTokenHeader();
 
+            // Use a dedicated bot PAT for posting so comments appear under a service identity,
+            // not the caller's personal account. Falls back to the caller's token if not set.
+            var botPat = Environment.GetEnvironmentVariable("ADO_BOT_PAT");
+            var postingToken = !string.IsNullOrWhiteSpace(botPat) ? botPat : adoAccessTokenOverride;
+
             _logger.LogInformation(
-                "POST comments/post: {Count} candidate comments for PR {PrId} in {Project}/{Repository}",
-                request.Comments.Count, request.PullRequestId, request.Project, request.Repository);
+                "POST comments/post: {Count} candidate comments for PR {PrId} in {Project}/{Repository} (bot identity: {BotIdentity})",
+                request.Comments.Count, request.PullRequestId, request.Project, request.Repository,
+                string.IsNullOrWhiteSpace(botPat) ? "caller" : "bot");
 
             // Fetch PR files so we can remap comment lines to valid diff positions
             var files = await _adoClient.GetPullRequestFilesAsync(
@@ -692,7 +698,7 @@ public class CodeReviewController : ControllerBase
 
                 var postResult = await _adoClient.PostCommentWithResultAsync(
                     request.Project, request.Repository, request.PullRequestId,
-                    comment, adoAccessTokenOverride);
+                    comment, postingToken);
 
                 if (postResult.Success)
                 {
