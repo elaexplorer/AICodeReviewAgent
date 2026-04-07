@@ -261,19 +261,19 @@ public class CodeReviewController : ControllerBase
                     "Parallel review complete — GPT-4: {GptCount} comments, Claude: {ClaudeCount} comments",
                     reviewOutput.Comments.Count, claudeComments.Count);
 
-                // If local Claude is available, only post comments found by both models
+                // Post high/critical comments from both models (union), deduped by position
                 var highPriorityComments = reviewOutput.Comments
                     .Where(IsHighPriorityComment)
+                    .Concat(claudeComments.Where(IsHighPriorityComment))
+                    .GroupBy(c => $"{NormalizePath(c.FilePath)}:{c.StartLine}")
+                    .Select(g => g.First())
                     .ToList();
 
-                if (claudeComments.Count > 0)
-                {
-                    var before = highPriorityComments.Count;
-                    highPriorityComments = IntersectWithClaudeComments(highPriorityComments, claudeComments);
-                    _logger.LogInformation(
-                        "Intersection filter: {Before} GPT-4 comments → {After} found by both models",
-                        before, highPriorityComments.Count);
-                }
+                _logger.LogInformation(
+                    "Union filter: {GptHigh} GPT-4 high/critical + {ClaudeHigh} Claude high/critical → {Total} to post (after dedup)",
+                    reviewOutput.Comments.Count(IsHighPriorityComment),
+                    claudeComments.Count(IsHighPriorityComment),
+                    highPriorityComments.Count);
                 var validRightSideLinesByFile = BuildValidRightSideLineLookup(reviewOutput.Files);
                 var existingFingerprints = await _adoClient.GetExistingCommentFingerprintsAsync(
                     reviewOutput.Project,
@@ -1300,7 +1300,7 @@ public class CodeReviewController : ControllerBase
         var durationSec        = (int)(jobCompletedAt - jobStartedAt).TotalSeconds;
         var durationStr        = durationSec >= 60 ? $"{durationSec / 60}m {durationSec % 60}s" : $"{durationSec}s";
         var dualModel          = claudeComments.Count > 0;
-        var modelTag           = dualModel ? "GPT + Claude (dual-model)" : "GPT only";
+        var modelTag           = dualModel ? "GPT + Claude (union)" : "GPT only";
         var notPosted          = Math.Max(0, filteredToPost - postedComments.Count - skippedCount);
         var gptHighComments    = gptComments.Where(c => c.Severity?.ToLower() is "critical" or "high").OrderByDescending(c => c.Confidence).ToList();
         var claudeHighComments = claudeComments.Where(c => c.Severity?.ToLower() is "critical" or "high").OrderByDescending(c => c.Confidence).ToList();
