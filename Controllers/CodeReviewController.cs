@@ -709,6 +709,18 @@ public class CodeReviewController : ControllerBase
 
             foreach (var incoming in request.Comments)
             {
+                // Only post critical severity — guard against stale clients sending medium/low
+                var incomingSeverity = (incoming.Severity ?? "medium").Trim().ToLowerInvariant();
+                if (!string.Equals(incomingSeverity, "critical", StringComparison.Ordinal))
+                {
+                    _logger.LogInformation(
+                        "Skipping non-critical comment at {FilePath}:{Line} (severity={Severity})",
+                        incoming.FilePath, incoming.StartLine, incomingSeverity);
+                    skippedCount++;
+                    skippedComments.Add(new { incoming.FilePath, incoming.StartLine, reason = $"severity={incomingSeverity}" });
+                    continue;
+                }
+
                 // Map to CodeReviewComment
                 var comment = new CodeReviewComment
                 {
