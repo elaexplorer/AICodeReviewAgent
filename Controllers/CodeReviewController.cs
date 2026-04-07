@@ -1313,7 +1313,7 @@ public class CodeReviewController : ControllerBase
             var sb = new StringBuilder();
             foreach (var c in items)
             {
-                var sev  = (c.Severity ?? "").ToUpper();
+                var sev  = c.Severity?.ToLower() is "high" or "critical" ? "CRITICAL" : (c.Severity?.ToUpper() ?? "MEDIUM");
                 var conf = $"{c.Confidence * 100:F0}%";
                 var file = System.Web.HttpUtility.HtmlEncode(
                     System.IO.Path.GetFileName(c.FilePath ?? ""));
@@ -1351,7 +1351,7 @@ public class CodeReviewController : ControllerBase
                 postedHtml.Append($"""
                     <div style="margin:8px 0;padding:10px 14px;border-left:3px solid #d73a49;background:#ffeef0;border-radius:0 4px 4px 0">
                       <div style="font-size:11px;font-weight:700;color:#d73a49;margin-bottom:3px">
-                        {(c.Severity ?? "HIGH").ToUpper()} &nbsp;·&nbsp; {c.Confidence * 100:F0}% confidence
+                        {(c.Severity?.ToLower() is "high" or "critical" ? "CRITICAL" : (c.Severity?.ToUpper() ?? "HIGH"))} &nbsp;·&nbsp; {c.Confidence * 100:F0}% confidence
                       </div>
                       <div style="font-size:11px;color:#586069;margin-bottom:4px">
                         <code>{System.Web.HttpUtility.HtmlEncode(c.FilePath ?? "")}:{c.StartLine}</code>
