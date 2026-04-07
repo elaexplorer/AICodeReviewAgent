@@ -385,6 +385,15 @@ public class AzureDevOpsMcpClient : IAsyncDisposable
         string project, string repositoryId, int pullRequestId)
         => await _restClient.GetAgentThreadStatusesAsync(project, repositoryId, pullRequestId);
 
+    public async Task PostPrSummaryCommentAsync(
+        string project, string repository, int pullRequestId,
+        string markdownBody, string? accessTokenOverride = null)
+    {
+        var repoInfo = await _restClient.GetRepositoryAsync(project, repository);
+        if (repoInfo?.Id is not null)
+            await _restClient.PostPrSummaryCommentAsync(project, repoInfo.Id, pullRequestId, markdownBody, accessTokenOverride);
+    }
+
     public async ValueTask DisposeAsync()
     {
         if (_mcpClient is not null)

@@ -621,6 +621,37 @@ public class AzureDevOpsRestClient
         }
     }
 
+    /// <summary>
+    /// Posts a PR-level (non-inline) summary comment from the code review agent.
+    /// </summary>
+    public async Task PostPrSummaryCommentAsync(
+        string project,
+        string repositoryId,
+        int pullRequestId,
+        string markdownBody,
+        string? accessTokenOverride = null)
+    {
+        try
+        {
+            var url = $"https://dev.azure.com/{_organization}/{project}/_apis/git/repositories/{repositoryId}/pullRequests/{pullRequestId}/threads?api-version=7.1";
+            var payload = new
+            {
+                comments = new[] { new { parentCommentId = 0, content = markdownBody, commentType = 1 } },
+                status = 4   // 4 = closed/informational — doesn't block completion
+            };
+            var json = JsonSerializer.Serialize(payload);
+            var response = await SendPostWithAuthFallbackAsync(url, json, accessTokenOverride, "summary-thread-post");
+            if (response.IsSuccessStatusCode)
+                _logger.LogInformation("Posted PR summary comment to PR {PullRequestId}", pullRequestId);
+            else
+                _logger.LogWarning("Failed to post PR summary comment to PR {PullRequestId}: {Status}", pullRequestId, response.StatusCode);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Exception posting PR summary comment to PR {PullRequestId}", pullRequestId);
+        }
+    }
+
     private static async Task<int?> ParseThreadIdFromResponseAsync(HttpResponseMessage response)
     {
         try
