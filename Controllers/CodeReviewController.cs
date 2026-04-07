@@ -709,9 +709,9 @@ public class CodeReviewController : ControllerBase
 
             foreach (var incoming in request.Comments)
             {
-                // Only post critical severity — guard against stale clients sending medium/low
+                // Only post critical/high severity — guard against stale clients sending medium/low
                 var incomingSeverity = (incoming.Severity ?? "medium").Trim().ToLowerInvariant();
-                if (!string.Equals(incomingSeverity, "critical", StringComparison.Ordinal))
+                if (incomingSeverity is not ("critical" or "high"))
                 {
                     _logger.LogInformation(
                         "Skipping non-critical comment at {FilePath}:{Line} (severity={Severity})",
@@ -1533,8 +1533,8 @@ public class CodeReviewController : ControllerBase
     {
         if (comment.Confidence < 0.7)
             return false;
-        var severity = comment.Severity?.Trim();
-        return string.Equals(severity, "critical", StringComparison.OrdinalIgnoreCase);
+        var severity = comment.Severity?.Trim().ToLowerInvariant();
+        return severity is "critical" or "high";
     }
 
     private static CodeReviewComment CloneComment(CodeReviewComment comment)
