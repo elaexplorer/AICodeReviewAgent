@@ -82,7 +82,8 @@ public class CodeReviewComment
     // LLM confidence that this is a real issue (0.0–1.0). Comments below 0.7 are not posted.
     public double Confidence { get; set; } = 1.0;
 
-    public bool Posted { get; set; } = false;
+    public bool   Posted   { get; set; } = false;
+    public int?   ThreadId { get; set; }
 }
 
 public class RepositoryInfo

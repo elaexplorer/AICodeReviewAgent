@@ -327,9 +327,11 @@ public class CodeReviewController : ControllerBase
 
                     if (postResult.Success)
                     {
-                        comment.Posted = true;
+                        comment.Posted    = true;
+                        comment.ThreadId  = postResult.ThreadId;
                         comment.StartLine = commentToPost.StartLine;
-                        comment.EndLine = commentToPost.EndLine;
+                        comment.EndLine   = commentToPost.EndLine;
+                        commentToPost.ThreadId = postResult.ThreadId;
                         postedCount++;
                         postedComments.Add(commentToPost);
                         existingFingerprints.Add(fingerprint);
@@ -359,6 +361,45 @@ public class CodeReviewController : ControllerBase
                             postResult.ErrorMessage);
                     }
                 }
+
+                var dualModel = claudeComments.Count > 0;
+
+                // Persist job record and posted thread IDs to SQLite for daily reporting
+                var jobRecord = new ReviewJobRecord
+                {
+                    JobId        = jobId,
+                    PrId         = reviewOutput.PullRequestId,
+                    PrUrl        = request.PullRequestLink,
+                    Project      = reviewOutput.Project,
+                    Repository   = reviewOutput.Repository,
+                    ReviewedAt   = DateTime.UtcNow,
+                    GptTotal     = reviewOutput.Comments.Count,
+                    GptHigh      = reviewOutput.Comments.Count(IsHighPriorityComment),
+                    ClaudeTotal  = claudeComments.Count,
+                    ClaudeHigh   = claudeComments.Count(IsHighPriorityComment),
+                    PostedCount  = postedCount,
+                    SkippedCount = skippedCount,
+                    ModelTag     = dualModel ? "GPT + Claude (union)" : "GPT only",
+                };
+                _ = _feedbackService.RecordJobAsync(jobRecord);
+
+                var postedThreadRecords = postedComments
+                    .Where(c => c.ThreadId.HasValue)
+                    .Select(c => new PostedThreadRecord
+                    {
+                        ThreadId    = c.ThreadId!.Value,
+                        FilePath    = c.FilePath,
+                        StartLine   = c.StartLine,
+                        Severity    = c.Severity ?? "high",
+                        CommentType = c.CommentType ?? "issue",
+                        SourceModel = "gpt",
+                    })
+                    .ToList();
+                if (postedThreadRecords.Count > 0)
+                    _ = _feedbackService.RecordPostedThreadsAsync(
+                            jobId, reviewOutput.PullRequestId,
+                            reviewOutput.Project, reviewOutput.Repository,
+                            postedThreadRecords);
 
                 // Send email summary — fire and forget, don't block job completion
                 _ = SendReviewEmailAsync(
@@ -1814,6 +1855,176 @@ public class CodeReviewController : ControllerBase
     {
         var metrics = _feedbackService.GetMetrics();
         return Ok(metrics);
+    }
+
+    /// <summary>
+    /// Sends the end-of-day email summary for all PRs reviewed today.
+    /// Syncs ADO thread statuses first so acceptance/rejection data is current.
+    /// GET /api/codereview/daily-report?date=2026-04-07   (date optional, defaults to today UTC)
+    /// </summary>
+    [HttpGet("daily-report")]
+    public async Task<IActionResult> SendDailyReport([FromQuery] string? date = null)
+    {
+        var emailTo      = Environment.GetEnvironmentVariable("REPORT_EMAIL_TO");
+        var logicAppUrl  = Environment.GetEnvironmentVariable("REPORT_LOGIC_APP_URL");
+        if (string.IsNullOrWhiteSpace(emailTo) || string.IsNullOrWhiteSpace(logicAppUrl))
+            return BadRequest("REPORT_EMAIL_TO and REPORT_LOGIC_APP_URL env vars are required.");
+
+        var reportDate = string.IsNullOrWhiteSpace(date)
+            ? DateTimeOffset.UtcNow
+            : DateTimeOffset.Parse(date);
+
+        // Sync ADO thread statuses for all PRs reviewed today before pulling data
+        var jobsRaw = _feedbackService.GetTodayJobs(reportDate);
+        foreach (var row in jobsRaw)
+        {
+            try
+            {
+                await _feedbackService.SyncThreadStatusesForPrAsync(
+                    row.Project,
+                    row.Repository,
+                    row.PrId,
+                    async (proj, repo, prId) =>
+                    {
+                        var repoInfo = await _adoClient.GetRepositoryAsync(proj, repo);
+                        if (repoInfo == null) return [];
+                        return await _adoClient.GetAgentThreadStatusesAsync(proj, repoInfo.Id, prId);
+                    });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to sync thread statuses for PR {PrId}", row.PrId);
+            }
+        }
+
+        var rows = _feedbackService.GetTodayJobs(reportDate);
+        if (rows.Count == 0)
+        {
+            return Ok(new { message = $"No PRs reviewed on {reportDate:yyyy-MM-dd}." });
+        }
+
+        var html    = BuildDailyReportEmailHtml(rows, reportDate);
+        var subject = $"AI Code Review Daily Summary — {reportDate:yyyy-MM-dd} ({rows.Count} PR{(rows.Count == 1 ? "" : "s")})";
+
+        using var http = new HttpClient();
+        var payload  = JsonSerializer.Serialize(new { to = emailTo, subject, body = html });
+        var response = await http.PostAsync(logicAppUrl,
+            new StringContent(payload, Encoding.UTF8, "application/json"));
+
+        if (!response.IsSuccessStatusCode)
+        {
+            var err = await response.Content.ReadAsStringAsync();
+            _logger.LogError("Daily report email failed: {Status} {Body}", response.StatusCode, err);
+            return StatusCode(500, new { error = "Failed to send daily report email", detail = err });
+        }
+
+        _logger.LogInformation("Daily report sent to {Email} for {Date} ({Count} PRs)", emailTo, reportDate.ToString("yyyy-MM-dd"), rows.Count);
+        return Ok(new { sent = true, prCount = rows.Count, date = reportDate.ToString("yyyy-MM-dd") });
+    }
+
+    private static string BuildDailyReportEmailHtml(List<DailyReportRow> rows, DateTimeOffset reportDate)
+    {
+        var totalPosted   = rows.Sum(r => r.PostedCount);
+        var totalSkipped  = rows.Sum(r => r.SkippedCount);
+        var totalResolved = rows.Sum(r => r.Resolved);
+        var totalRejected = rows.Sum(r => r.Rejected);
+        var totalActive   = rows.Sum(r => r.Active);
+        var totalThreads  = rows.Sum(r => r.TotalThreads);
+
+        static string Badge(string text, string bg, string fg = "#fff") =>
+            $"<span style=\"background:{bg};color:{fg};padding:2px 7px;border-radius:10px;font-size:11px;font-weight:600\">{text}</span>";
+
+        var prRows = new StringBuilder();
+        foreach (var r in rows)
+        {
+            var prLink   = $"<a href=\"{r.PrUrl}\" style=\"color:#0366d6\">PR #{r.PrId}</a>";
+            var repoShort = r.Repository.Length > 30 ? r.Repository[..30] + "…" : r.Repository;
+            var resolvedBadge = r.Resolved > 0 ? Badge($"✓ {r.Resolved} resolved", "#2ea44f") : "";
+            var rejectedBadge = r.Rejected > 0 ? Badge($"✗ {r.Rejected} rejected", "#d93f0b") : "";
+            var activeBadge   = r.Active   > 0 ? Badge($"◉ {r.Active} open", "#0075ca") : "";
+            var time = r.ReviewedAt.Length >= 19 ? r.ReviewedAt[11..16] + " UTC" : r.ReviewedAt;
+
+            prRows.AppendLine($"""
+                <tr>
+                  <td style="padding:8px 10px;border-bottom:1px solid #e1e4e8">{prLink}<br><span style="color:#586069;font-size:11px">{repoShort}</span></td>
+                  <td style="padding:8px 10px;border-bottom:1px solid #e1e4e8;text-align:center">{r.GptHigh}</td>
+                  <td style="padding:8px 10px;border-bottom:1px solid #e1e4e8;text-align:center">{r.ClaudeHigh}</td>
+                  <td style="padding:8px 10px;border-bottom:1px solid #e1e4e8;text-align:center"><strong>{r.PostedCount}</strong>{(r.SkippedCount > 0 ? $" <span style='color:#586069;font-size:11px'>(+{r.SkippedCount} dedup)</span>" : "")}</td>
+                  <td style="padding:8px 10px;border-bottom:1px solid #e1e4e8">{resolvedBadge} {rejectedBadge} {activeBadge}</td>
+                  <td style="padding:8px 10px;border-bottom:1px solid #e1e4e8;font-size:11px;color:#586069">{time}</td>
+                </tr>
+                """);
+        }
+
+        return $"""
+            <!DOCTYPE html><html><body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f6f8fa;margin:0;padding:20px">
+            <div style="max-width:820px;margin:0 auto;background:#fff;border:1px solid #e1e4e8;border-radius:8px;overflow:hidden">
+
+              <!-- Header -->
+              <div style="background:#24292e;padding:20px 24px">
+                <h1 style="color:#fff;margin:0;font-size:18px">AI Code Review — Daily Summary</h1>
+                <div style="color:#8b949e;font-size:12px;margin-top:4px">{reportDate:yyyy-MM-dd} &nbsp;·&nbsp; {rows.Count} PR{(rows.Count == 1 ? "" : "s")} reviewed</div>
+              </div>
+
+              <!-- Stat bar -->
+              <div style="display:flex;gap:0;border-bottom:1px solid #e1e4e8">
+                {StatCell("PRs Reviewed", rows.Count.ToString())}
+                {StatCell("Comments Posted", totalPosted.ToString())}
+                {StatCell("Deduped/Skipped", totalSkipped.ToString())}
+                {StatCell("Resolved", totalResolved.ToString(), "#2ea44f")}
+                {StatCell("Rejected", totalRejected.ToString(), "#d93f0b")}
+                {StatCell("Still Open", totalActive.ToString(), "#0075ca")}
+              </div>
+
+              <!-- PR table -->
+              <div style="padding:20px 24px">
+                <h2 style="font-size:14px;margin:0 0 12px">PRs Reviewed Today</h2>
+                <table style="width:100%;border-collapse:collapse;font-size:13px">
+                  <thead>
+                    <tr style="background:#f6f8fa">
+                      <th style="padding:8px 10px;text-align:left;border-bottom:2px solid #e1e4e8">PR / Repo</th>
+                      <th style="padding:8px 10px;text-align:center;border-bottom:2px solid #e1e4e8">GPT high</th>
+                      <th style="padding:8px 10px;text-align:center;border-bottom:2px solid #e1e4e8">Claude high</th>
+                      <th style="padding:8px 10px;text-align:center;border-bottom:2px solid #e1e4e8">Posted</th>
+                      <th style="padding:8px 10px;text-align:left;border-bottom:2px solid #e1e4e8">Feedback</th>
+                      <th style="padding:8px 10px;text-align:left;border-bottom:2px solid #e1e4e8">Time</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {prRows}
+                  </tbody>
+                </table>
+              </div>
+
+              {(totalThreads > 0 ? $"""
+              <!-- Acceptance summary -->
+              <div style="padding:0 24px 20px">
+                <h2 style="font-size:14px;margin:0 0 8px">Comment Acceptance (all tracked threads)</h2>
+                <div style="background:#f6f8fa;border:1px solid #e1e4e8;border-radius:6px;padding:12px 16px;font-size:13px">
+                  {Badge($"✓ {totalResolved} resolved", "#2ea44f")} &nbsp;
+                  {Badge($"✗ {totalRejected} rejected", "#d93f0b")} &nbsp;
+                  {Badge($"◉ {totalActive} open", "#0075ca")}
+                  {(totalThreads > 0 ? $"<br><span style='color:#586069;font-size:11px;margin-top:6px;display:block'>Acceptance rate: {Math.Round(totalResolved * 100.0 / totalThreads, 1)}% of tracked threads resolved as fixed</span>" : "")}
+                </div>
+              </div>
+              """ : "")}
+
+              <!-- Footer -->
+              <div style="padding:12px 24px;background:#f6f8fa;border-top:1px solid #e1e4e8;font-size:11px;color:#586069">
+                Generated by AI Code Review Agent &nbsp;·&nbsp; Feedback status synced from Azure DevOps at report time
+              </div>
+            </div>
+            </body></html>
+            """;
+    }
+
+    private static string StatCell(string label, string value, string? valueColor = null)
+    {
+        var color = valueColor ?? "#24292e";
+        return $"<div style=\"flex:1;padding:14px 16px;border-right:1px solid #e1e4e8;text-align:center\">" +
+               $"<div style=\"font-size:22px;font-weight:700;color:{color}\">{value}</div>" +
+               $"<div style=\"font-size:11px;color:#586069;margin-top:2px\">{label}</div>" +
+               "</div>";
     }
 }
 
