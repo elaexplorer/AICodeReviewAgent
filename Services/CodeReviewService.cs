@@ -267,7 +267,11 @@ public class CodeReviewService
         prompt.AppendLine("COMMENT_START");
         prompt.AppendLine("Line: [line number]");
         prompt.AppendLine("Type: [suggestion|issue|nitpick]");
-        prompt.AppendLine("Severity: [low|medium|high]");
+        prompt.AppendLine("Severity: [critical|high|medium|low]");
+        prompt.AppendLine("  critical = definite bug, data loss, or security vulnerability that will cause failures in production");
+        prompt.AppendLine("  high     = likely bug or significant correctness issue worth fixing before merge");
+        prompt.AppendLine("  medium   = code quality, maintainability, or minor correctness concern");
+        prompt.AppendLine("  low      = style, naming, or nitpick");
         prompt.AppendLine("Message: [your comment]");
         prompt.AppendLine("COMMENT_END");
         prompt.AppendLine();

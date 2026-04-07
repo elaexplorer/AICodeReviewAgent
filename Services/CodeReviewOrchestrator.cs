@@ -346,7 +346,7 @@ public class CodeReviewOrchestrator
                 Rules:
                 - "keep": the comment identifies a real issue visible in the diff.
                 - "drop": the comment is wrong, irrelevant, refers to code not actually changed, or is not actionable.
-                - You may lower severity (e.g. high → medium) if the issue exists but is overstated.
+                - You may adjust severity if warranted. Use: critical (definite bug/security issue that will cause production failures), high (likely bug worth fixing before merge), medium (code quality concern), low (style/nitpick).
                 - You may lower confidence if you are uncertain.
                 - Do NOT invent new comments. Only validate the ones provided.
                 - Be conservative: drop only clear false positives, not just issues you disagree with.
@@ -359,7 +359,7 @@ public class CodeReviewOrchestrator
 
                 Return a JSON array — one entry per comment index. Include ALL indices (even for "keep"):
                 [
-                  { "index": 0, "decision": "keep", "severity": "high", "confidence": 0.85 },
+                  { "index": 0, "decision": "keep", "severity": "critical", "confidence": 0.95 },
                   { "index": 1, "decision": "drop", "reason": "The variable is declared on line 5, comment is incorrect" },
                   { "index": 2, "decision": "keep", "severity": "medium", "confidence": 0.72 }
                 ]
