@@ -366,8 +366,8 @@ public class CodeReviewController : ControllerBase
                     reviewOutput.PullRequestId,
                     reviewOutput.Project,
                     reviewOutput.Repository,
-                    gptCommentCount:    reviewOutput.Comments.Count,
-                    claudeCommentCount: claudeComments.Count,
+                    gptComments:        reviewOutput.Comments,
+                    claudeComments:     claudeComments,
                     filteredToPost:     highPriorityComments.Count,
                     postedComments:     postedComments,
                     skippedCount:       skippedCount,
@@ -1242,8 +1242,8 @@ public class CodeReviewController : ControllerBase
         int prId,
         string project,
         string repository,
-        int gptCommentCount,
-        int claudeCommentCount,
+        List<CodeReviewComment> gptComments,
+        List<CodeReviewComment> claudeComments,
         int filteredToPost,
         List<CodeReviewComment> postedComments,
         int skippedCount,
@@ -1261,11 +1261,11 @@ public class CodeReviewController : ControllerBase
         }
 
         var subject = postedComments.Count > 0
-            ? $"AI Code Review — PR #{prId} ({project}/{repository}) — {postedComments.Count} critical comments posted"
-            : $"AI Code Review — PR #{prId} ({project}/{repository}) — no critical issues found";
+            ? $"AI Code Review — PR #{prId} ({project}/{repository}) — {postedComments.Count} comments posted"
+            : $"AI Code Review — PR #{prId} ({project}/{repository}) — no high/critical issues found";
 
         var html = BuildReviewEmailHtml(prLink, prId, project, repository,
-                                        gptCommentCount, claudeCommentCount, filteredToPost,
+                                        gptComments, claudeComments, filteredToPost,
                                         postedComments, skippedCount, jobStartedAt, jobCompletedAt);
         try
         {
@@ -1287,46 +1287,73 @@ public class CodeReviewController : ControllerBase
         int prId,
         string project,
         string repository,
-        int gptCommentCount,
-        int claudeCommentCount,
+        List<CodeReviewComment> gptComments,
+        List<CodeReviewComment> claudeComments,
         int filteredToPost,
         List<CodeReviewComment> postedComments,
         int skippedCount,
         DateTime jobStartedAt,
         DateTime jobCompletedAt)
     {
-        var startedStr   = jobStartedAt.ToString("yyyy-MM-dd HH:mm:ss") + " UTC";
-        var completedStr = jobCompletedAt.ToString("yyyy-MM-dd HH:mm:ss") + " UTC";
-        var durationSec  = (int)(jobCompletedAt - jobStartedAt).TotalSeconds;
-        var durationStr  = durationSec >= 60
-            ? $"{durationSec / 60}m {durationSec % 60}s"
-            : $"{durationSec}s";
-        var dualModel    = claudeCommentCount > 0;
-        var modelTag     = dualModel ? "GPT + Claude (dual-model)" : "GPT only";
-        var notPosted    = filteredToPost - postedComments.Count - skippedCount;
+        var startedStr         = jobStartedAt.ToString("yyyy-MM-dd HH:mm:ss") + " UTC";
+        var completedStr       = jobCompletedAt.ToString("yyyy-MM-dd HH:mm:ss") + " UTC";
+        var durationSec        = (int)(jobCompletedAt - jobStartedAt).TotalSeconds;
+        var durationStr        = durationSec >= 60 ? $"{durationSec / 60}m {durationSec % 60}s" : $"{durationSec}s";
+        var dualModel          = claudeComments.Count > 0;
+        var modelTag           = dualModel ? "GPT + Claude (dual-model)" : "GPT only";
+        var notPosted          = Math.Max(0, filteredToPost - postedComments.Count - skippedCount);
+        var gptHighComments    = gptComments.Where(c => c.Severity?.ToLower() is "critical" or "high").OrderByDescending(c => c.Confidence).ToList();
+        var claudeHighComments = claudeComments.Where(c => c.Severity?.ToLower() is "critical" or "high").OrderByDescending(c => c.Confidence).ToList();
 
-        var commentsHtml = new StringBuilder();
+        // Helper: build a table of comments
+        static string CommentTable(List<CodeReviewComment> items, string accentColor)
+        {
+            if (items.Count == 0)
+                return "<tr><td colspan='4' style='padding:8px;color:#6a737d;font-style:italic'>None</td></tr>";
+            var sb = new StringBuilder();
+            foreach (var c in items)
+            {
+                var sev  = (c.Severity ?? "").ToUpper();
+                var conf = $"{c.Confidence * 100:F0}%";
+                var file = System.Web.HttpUtility.HtmlEncode(
+                    System.IO.Path.GetFileName(c.FilePath ?? ""));
+                var text = System.Web.HttpUtility.HtmlEncode((c.CommentText ?? "").Length > 120
+                    ? (c.CommentText!)[..120] + "…"
+                    : c.CommentText ?? "");
+                sb.Append($"""
+                    <tr style="border-bottom:1px solid #eaecef">
+                      <td style="padding:6px 8px;white-space:nowrap">
+                        <span style="font-size:10px;font-weight:700;color:{accentColor};background:#ffeef0;padding:2px 5px;border-radius:3px">{sev}</span>
+                      </td>
+                      <td style="padding:6px 8px;font-size:11px;color:#586069;white-space:nowrap">{file}:{c.StartLine}</td>
+                      <td style="padding:6px 8px;font-size:12px;color:#24292e">{text}</td>
+                      <td style="padding:6px 8px;font-size:11px;color:#6a737d;white-space:nowrap;text-align:right">{conf}</td>
+                    </tr>
+                    """);
+            }
+            return sb.ToString();
+        }
+
+        // Helper: posted comment cards
+        var postedHtml = new StringBuilder();
         if (postedComments.Count == 0)
         {
-            commentsHtml.Append(
-                "<div style=\"color:#6a737d;padding:12px 0\">No critical comments were posted.</div>");
+            postedHtml.Append("<div style='color:#6a737d;padding:8px 0;font-style:italic'>No comments were posted to the PR.</div>");
         }
         else
         {
             foreach (var c in postedComments)
             {
-                var text       = System.Web.HttpUtility.HtmlEncode(c.CommentText ?? "");
-                var fix        = System.Web.HttpUtility.HtmlEncode(c.SuggestedFix ?? "");
-                var confidence = $"{c.Confidence * 100:F0}%";
-                var fixHtml    = string.IsNullOrWhiteSpace(fix) ? "" :
-                    $"<div style=\"margin-top:6px;font-size:12px;color:#555\"><b>Suggested fix:</b> {fix}</div>";
-
-                commentsHtml.Append($"""
-                    <div style="margin:10px 0;padding:10px 14px;border-left:3px solid #d73a49;background:#ffeef0;border-radius:0 4px 4px 0">
-                      <div style="font-size:11px;font-weight:600;color:#d73a49;text-transform:uppercase;margin-bottom:4px">
-                        CRITICAL &nbsp;·&nbsp; confidence {confidence}
+                var text = System.Web.HttpUtility.HtmlEncode(c.CommentText ?? "");
+                var fix  = System.Web.HttpUtility.HtmlEncode(c.SuggestedFix ?? "");
+                var fixHtml = string.IsNullOrWhiteSpace(fix) ? "" :
+                    $"<div style='margin-top:5px;font-size:12px;color:#555'><b>Fix:</b> {fix}</div>";
+                postedHtml.Append($"""
+                    <div style="margin:8px 0;padding:10px 14px;border-left:3px solid #d73a49;background:#ffeef0;border-radius:0 4px 4px 0">
+                      <div style="font-size:11px;font-weight:700;color:#d73a49;margin-bottom:3px">
+                        {(c.Severity ?? "HIGH").ToUpper()} &nbsp;·&nbsp; {c.Confidence * 100:F0}% confidence
                       </div>
-                      <div style="font-size:12px;color:#586069;margin-bottom:4px">
+                      <div style="font-size:11px;color:#586069;margin-bottom:4px">
                         <code>{System.Web.HttpUtility.HtmlEncode(c.FilePath ?? "")}:{c.StartLine}</code>
                       </div>
                       <div style="font-size:13px;color:#24292e">{text}</div>
@@ -1341,64 +1368,92 @@ public class CodeReviewController : ControllerBase
             <html>
             <head><meta charset="utf-8"><title>AI Code Review — PR #{prId}</title></head>
             <body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f6f8fa;margin:0;padding:24px">
-              <div style="max-width:820px;margin:0 auto;background:#fff;border:1px solid #e1e4e8;border-radius:8px;overflow:hidden">
+              <div style="max-width:860px;margin:0 auto;background:#fff;border:1px solid #e1e4e8;border-radius:8px;overflow:hidden">
 
                 <!-- Header -->
                 <div style="background:#24292e;padding:20px 24px">
                   <h1 style="color:#fff;margin:0;font-size:18px">AI Code Review Report</h1>
-                  <div style="color:#8b949e;font-size:12px;margin-top:4px">
-                    {project}/{repository} &nbsp;·&nbsp; {modelTag}
-                  </div>
+                  <div style="color:#8b949e;font-size:12px;margin-top:4px">{project}/{repository} &nbsp;·&nbsp; {modelTag}</div>
                 </div>
 
                 <!-- Stats row -->
-                <div style="display:flex;gap:0;border-bottom:1px solid #e1e4e8">
-                  <div style="flex:1;padding:16px 20px;border-right:1px solid #e1e4e8;text-align:center">
-                    <div style="font-size:24px;font-weight:700;color:#0366d6">{gptCommentCount}</div>
-                    <div style="font-size:11px;color:#586069;margin-top:2px">GPT comments</div>
+                <div style="display:flex;border-bottom:1px solid #e1e4e8">
+                  <div style="flex:1;padding:14px 16px;border-right:1px solid #e1e4e8;text-align:center">
+                    <div style="font-size:22px;font-weight:700;color:#0366d6">{gptComments.Count}</div>
+                    <div style="font-size:11px;color:#586069;margin-top:2px">GPT total</div>
                   </div>
-                  <div style="flex:1;padding:16px 20px;border-right:1px solid #e1e4e8;text-align:center">
-                    <div style="font-size:24px;font-weight:700;color:#6f42c1">{claudeCommentCount}</div>
-                    <div style="font-size:11px;color:#586069;margin-top:2px">Claude comments</div>
+                  <div style="flex:1;padding:14px 16px;border-right:1px solid #e1e4e8;text-align:center">
+                    <div style="font-size:22px;font-weight:700;color:#6f42c1">{claudeComments.Count}</div>
+                    <div style="font-size:11px;color:#586069;margin-top:2px">Claude total</div>
                   </div>
-                  <div style="flex:1;padding:16px 20px;border-right:1px solid #e1e4e8;text-align:center">
-                    <div style="font-size:24px;font-weight:700;color:#d73a49">{filteredToPost}</div>
-                    <div style="font-size:11px;color:#586069;margin-top:2px">Critical (both models)</div>
+                  <div style="flex:1;padding:14px 16px;border-right:1px solid #e1e4e8;text-align:center">
+                    <div style="font-size:22px;font-weight:700;color:#d73a49">{filteredToPost}</div>
+                    <div style="font-size:11px;color:#586069;margin-top:2px">High/critical (both)</div>
                   </div>
-                  <div style="flex:1;padding:16px 20px;border-right:1px solid #e1e4e8;text-align:center">
-                    <div style="font-size:24px;font-weight:700;color:#28a745">{postedComments.Count}</div>
+                  <div style="flex:1;padding:14px 16px;border-right:1px solid #e1e4e8;text-align:center">
+                    <div style="font-size:22px;font-weight:700;color:#28a745">{postedComments.Count}</div>
                     <div style="font-size:11px;color:#586069;margin-top:2px">Posted</div>
                   </div>
-                  <div style="flex:1;padding:16px 20px;border-right:1px solid #e1e4e8;text-align:center">
-                    <div style="font-size:24px;font-weight:700;color:#6a737d">{skippedCount}</div>
-                    <div style="font-size:11px;color:#586069;margin-top:2px">Duplicates skipped</div>
+                  <div style="flex:1;padding:14px 16px;border-right:1px solid #e1e4e8;text-align:center">
+                    <div style="font-size:22px;font-weight:700;color:#6a737d">{skippedCount}</div>
+                    <div style="font-size:11px;color:#586069;margin-top:2px">Skipped (dup)</div>
                   </div>
-                  <div style="flex:1;padding:16px 20px;text-align:center">
-                    <div style="font-size:24px;font-weight:700;color:#e36209">{(notPosted > 0 ? notPosted : 0)}</div>
+                  <div style="flex:1;padding:14px 16px;text-align:center">
+                    <div style="font-size:22px;font-weight:700;color:#e36209">{notPosted}</div>
                     <div style="font-size:11px;color:#586069;margin-top:2px">Post failures</div>
                   </div>
                 </div>
 
-                <!-- Timing -->
-                <div style="padding:12px 24px;background:#f6f8fa;border-bottom:1px solid #e1e4e8;font-size:12px;color:#586069">
-                  <b>Started:</b> {startedStr} &nbsp;·&nbsp;
-                  <b>Completed:</b> {completedStr} &nbsp;·&nbsp;
-                  <b>Duration:</b> {durationStr}
+                <!-- Timing + PR link -->
+                <div style="padding:10px 24px;background:#f6f8fa;border-bottom:1px solid #e1e4e8;font-size:12px;color:#586069">
+                  <b>Started:</b> {startedStr} &nbsp;·&nbsp; <b>Completed:</b> {completedStr} &nbsp;·&nbsp; <b>Duration:</b> {durationStr}
+                </div>
+                <div style="padding:12px 24px;border-bottom:1px solid #e1e4e8">
+                  <a href="{prLink}" style="font-weight:600;color:#0366d6;text-decoration:none;font-size:14px">PR #{prId}: {project}/{repository}</a>
                 </div>
 
-                <!-- PR link -->
+                <!-- GPT high/critical table -->
                 <div style="padding:16px 24px;border-bottom:1px solid #e1e4e8">
-                  <a href="{prLink}" style="font-weight:600;color:#0366d6;text-decoration:none;font-size:14px">
-                    PR #{prId}: {project}/{repository}
-                  </a>
+                  <div style="font-size:13px;font-weight:600;color:#0366d6;margin-bottom:8px">
+                    GPT — High/Critical Comments ({gptHighComments.Count})
+                  </div>
+                  <table style="width:100%;border-collapse:collapse;font-size:12px">
+                    <thead>
+                      <tr style="background:#f6f8fa;border-bottom:2px solid #e1e4e8">
+                        <th style="padding:6px 8px;text-align:left;color:#586069;font-weight:600">Sev</th>
+                        <th style="padding:6px 8px;text-align:left;color:#586069;font-weight:600">File:Line</th>
+                        <th style="padding:6px 8px;text-align:left;color:#586069;font-weight:600">Comment</th>
+                        <th style="padding:6px 8px;text-align:right;color:#586069;font-weight:600">Conf</th>
+                      </tr>
+                    </thead>
+                    <tbody>{CommentTable(gptHighComments, "#d73a49")}</tbody>
+                  </table>
                 </div>
 
-                <!-- Posted comments -->
-                <div style="padding:16px 24px">
-                  <div style="font-size:13px;font-weight:600;color:#24292e;margin-bottom:10px">
-                    Posted Comments ({postedComments.Count})
+                <!-- Claude high/critical table -->
+                <div style="padding:16px 24px;border-bottom:1px solid #e1e4e8">
+                  <div style="font-size:13px;font-weight:600;color:#6f42c1;margin-bottom:8px">
+                    Claude — High/Critical Comments ({claudeHighComments.Count})
                   </div>
-                  {commentsHtml}
+                  <table style="width:100%;border-collapse:collapse;font-size:12px">
+                    <thead>
+                      <tr style="background:#f6f8fa;border-bottom:2px solid #e1e4e8">
+                        <th style="padding:6px 8px;text-align:left;color:#586069;font-weight:600">Sev</th>
+                        <th style="padding:6px 8px;text-align:left;color:#586069;font-weight:600">File:Line</th>
+                        <th style="padding:6px 8px;text-align:left;color:#586069;font-weight:600">Comment</th>
+                        <th style="padding:6px 8px;text-align:right;color:#586069;font-weight:600">Conf</th>
+                      </tr>
+                    </thead>
+                    <tbody>{CommentTable(claudeHighComments, "#6f42c1")}</tbody>
+                  </table>
+                </div>
+
+                <!-- Posted to PR -->
+                <div style="padding:16px 24px">
+                  <div style="font-size:13px;font-weight:600;color:#24292e;margin-bottom:8px">
+                    Posted to PR ({postedComments.Count})
+                  </div>
+                  {postedHtml}
                 </div>
 
                 <!-- Footer -->
