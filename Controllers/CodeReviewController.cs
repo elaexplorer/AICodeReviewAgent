@@ -1219,12 +1219,11 @@ public class CodeReviewController : ControllerBase
     /// Sends a review summary email via Microsoft Graph API (avoids SMTP AUTH, which is
     /// disabled in most Microsoft 365 tenants).
     ///
+    /// Sends a review summary email via Azure Logic App HTTP trigger.
+    ///
     /// Required env vars:
-    ///   REPORT_EMAIL_TO          — recipient(s), comma-separated
-    ///   REPORT_GRAPH_TENANT_ID   — Azure AD tenant ID
-    ///   REPORT_GRAPH_CLIENT_ID   — App registration client ID (needs Mail.Send permission)
-    ///   REPORT_GRAPH_CLIENT_SECRET — App registration client secret
-    ///   REPORT_GRAPH_SENDER_UPN  — UPN of the mailbox to send from (e.g. elavarasid@microsoft.com)
+    ///   REPORT_EMAIL_TO           — recipient(s), comma-separated
+    ///   REPORT_LOGIC_APP_URL      — Logic App HTTP trigger URL (includes SAS signature)
     /// </summary>
     private static async Task SendReviewEmailAsync(
         string prLink,
@@ -1240,19 +1239,12 @@ public class CodeReviewController : ControllerBase
         DateTime jobCompletedAt,
         ILogger logger)
     {
-        var emailTo    = Environment.GetEnvironmentVariable("REPORT_EMAIL_TO")            ?? "";
-        var tenantId   = Environment.GetEnvironmentVariable("REPORT_GRAPH_TENANT_ID")     ?? "";
-        var clientId   = Environment.GetEnvironmentVariable("REPORT_GRAPH_CLIENT_ID")     ?? "";
-        var clientSec  = Environment.GetEnvironmentVariable("REPORT_GRAPH_CLIENT_SECRET") ?? "";
-        var senderUpn  = Environment.GetEnvironmentVariable("REPORT_GRAPH_SENDER_UPN")    ?? "";
+        var emailTo      = Environment.GetEnvironmentVariable("REPORT_EMAIL_TO")       ?? "";
+        var logicAppUrl  = Environment.GetEnvironmentVariable("REPORT_LOGIC_APP_URL")  ?? "";
 
-        if (string.IsNullOrWhiteSpace(emailTo) ||
-            string.IsNullOrWhiteSpace(tenantId) ||
-            string.IsNullOrWhiteSpace(clientId) ||
-            string.IsNullOrWhiteSpace(clientSec) ||
-            string.IsNullOrWhiteSpace(senderUpn))
+        if (string.IsNullOrWhiteSpace(emailTo) || string.IsNullOrWhiteSpace(logicAppUrl))
         {
-            logger.LogInformation("Email skipped — Graph API env vars not fully configured");
+            logger.LogInformation("Email skipped — REPORT_EMAIL_TO or REPORT_LOGIC_APP_URL not configured");
             return;
         }
 
@@ -1265,51 +1257,12 @@ public class CodeReviewController : ControllerBase
                                         postedComments, skippedCount, jobStartedAt, jobCompletedAt);
         try
         {
-            // Acquire OAuth2 token via client credentials
-            using var http = new HttpClient();
-            var tokenResp = await http.PostAsync(
-                $"https://login.microsoftonline.com/{tenantId}/oauth2/v2.0/token",
-                new FormUrlEncodedContent(new Dictionary<string, string>
-                {
-                    ["grant_type"]    = "client_credentials",
-                    ["client_id"]     = clientId,
-                    ["client_secret"] = clientSec,
-                    ["scope"]         = "https://graph.microsoft.com/.default",
-                }));
-            tokenResp.EnsureSuccessStatusCode();
-            var tokenDoc   = JsonDocument.Parse(await tokenResp.Content.ReadAsStringAsync());
-            var accessToken = tokenDoc.RootElement.GetProperty("access_token").GetString()!;
-
-            // Build Graph sendMail payload
-            var recipients = emailTo
-                .Split(',', StringSplitOptions.RemoveEmptyEntries)
-                .Select(e => new { emailAddress = new { address = e.Trim() } })
-                .ToArray();
-
-            var message = new
-            {
-                message = new
-                {
-                    subject,
-                    body = new { contentType = "HTML", content = html },
-                    toRecipients = recipients,
-                },
-                saveToSentItems = false,
-            };
-
-            var graphReq = new HttpRequestMessage(
-                HttpMethod.Post,
-                $"https://graph.microsoft.com/v1.0/users/{Uri.EscapeDataString(senderUpn)}/sendMail")
-            {
-                Content = new StringContent(
-                    JsonSerializer.Serialize(message), Encoding.UTF8, "application/json")
-            };
-            graphReq.Headers.Authorization =
-                new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", accessToken);
-
-            var sendResp = await http.SendAsync(graphReq);
-            sendResp.EnsureSuccessStatusCode();
-            logger.LogInformation("Review email sent (Graph) to {Recipients} for PR #{PrId}", emailTo, prId);
+            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
+            var payload = JsonSerializer.Serialize(new { to = emailTo, subject, body = html });
+            var resp = await http.PostAsync(logicAppUrl,
+                new StringContent(payload, Encoding.UTF8, "application/json"));
+            resp.EnsureSuccessStatusCode();
+            logger.LogInformation("Review email sent (Logic App) to {Recipients} for PR #{PrId}", emailTo, prId);
         }
         catch (Exception ex)
         {
