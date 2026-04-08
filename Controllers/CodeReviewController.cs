@@ -572,6 +572,29 @@ public class CodeReviewController : ControllerBase
         });
     }
 
+    /// <summary>
+    /// DELETE /api/codereview/pr-comments/{project}/{repository}/{pullRequestId}
+    /// Removes all comments posted by this agent on the given PR (identified by the 🤖 footer marker).
+    /// Useful during testing to clean up before re-running a review.
+    /// </summary>
+    [HttpDelete("pr-comments/{project}/{repository}/{pullRequestId}")]
+    public async Task<IActionResult> DeletePrComments(string project, string repository, int pullRequestId)
+    {
+        try
+        {
+            var deleted = await _adoClient.DeleteAgentCommentsAsync(project, repository, pullRequestId);
+            _logger.LogInformation(
+                "Deleted {Count} agent comment thread(s) from PR {PullRequestId} in {Project}/{Repository}",
+                deleted, pullRequestId, project, repository);
+            return Ok(new { deleted, project, repository, pullRequestId });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to delete agent comments from PR {PullRequestId}", pullRequestId);
+            return StatusCode(500, new { error = ex.Message });
+        }
+    }
+
     [HttpGet("current")]
     public IActionResult GetCurrentReview()
     {
