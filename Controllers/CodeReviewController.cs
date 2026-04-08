@@ -30,7 +30,7 @@ public class CodeReviewController : ControllerBase
     private static readonly HashSet<string> _indexingInProgress = new();
     private static readonly object _indexingLock = new();
     private static readonly ConcurrentDictionary<string, ReviewByLinkAndPostJobStatus> _reviewByLinkAndPostJobs = new();
-    private static readonly TimeSpan ReviewByLinkAndPostSyncWait = TimeSpan.FromSeconds(220);
+    private static readonly TimeSpan ReviewByLinkAndPostSyncWait = TimeSpan.FromSeconds(400);
     private static readonly HttpClient _localClaudeHttpClient = new() { Timeout = TimeSpan.FromMinutes(5) };
 
     public CodeReviewController(
@@ -242,9 +242,10 @@ public class CodeReviewController : ControllerBase
             try
             {
                 _logger.LogInformation(
-                    "Starting review-by-link-and-post job {JobId} for PR {PullRequestId} in {Project}/{Repository} (local Claude: {LocalClaude})",
+                    "Starting review-by-link-and-post job {JobId} for PR {PullRequestId} in {Project}/{Repository} (local Claude: {LocalClaude}, dryRun: {DryRun})",
                     jobId, parsed.PullRequestId, parsed.Project, parsed.Repository,
-                    string.IsNullOrWhiteSpace(localClaudeUrl) ? "disabled" : localClaudeUrl);
+                    string.IsNullOrWhiteSpace(localClaudeUrl) ? "disabled" : localClaudeUrl,
+                    request.DryRun);
 
                 // Run GPT-4 and local Claude in parallel
                 var gptTask    = RunReviewByLinkCoreAsync(request.PullRequestLink, parsed, adoAccessTokenOverride);
@@ -288,94 +289,106 @@ public class CodeReviewController : ControllerBase
                 var skippedCount = 0;
                 var postedComments  = new List<CodeReviewComment>();
                 var postingFailures = new List<ReviewPostingFailure>();
-                foreach (var comment in highPriorityComments)
+
+                var isAbandoned = string.Equals(reviewOutput.Status, "abandoned", StringComparison.OrdinalIgnoreCase);
+                var skipPosting = request.DryRun || reviewOutput.IsDraft || isAbandoned;
+                var skipReason  = reviewOutput.IsDraft ? "DRAFT PR"
+                                : isAbandoned          ? "ABANDONED PR"
+                                :                        "DRY RUN";
+
+                if (skipPosting)
                 {
-                    var commentToPost = CloneComment(comment);
-                    var remappedLine = RemapToNearestValidRightSideLine(commentToPost, validRightSideLinesByFile);
-                    if (remappedLine.HasValue)
-                    {
+                    _logger.LogInformation(
+                        "{Reason} — skipping all ADO posts. GPT-4: {GptTotal} comments ({GptHigh} high/critical), Claude: {ClaudeTotal} comments ({ClaudeHigh} high/critical), deduped high-priority to post: {Total}",
+                        skipReason,
+                        reviewOutput.Comments.Count, reviewOutput.Comments.Count(IsHighPriorityComment),
+                        claudeComments.Count, claudeComments.Count(IsHighPriorityComment),
+                        highPriorityComments.Count);
+
+                    foreach (var c in highPriorityComments)
                         _logger.LogInformation(
-                            "Adjusted comment line anchor for PR {PullRequestId} at {FilePath} from {OriginalLine} to {MappedLine}",
-                            reviewOutput.PullRequestId,
-                            commentToPost.FilePath,
-                            comment.StartLine,
-                            remappedLine.Value);
-                    }
-
-                    var fingerprint = AzureDevOpsRestClient.BuildCommentFingerprint(commentToPost);
-                    var positionKey = AzureDevOpsRestClient.BuildCommentPositionKey(commentToPost);
-                    if (existingFingerprints.Contains(fingerprint) || existingPositionKeys.Contains(positionKey))
+                            "{Reason} would-post [{Severity}] {FilePath}:{Line} — {Text}",
+                            skipReason, c.Severity, c.FilePath, c.StartLine, c.CommentText[..Math.Min(120, c.CommentText.Length)]);
+                }
+                else if (!skipPosting)
+                {
+                    foreach (var comment in highPriorityComments)
                     {
-                        skippedCount++;
-                        comment.Posted = true;
-                        comment.StartLine = commentToPost.StartLine;
-                        comment.EndLine = commentToPost.EndLine;
-                        _logger.LogInformation(
-                            "Skipping duplicate high-priority comment for PR {PullRequestId} at {FilePath}:{StartLine}",
-                            reviewOutput.PullRequestId,
-                            commentToPost.FilePath,
-                            commentToPost.StartLine);
-                        continue;
-                    }
-
-                    var postResult = await _adoClient.PostCommentWithResultAsync(
-                        reviewOutput.Project,
-                        reviewOutput.Repository,
-                        reviewOutput.PullRequestId,
-                        commentToPost,
-                        adoAccessTokenOverride);
-
-                    if (postResult.Success)
-                    {
-                        comment.Posted    = true;
-                        comment.ThreadId  = postResult.ThreadId;
-                        comment.StartLine = commentToPost.StartLine;
-                        comment.EndLine   = commentToPost.EndLine;
-                        commentToPost.ThreadId = postResult.ThreadId;
-                        postedCount++;
-                        postedComments.Add(commentToPost);
-                        existingFingerprints.Add(fingerprint);
-                        existingPositionKeys.Add(positionKey);
-                    }
-                    else
-                    {
-                        postingFailures.Add(new ReviewPostingFailure
+                        var commentToPost = CloneComment(comment);
+                        var remappedLine = RemapToNearestValidRightSideLine(commentToPost, validRightSideLinesByFile);
+                        if (remappedLine.HasValue)
                         {
-                            CommentId = comment.Id,
-                            FilePath = commentToPost.FilePath,
-                            StartLine = commentToPost.StartLine,
-                            EndLine = commentToPost.EndLine,
-                            Severity = comment.Severity,
-                            Stage = postResult.Stage,
-                            StatusCode = postResult.StatusCode,
-                            ErrorMessage = postResult.ErrorMessage
-                        });
+                            _logger.LogInformation(
+                                "Adjusted comment line anchor for PR {PullRequestId} at {FilePath} from {OriginalLine} to {MappedLine}",
+                                reviewOutput.PullRequestId,
+                                commentToPost.FilePath,
+                                comment.StartLine,
+                                remappedLine.Value);
+                        }
 
-                        _logger.LogWarning(
-                            "Failed to post high-priority comment for PR {PullRequestId} at {FilePath}:{StartLine}. Stage={Stage}, StatusCode={StatusCode}, Error={Error}",
+                        var fingerprint = AzureDevOpsRestClient.BuildCommentFingerprint(commentToPost);
+                        var positionKey = AzureDevOpsRestClient.BuildCommentPositionKey(commentToPost);
+                        if (existingFingerprints.Contains(fingerprint) || existingPositionKeys.Contains(positionKey))
+                        {
+                            skippedCount++;
+                            comment.Posted = true;
+                            comment.StartLine = commentToPost.StartLine;
+                            comment.EndLine = commentToPost.EndLine;
+                            _logger.LogInformation(
+                                "Skipping duplicate high-priority comment for PR {PullRequestId} at {FilePath}:{StartLine}",
+                                reviewOutput.PullRequestId,
+                                commentToPost.FilePath,
+                                commentToPost.StartLine);
+                            continue;
+                        }
+
+                        var postResult = await _adoClient.PostCommentWithResultAsync(
+                            reviewOutput.Project,
+                            reviewOutput.Repository,
                             reviewOutput.PullRequestId,
-                            commentToPost.FilePath,
-                            commentToPost.StartLine,
-                            postResult.Stage,
-                            postResult.StatusCode,
-                            postResult.ErrorMessage);
+                            commentToPost,
+                            adoAccessTokenOverride);
+
+                        if (postResult.Success)
+                        {
+                            comment.Posted    = true;
+                            comment.ThreadId  = postResult.ThreadId;
+                            comment.StartLine = commentToPost.StartLine;
+                            comment.EndLine   = commentToPost.EndLine;
+                            commentToPost.ThreadId = postResult.ThreadId;
+                            postedCount++;
+                            postedComments.Add(commentToPost);
+                            existingFingerprints.Add(fingerprint);
+                            existingPositionKeys.Add(positionKey);
+                        }
+                        else
+                        {
+                            postingFailures.Add(new ReviewPostingFailure
+                            {
+                                CommentId = comment.Id,
+                                FilePath = commentToPost.FilePath,
+                                StartLine = commentToPost.StartLine,
+                                EndLine = commentToPost.EndLine,
+                                Severity = comment.Severity,
+                                Stage = postResult.Stage,
+                                StatusCode = postResult.StatusCode,
+                                ErrorMessage = postResult.ErrorMessage
+                            });
+
+                            _logger.LogWarning(
+                                "Failed to post high-priority comment for PR {PullRequestId} at {FilePath}:{StartLine}. Stage={Stage}, StatusCode={StatusCode}, Error={Error}",
+                                reviewOutput.PullRequestId,
+                                commentToPost.FilePath,
+                                commentToPost.StartLine,
+                                postResult.Stage,
+                                postResult.StatusCode,
+                                postResult.ErrorMessage);
+                        }
                     }
+
                 }
 
                 var dualModel = claudeComments.Count > 0;
-
-                // Post a PR-level summary comment so the review is always visible on the PR
-                _ = _adoClient.PostPrSummaryCommentAsync(
-                    reviewOutput.Project,
-                    reviewOutput.Repository,
-                    reviewOutput.PullRequestId,
-                    BuildPrSummaryComment(
-                        gptComments:     reviewOutput.Comments,
-                        claudeComments:  claudeComments,
-                        postedComments:  postedComments,
-                        skippedCount:    skippedCount,
-                        failures:        postingFailures),
-                    adoAccessTokenOverride);
 
                 // Persist job record and posted thread IDs to SQLite for daily reporting
                 var jobRecord = new ReviewJobRecord
@@ -436,14 +449,17 @@ public class CodeReviewController : ControllerBase
                     Project = reviewOutput.Project,
                     Repository = reviewOutput.Repository,
                     PullRequestId = reviewOutput.PullRequestId,
+                    IsDraft = reviewOutput.IsDraft,
                     Status = "completed",
                     StartedAtUtc = _reviewByLinkAndPostJobs[jobId].StartedAtUtc,
                     CompletedAtUtc = DateTime.UtcNow,
                     TotalComments = reviewOutput.Comments.Count,
+                    ClaudeTotalComments = claudeComments.Count,
                     HighPriorityComments = highPriorityComments.Count,
                     PostedHighPriorityComments = postedCount,
                     SkippedHighPriorityComments = skippedCount,
                     Comments = reviewOutput.Comments,
+                    ClaudeComments = claudeComments,
                     PostingFailures = postingFailures
                 };
             }
@@ -480,7 +496,18 @@ public class CodeReviewController : ControllerBase
                 project = finalState.Project,
                 repository = finalState.Repository,
                 pullRequestId = finalState.PullRequestId,
-                comments = finalState.Comments,
+                gpt4 = new
+                {
+                    total = finalState.TotalComments,
+                    highCritical = finalState.Comments.Count(IsHighPriorityComment),
+                    comments = finalState.Comments
+                },
+                claude = new
+                {
+                    total = finalState.ClaudeTotalComments,
+                    highCritical = finalState.ClaudeComments.Count(IsHighPriorityComment),
+                    comments = finalState.ClaudeComments
+                },
                 posting = new
                 {
                     highPriorityComments = finalState.HighPriorityComments,
@@ -502,6 +529,46 @@ public class CodeReviewController : ControllerBase
             repository = parsed.Repository,
             pullRequestId = parsed.PullRequestId,
             pullRequestLink = request.PullRequestLink
+        });
+    }
+
+    [HttpGet("review-by-link-and-post/jobs/{jobId}")]
+    public IActionResult GetReviewJob(string jobId)
+    {
+        if (!_reviewByLinkAndPostJobs.TryGetValue(jobId, out var job))
+            return NotFound(new { error = "Job not found", jobId });
+
+        return Ok(new
+        {
+            jobId = job.JobId,
+            status = job.Status,
+            isDraft = job.IsDraft,
+            pullRequestLink = job.PullRequestLink,
+            project = job.Project,
+            repository = job.Repository,
+            pullRequestId = job.PullRequestId,
+            startedAtUtc = job.StartedAtUtc,
+            completedAtUtc = job.CompletedAtUtc,
+            gpt4 = new
+            {
+                total = job.TotalComments,
+                highCritical = job.Comments.Count(IsHighPriorityComment),
+                comments = job.Comments
+            },
+            claude = new
+            {
+                total = job.ClaudeTotalComments,
+                highCritical = job.ClaudeComments.Count(IsHighPriorityComment),
+                comments = job.ClaudeComments
+            },
+            posting = new
+            {
+                highPriorityComments = job.HighPriorityComments,
+                postedHighPriorityComments = job.PostedHighPriorityComments,
+                skippedHighPriorityComments = job.SkippedHighPriorityComments,
+                failures = job.PostingFailures
+            },
+            error = job.Error
         });
     }
 
@@ -1276,6 +1343,8 @@ public class CodeReviewController : ControllerBase
             Project = parsed.Project,
             Repository = parsed.Repository,
             PullRequestId = parsed.PullRequestId,
+            IsDraft = pullRequest.IsDraft,
+            Status = pullRequest.Status,
             Files = files,
             Comments = comments
         };
@@ -1935,68 +2004,6 @@ public class CodeReviewController : ControllerBase
         return Ok(new { sent = true, prCount = rows.Count, date = reportDate.ToString("yyyy-MM-dd") });
     }
 
-    private static string BuildPrSummaryComment(
-        List<CodeReviewComment> gptComments,
-        List<CodeReviewComment> claudeComments,
-        List<CodeReviewComment> postedComments,
-        int skippedCount,
-        List<ReviewPostingFailure> failures)
-    {
-        var gptHigh     = gptComments.Count(IsHighPriorityComment);
-        var claudeHigh  = claudeComments.Count(IsHighPriorityComment);
-        var totalPosted = postedComments.Count;
-        var dualModel   = claudeComments.Count > 0;
-        var modelTag    = dualModel ? "GPT-4 + Claude (dual-model)" : "GPT-4";
-
-        var sb = new StringBuilder();
-        sb.AppendLine("### 🤖 AI Code Review Complete");
-        sb.AppendLine();
-        sb.AppendLine($"**Model:** {modelTag}");
-        sb.AppendLine();
-        sb.AppendLine("| | Total comments | High / Critical |");
-        sb.AppendLine("|---|---|---|");
-        sb.AppendLine($"| GPT-4 | {gptComments.Count} | {gptHigh} |");
-        if (dualModel)
-            sb.AppendLine($"| Claude | {claudeComments.Count} | {claudeHigh} |");
-        sb.AppendLine();
-
-        if (totalPosted > 0)
-        {
-            sb.AppendLine($"**Posted {totalPosted} high/critical comment{(totalPosted == 1 ? "" : "s")}** to this PR.");
-            if (skippedCount > 0)
-                sb.AppendLine($"_{skippedCount} duplicate{(skippedCount == 1 ? "" : "s")} skipped (already on PR)._");
-            sb.AppendLine();
-            sb.AppendLine("**Posted comments:**");
-            foreach (var c in postedComments)
-            {
-                var sev  = c.Severity?.ToLower() is "high" or "critical" ? "🔴 CRITICAL" : $"🟡 {c.Severity?.ToUpper()}";
-                var line = c.StartLine > 0 ? $":{c.StartLine}" : "";
-                var text = c.CommentText.Split('\n')[0];
-                if (text.Length > 120) text = text[..120] + "…";
-                sb.AppendLine($"- {sev} — `{c.FilePath}{line}` — {text}");
-            }
-        }
-        else if (skippedCount > 0)
-        {
-            sb.AppendLine($"**No new comments posted** — {skippedCount} high/critical issue{(skippedCount == 1 ? "" : "s")} were already on this PR.");
-        }
-        else
-        {
-            sb.AppendLine("**No high/critical issues found.** The code looks good.");
-        }
-
-        if (failures.Count > 0)
-        {
-            sb.AppendLine();
-            sb.AppendLine($"_{failures.Count} comment{(failures.Count == 1 ? "" : "s")} could not be posted (line anchor mismatch or API error)._");
-        }
-
-        sb.AppendLine();
-        sb.AppendLine("---");
-        sb.AppendLine("🤖 *Generated by [CodeReviewAIAgent](https://github.com/elaexplorer/AICodeReviewAgent)*");
-        return sb.ToString();
-    }
-
     private static string BuildDailyReportEmailHtml(List<DailyReportRow> rows, DateTimeOffset reportDate)
     {
         var totalPosted   = rows.Sum(r => r.PostedCount);
@@ -2113,6 +2120,11 @@ public class ReviewRequest
 public class ReviewByLinkRequest
 {
     public string PullRequestLink { get; set; } = string.Empty;
+    /// <summary>
+    /// When true, run both models but skip posting comments to ADO.
+    /// The response still contains all comments from both GPT-4 and Claude.
+    /// </summary>
+    public bool DryRun { get; set; } = false;
 }
 
 public class PostCommentRequest
@@ -2198,6 +2210,8 @@ public class ReviewByLinkExecutionResult
     public string Project { get; set; } = string.Empty;
     public string Repository { get; set; } = string.Empty;
     public int PullRequestId { get; set; }
+    public bool IsDraft { get; set; } = false;
+    public string Status { get; set; } = string.Empty;
     public List<PullRequestFile> Files { get; set; } = new();
     public List<CodeReviewComment> Comments { get; set; } = new();
 }
@@ -2209,15 +2223,18 @@ public class ReviewByLinkAndPostJobStatus
     public string Project { get; set; } = string.Empty;
     public string Repository { get; set; } = string.Empty;
     public int PullRequestId { get; set; }
+    public bool IsDraft { get; set; } = false;
     public string Status { get; set; } = string.Empty;
     public string? Error { get; set; }
     public DateTime StartedAtUtc { get; set; }
     public DateTime? CompletedAtUtc { get; set; }
     public int TotalComments { get; set; }
+    public int ClaudeTotalComments { get; set; }
     public int HighPriorityComments { get; set; }
     public int PostedHighPriorityComments { get; set; }
     public int SkippedHighPriorityComments { get; set; }
     public List<CodeReviewComment> Comments { get; set; } = new();
+    public List<CodeReviewComment> ClaudeComments { get; set; } = new();
     public List<ReviewPostingFailure> PostingFailures { get; set; } = new();
 }
 

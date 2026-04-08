@@ -151,7 +151,8 @@ public class AzureDevOpsRestClient
                     : DateTime.Now,
                 Status = prData.TryGetProperty("status", out var statusProp)
                     ? (statusProp.ValueKind == JsonValueKind.Number ? statusProp.GetInt32().ToString() : statusProp.GetString() ?? "unknown")
-                    : "unknown"
+                    : "unknown",
+                IsDraft = prData.TryGetProperty("isDraft", out var draftProp) && draftProp.GetBoolean()
             };
 
             _logger.LogInformation("Found PR {PullRequestId}: {Title}", pullRequest.Id, pullRequest.Title);

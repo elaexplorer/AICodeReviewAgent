@@ -98,6 +98,109 @@ def get_pr_metadata(pat: str, pr_id: int) -> dict:
     return r.json()
 
 
+def get_pr_changed_files(pat: str, pr_id: int) -> list[dict]:
+    """Return list of changed files with their paths and change types."""
+    url = (f"https://dev.azure.com/{ADO_ORGANIZATION}/{ADO_PROJECT}/_apis/"
+           f"git/repositories/{ADO_REPOSITORY}/pullRequests/{pr_id}/iterations?api-version=7.0")
+    r = _requests.get(url, headers=ado_headers(pat), timeout=30)
+    r.raise_for_status()
+    iterations = r.json().get("value", [])
+    if not iterations:
+        return []
+    latest_iter = iterations[-1]["id"]
+
+    url2 = (f"https://dev.azure.com/{ADO_ORGANIZATION}/{ADO_PROJECT}/_apis/"
+            f"git/repositories/{ADO_REPOSITORY}/pullRequests/{pr_id}"
+            f"/iterations/{latest_iter}/changes?api-version=7.0")
+    r2 = _requests.get(url2, headers=ado_headers(pat), timeout=30)
+    r2.raise_for_status()
+    changes = r2.json().get("changeEntries", [])
+    return [
+        {
+            "path":       c["item"]["path"],
+            "changeType": c.get("changeType", "edit"),
+        }
+        for c in changes
+        if "path" in c.get("item", {})
+    ]
+
+
+def get_file_content_at_commit(pat: str, path: str, commit_id: str) -> str:
+    """Fetch raw file content at a specific commit. Returns empty string on error."""
+    url = (f"https://dev.azure.com/{ADO_ORGANIZATION}/{ADO_PROJECT}/_apis/"
+           f"git/repositories/{ADO_REPOSITORY}/items"
+           f"?path={path}&versionDescriptor.version={commit_id}&versionDescriptor.versionType=commit"
+           f"&$format=text&api-version=7.0")
+    try:
+        r = _requests.get(url, headers=ado_headers(pat), timeout=20)
+        if r.status_code == 200:
+            return r.text
+    except Exception:
+        pass
+    return ""
+
+
+def build_pr_context(pat: str, pr: dict, changed_files: list[dict], max_files: int = 30) -> str:
+    """
+    Build a text block with PR metadata and the content of each changed file
+    at the source commit. Files are included in full up to MAX_FILE_BYTES;
+    total content is capped at MAX_TOTAL_BYTES so the prompt stays tractable.
+    Skipped/deleted files are listed but content is not fetched.
+    """
+    source_commit = pr.get("lastMergeSourceCommit", {}).get("commitId", "")
+    title         = pr.get("title", "")
+    description   = (pr.get("description") or "")[:800]
+
+    lines = [
+        f"## Pull Request: {title}",
+        f"Description: {description}",
+        f"Changed files ({len(changed_files)} total):",
+    ]
+    for f in changed_files:
+        lines.append(f"  [{f['changeType']}] {f['path']}")
+    lines.append("")
+
+    MAX_FILE_BYTES  = 6_000   # ~1500 tokens per file
+    MAX_TOTAL_BYTES = 40_000  # ~10K tokens total — keeps Claude well within timeout
+
+    shown = 0
+    total_bytes = len("\n".join(lines))
+
+    # Only include real source code files, skip lock/yaml/config/docs
+    code_exts = {".rs", ".cs", ".py", ".go", ".ts", ".js", ".cpp", ".c", ".h", ".md"}
+    skip_names = {"Cargo.lock", "package-lock.json", "yarn.lock"}
+
+    eligible = [
+        f for f in changed_files
+        if f.get("path")
+        and f["changeType"] != "delete"
+        and any(f["path"].endswith(e) for e in code_exts)
+        and not any(f["path"].endswith(s) for s in skip_names)
+    ]
+
+    # Added files first (new code most likely to have bugs), then edits
+    sorted_files = sorted(eligible, key=lambda f: (0 if f["changeType"] == "add" else 1, f["path"]))
+
+    for f in sorted_files[:max_files]:
+        path   = f["path"]
+        change = f["changeType"]
+
+        content = get_file_content_at_commit(pat, path, source_commit) if source_commit else ""
+        if not content:
+            continue
+
+        content = content[:MAX_FILE_BYTES]
+        block = f"\n### {path} [{change}]\n```\n{content}\n```\n"
+        total_bytes += len(block)
+        if total_bytes > MAX_TOTAL_BYTES:
+            lines.append(f"\n[... content truncated at {shown} files, {total_bytes // 1024} KB total ...]")
+            break
+        lines.append(block)
+        shown += 1
+
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Repo clone / update
 # ---------------------------------------------------------------------------
@@ -157,64 +260,97 @@ def checkout_pr_branch(repo_dir: Path, pr: dict):
 
 
 # ---------------------------------------------------------------------------
-# Claude skill invocation
+# Claude review invocation
 # ---------------------------------------------------------------------------
 
-# Instruct the skill to run its full multi-agent pipeline but return JSON
-# instead of posting to ADO/GitHub.
-SKILL_PROMPT = textwrap.dedent("""
-    Run the code-review:code-review skill for this pull request:
-    {pr_link}
+# Prompt template — PR diff context is injected by Python before calling Claude.
+# No MCP needed: diffs are fetched by the server and passed directly.
+REVIEW_PROMPT = textwrap.dedent("""
+    You are a senior code reviewer. Review the following pull request diff and return a JSON array of issues.
 
-    IMPORTANT: Do NOT post any comments to ADO or GitHub.
-    Instead, after completing the full review (all 5 parallel agents,
-    confidence scoring, and filtering), return ONLY a raw JSON array of
-    issues with confidence >= 80. No prose, no markdown fences — raw JSON only.
+    {pr_context}
 
+    Focus on:
+    - Runtime panics, crashes, or process-terminating assertions on reachable paths
+    - Data races, concurrency bugs
+    - Security vulnerabilities (injection, auth bypass, credential exposure)
+    - Breaking API / ABI changes visible to external callers
+    - Correctness bugs: wrong logic, missing error handling on failure paths
+    - Incomplete migrations where one file was changed but a dependent file was not
+
+    Scoring rules:
+    - Only include issues with confidence >= 0.85
+    - "critical": will cause a production outage or security breach
+    - "high": likely causes incorrect behaviour or crashes under realistic conditions
+    - "medium": meaningful code quality issue but not immediately dangerous
+    - "low": minor style or nitpick
+
+    Return ONLY a raw JSON array — no prose, no markdown fences, nothing else.
     Each element must have exactly these fields:
     {{
       "filePath":    "/path/to/file",
       "startLine":   42,
       "endLine":     42,
-      "severity":    "critical" | "medium" | "low",
-      "commentType": "issue" | "suggestion" | "nitpick",
-      "commentText": "Clear description of the issue",
-      "suggestedFix": "Optional concrete fix",
+      "severity":    "critical" | "high" | "medium" | "low",
+      "commentType": "issue" | "suggestion",
+      "commentText": "Clear, specific description referencing the actual code",
+      "suggestedFix": "Concrete fix, or empty string",
       "confidence":  0.0-1.0
     }}
 
-    Return [] if no issues survive the confidence filter.
+    Return [] if no significant issues survive the confidence filter.
 """).strip()
 
 
-def run_skill_review(pr_link: str, repo_dir: Path) -> list[dict]:
+def run_skill_review(pr_link: str, repo_dir: Path, pat: str = "", pr: dict | None = None) -> list[dict]:
     """
-    Invoke the code-review:code-review Claude skill from within the local
-    repo clone. The skill runs 5 parallel agents + confidence scoring.
-    No --allowedTools restriction so the skill can use MCP, Bash, git, etc.
-    Timeout is generous (10 min) to accommodate multi-agent execution.
+    Fetch PR diffs via ADO REST (no MCP), build context, and send to Claude.
+    Claude runs as a stateless subprocess with the diff embedded in the prompt.
     """
-    prompt = SKILL_PROMPT.format(pr_link=pr_link)
+    print(f"[Review] Starting Claude review for {pr_link}", flush=True)
 
-    print(f"[Skill] Invoking code-review:code-review for {pr_link}")
-    print(f"[Skill] Running from: {repo_dir}")
+    # Fetch diff context from ADO
+    try:
+        pr_id = int(pr_link.rstrip("/").split("/")[-1].split("?")[0])
+        if not pat:
+            pat = os.environ.get("ADO_PAT", "")
+        if not pr:
+            pr = get_pr_metadata(pat, pr_id)
+        changed_files = get_pr_changed_files(pat, pr_id)
+        print(f"[Review] {len(changed_files)} changed files", flush=True)
+        pr_context = build_pr_context(pat, pr, changed_files)
+    except Exception as e:
+        print(f"[Review] Failed to build PR context: {e}", flush=True)
+        return []
+
+    prompt = REVIEW_PROMPT.format(pr_context=pr_context)
+    print(f"[Review] Prompt size: {len(prompt)} chars", flush=True)
 
     env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_LOG"}
     env["PYTHONUTF8"] = "1"
     try:
-        result = subprocess.run(
-            ["claude", "--print", "--output-format", "json", "--model", CLAUDE_MODEL],
-            input=prompt,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            timeout=600,          # 10 min — skill runs 5 parallel agents
-            env=env,
-            cwd=str(repo_dir),    # run inside repo so skill finds CLAUDE.md
-        )
+        # Run from a temp dir so Claude doesn't load .mcp.json from the project
+        # (MCP server startup adds 2+ minutes of overhead we don't need here —
+        #  all ADO data is already embedded in the prompt)
+        # Semaphore ensures only one claude --print process runs at a time;
+        # concurrent invocations caused the second process to return nothing.
+        import tempfile
+        with _claude_semaphore, tempfile.TemporaryDirectory() as tmpdir:
+            result = subprocess.run(
+                ["claude", "--print", "--output-format", "json",
+                 "--model", CLAUDE_MODEL],
+                input=prompt,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=420,      # 7 min — prompt is ~40KB, Claude takes 2-4 min for a full review
+                env=env,
+                cwd=tmpdir,
+            )
 
+        print(f"[Review] Claude exit code: {result.returncode}", flush=True)
         if result.returncode != 0:
-            print(f"[Skill] Exit {result.returncode}: {result.stderr[:300]}")
+            print(f"[Review] stderr: {result.stderr[:400]}", flush=True)
             return []
 
         stdout = "\n".join(
@@ -222,18 +358,23 @@ def run_skill_review(pr_link: str, repo_dir: Path) -> list[dict]:
             if not l.startswith("process.env[")
         ).strip()
 
-        # claude --output-format json wraps output in {"result": "...", ...}
-        outer = json.loads(stdout)
-        text  = outer.get("result", stdout)
+        try:
+            outer = json.loads(stdout)
+            text  = outer.get("result", stdout)
+        except json.JSONDecodeError:
+            text = stdout
+
         comments = parse_json_comments(text)
-        print(f"[Skill] {len(comments)} comments returned")
+        print(f"[Review] {len(comments)} comments parsed", flush=True)
+        if not comments:
+            print(f"[Review] Raw result (first 600): {text[:600]}", flush=True)
         return comments
 
     except subprocess.TimeoutExpired:
-        print("[Skill] Timed out after 10 minutes")
+        print("[Review] Claude timed out after 7 minutes", flush=True)
         return []
     except Exception as e:
-        print(f"[Skill] Failed: {e}")
+        print(f"[Review] Failed: {e}", flush=True)
         return []
 
 
@@ -290,18 +431,16 @@ def parse_pr_link(pr_link: str) -> tuple[int, str, str] | None:
 # job_id -> {"status": "pending"|"done"|"error", "pullRequestId": int, "comments": [...], "error": str}
 _jobs: dict[str, dict] = {}
 _jobs_lock = threading.Lock()
+_claude_semaphore = threading.Semaphore(1)  # only one claude --print at a time
 
 
 def _run_review_job(job_id: str, pr_link: str, ado_pat: str,
                     pr_id: int, project: str, repo: str):
-    """Background thread: run the Claude skill and store the result."""
+    """Background thread: fetch PR diffs and run Claude review."""
     try:
-        pr       = get_pr_metadata(ado_pat, pr_id)
-        repo_dir = ensure_repo_cloned(ado_pat)
-        checkout_pr_branch(repo_dir, pr)
-
-        comments = run_skill_review(pr_link, repo_dir)
-        print(f"[Job {job_id[:8]}] PR #{pr_id} -> {len(comments)} comments from skill")
+        pr = get_pr_metadata(ado_pat, pr_id)
+        comments = run_skill_review(pr_link, repo_dir=None, pat=ado_pat, pr=pr)
+        print(f"[Job {job_id[:8]}] PR #{pr_id} -> {len(comments)} comments", flush=True)
 
         with _jobs_lock:
             _jobs[job_id] = {

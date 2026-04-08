@@ -2,10 +2,8 @@
   "mcpServers": {
     "azure-devops": {
       "type": "stdio",
-      "command": "cmd",
+      "command": "npx",
       "args": [
-        "/c",
-        "npx",
         "-y",
         "@azure-devops/mcp",
         "your-organization",

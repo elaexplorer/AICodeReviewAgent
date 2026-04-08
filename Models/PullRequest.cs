@@ -22,6 +22,9 @@ public class PullRequest
     [JsonPropertyName("status")]
     public string Status { get; set; } = string.Empty;
 
+    [JsonPropertyName("isDraft")]
+    public bool IsDraft { get; set; } = false;
+
     [JsonPropertyName("createdBy")]
     public PullRequestUser CreatedBy { get; set; } = new();
 
