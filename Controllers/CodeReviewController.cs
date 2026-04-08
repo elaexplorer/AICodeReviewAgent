@@ -33,6 +33,12 @@ public class CodeReviewController : ControllerBase
     private static readonly TimeSpan ReviewByLinkAndPostSyncWait = TimeSpan.FromSeconds(400);
     private static readonly HttpClient _localClaudeHttpClient = new() { Timeout = TimeSpan.FromMinutes(5) };
 
+    // Latest pipeline token received via X-Ado-Access-Token header.
+    // Overwritten on every inbound pipeline request so the delete endpoint
+    // can use it to remove comments posted by the build service identity.
+    private static string? _latestPipelineToken;
+    private static DateTime _latestPipelineTokenReceivedAt = DateTime.MinValue;
+
     public CodeReviewController(
         CodeReviewAgentService codeReviewAgent,
         AzureDevOpsMcpClient adoClient,
@@ -577,16 +583,47 @@ public class CodeReviewController : ControllerBase
     /// Removes all comments posted by this agent on the given PR (identified by the 🤖 footer marker).
     /// Useful during testing to clean up before re-running a review.
     /// </summary>
+    [HttpGet("pipeline-token/status")]
+    public IActionResult GetPipelineTokenStatus()
+    {
+        if (_latestPipelineToken == null)
+            return Ok(new { hasToken = false, message = "No pipeline token received yet." });
+
+        var age   = DateTime.UtcNow - _latestPipelineTokenReceivedAt;
+        var valid = age.TotalHours < 6;
+        return Ok(new
+        {
+            hasToken    = true,
+            receivedAt  = _latestPipelineTokenReceivedAt,
+            ageMinutes  = (int)age.TotalMinutes,
+            usable      = valid,
+            message     = valid
+                ? $"Pipeline token available (received {(int)age.TotalMinutes}m ago, usable for delete)."
+                : $"Pipeline token is stale ({(int)age.TotalHours}h old) — trigger a pipeline run to refresh."
+        });
+    }
+
     [HttpDelete("pr-comments/{project}/{repository}/{pullRequestId}")]
     public async Task<IActionResult> DeletePrComments(string project, string repository, int pullRequestId)
     {
         try
         {
-            var deleted = await _adoClient.DeleteAgentCommentsAsync(project, repository, pullRequestId);
+            // Try with the saved pipeline token first (can delete Build Service comments).
+            // Fall back to null (uses the configured PAT) if no token is saved.
+            var tokenAge    = DateTime.UtcNow - _latestPipelineTokenReceivedAt;
+            var pipelineToken = _latestPipelineToken != null && tokenAge.TotalHours < 6
+                ? _latestPipelineToken : null;
+
+            if (pipelineToken != null)
+                _logger.LogInformation(
+                    "Using saved pipeline token (age {Age:mm\\:ss}) to delete agent comments from PR {PullRequestId}",
+                    tokenAge, pullRequestId);
+
+            var deleted = await _adoClient.DeleteAgentCommentsAsync(project, repository, pullRequestId, pipelineToken);
             _logger.LogInformation(
                 "Deleted {Count} agent comment thread(s) from PR {PullRequestId} in {Project}/{Repository}",
                 deleted, pullRequestId, project, repository);
-            return Ok(new { deleted, project, repository, pullRequestId });
+            return Ok(new { deleted, project, repository, pullRequestId, usedPipelineToken = pipelineToken != null });
         }
         catch (Exception ex)
         {
@@ -1878,12 +1915,17 @@ public class CodeReviewController : ControllerBase
     private string? GetOptionalAdoAccessTokenHeader()
     {
         if (!Request.Headers.TryGetValue("X-Ado-Access-Token", out var headerValues))
-        {
             return null;
-        }
 
         var token = headerValues.FirstOrDefault()?.Trim();
-        return string.IsNullOrWhiteSpace(token) ? null : token;
+        if (string.IsNullOrWhiteSpace(token)) return null;
+
+        // Persist the latest pipeline token so the delete endpoint can use it
+        // to remove comments posted by the Build Service identity.
+        _latestPipelineToken = token;
+        _latestPipelineTokenReceivedAt = DateTime.UtcNow;
+        _logger.LogDebug("Saved latest pipeline token (received at {ReceivedAt})", _latestPipelineTokenReceivedAt);
+        return token;
     }
 
     /// <summary>
