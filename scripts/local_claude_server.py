@@ -165,7 +165,7 @@ def checkout_pr_branch(repo_dir: Path, pr: dict):
 # Claude /code-review plugin invocation
 # ---------------------------------------------------------------------------
 
-# Appended to the /code-review prompt so Claude emits a parseable JSON array
+# Appended after the skill invocation so Claude emits a parseable JSON array
 # at the end of its step-7 terminal output instead of prose only.
 _JSON_SUFFIX = (
     "\n\nAfter completing your review findings (step 7), append a raw JSON array "
@@ -180,55 +180,76 @@ _JSON_SUFFIX = (
 
 def run_plugin_review(pr_link: str, repo_dir: Path, pat: str = "") -> list[dict]:
     """
-    Invoke the /code-review Claude plugin from the waimea repo checkout.
+    Invoke the code-review:code-review skill via claude --print.
 
-    No --comment flag: Claude runs the full multi-agent flow (haiku gating,
-    CLAUDE.md scan via Sonnet×2, bug detection via Opus×2, validation agents)
-    and outputs findings to stdout without posting to ADO.
-
-    --dangerouslySkipPermissions gives Claude unrestricted access to all MCP
-    tools (ADO read/search) so it can fetch the PR diff and CLAUDE.md.
-
-    The JSON array Claude appends to its step-7 output is extracted and
-    returned to the container, which posts using its pipeline PAT.
+    Uses Popen to stream Claude's output to the server log in real time
+    (so we can see sub-agent progress) while also accumulating it for
+    JSON parsing at the end.
 
     Raises RuntimeError on timeout or non-zero exit.
     """
-    print(f"[Review] Invoking /code-review plugin for {pr_link}", flush=True)
+    print(f"[Review] Invoking /code-review:code-review skill for {pr_link}", flush=True)
+
+    plugin_prompt = f"/code-review:code-review {pr_link}{_JSON_SUFFIX}"
 
     env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_LOG"}
     env["PYTHONUTF8"] = "1"
 
-    plugin_prompt = f"/code-review {pr_link}{_JSON_SUFFIX}"
+    def _drain(stream, lines: list, tag: str):
+        """Read stream line by line, print each line, and accumulate."""
+        for raw in stream:
+            line = raw.rstrip("\n")
+            print(f"[Claude{tag}] {line}", flush=True)
+            lines.append(line)
 
     with _claude_semaphore:
-        try:
-            result = subprocess.run(
-                [
-                    "claude", "--print",
-                    "--dangerouslySkipPermissions",
-                    "--model", CLAUDE_MODEL,
-                ],
-                input=plugin_prompt,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                timeout=1200,   # 20 min for the full multi-agent flow
-                env=env,
-                cwd=str(repo_dir),
-            )
-        except subprocess.TimeoutExpired:
-            raise RuntimeError("Claude /code-review plugin timed out after 20 min")
-
-    print(f"[Review] Plugin exit: {result.returncode}", flush=True)
-    if result.returncode != 0:
-        snippet = (result.stderr or "").strip()[:400]
-        raise RuntimeError(
-            f"Claude plugin failed (exit {result.returncode}): {snippet or '(no output)'}"
+        proc = subprocess.Popen(
+            [
+                "claude", "--print",
+                "--dangerously-skip-permissions",
+                "--model", CLAUDE_MODEL,
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            cwd=str(repo_dir),
         )
 
-    output = result.stdout.strip()
-    print(f"[Review] Plugin output ({len(output)} chars):\n{output[:600]}", flush=True)
+        stdout_lines: list[str] = []
+        stderr_lines: list[str] = []
+
+        t_out = threading.Thread(target=_drain, args=(proc.stdout, stdout_lines, ""), daemon=True)
+        t_err = threading.Thread(target=_drain, args=(proc.stderr, stderr_lines, " ERR"), daemon=True)
+        t_out.start()
+        t_err.start()
+
+        try:
+            proc.stdin.write(plugin_prompt)
+            proc.stdin.close()
+            proc.wait(timeout=2400)   # 40 min for the full multi-agent flow
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            t_out.join(timeout=5)
+            t_err.join(timeout=5)
+            raise RuntimeError("Claude /code-review plugin timed out after 40 min")
+
+        t_out.join()
+        t_err.join()
+
+    returncode = proc.returncode
+    print(f"[Review] Plugin exit: {returncode}", flush=True)
+    if returncode != 0:
+        snippet = "\n".join(stderr_lines[-20:])[:400]
+        raise RuntimeError(
+            f"Claude plugin failed (exit {returncode}): {snippet or '(no output)'}"
+        )
+
+    output = "\n".join(stdout_lines).strip()
+    print(f"[Review] Plugin output ({len(output)} chars) — last 600 chars:\n{output[-600:]}", flush=True)
 
     if not output:
         raise RuntimeError("Claude plugin produced no output — review did not complete")
