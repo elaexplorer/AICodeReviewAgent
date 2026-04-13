@@ -30,7 +30,7 @@ public class CodeReviewController : ControllerBase
     private static readonly HashSet<string> _indexingInProgress = new();
     private static readonly object _indexingLock = new();
     private static readonly ConcurrentDictionary<string, ReviewByLinkAndPostJobStatus> _reviewByLinkAndPostJobs = new();
-    private static readonly TimeSpan ReviewByLinkAndPostSyncWait = TimeSpan.FromSeconds(400);
+    private static readonly TimeSpan ReviewByLinkAndPostSyncWait = TimeSpan.FromSeconds(5);
     private static readonly HttpClient _localClaudeHttpClient = new() { Timeout = TimeSpan.FromMinutes(5) };
 
     // Latest pipeline token received via X-Ado-Access-Token header.
@@ -1540,8 +1540,9 @@ public class CodeReviewController : ControllerBase
                                : claudeComments.Count > 0        ? "GPT + Claude (union)"
                                :                                   "GPT only";
         var notPosted          = Math.Max(0, filteredToPost - postedComments.Count - skippedCount);
-        var gptHighComments    = gptComments.Where(c => c.Severity?.ToLower() is "critical" or "high").OrderByDescending(c => c.Confidence).ToList();
-        var claudeHighComments = claudeComments.Where(c => c.Severity?.ToLower() is "critical" or "high").OrderByDescending(c => c.Confidence).ToList();
+        var gptHighComments      = gptComments.Where(c => c.Severity?.ToLower() is "critical" or "high").OrderByDescending(c => c.Confidence).ToList();
+        var claudeHighComments   = claudeComments.Where(c => c.Severity?.ToLower() is "critical" or "high").OrderByDescending(c => c.Confidence).ToList();
+        var claudeMediumComments = claudeComments.Where(c => c.Severity?.ToLower() is "medium").OrderByDescending(c => c.Confidence).ToList();
 
         // Helper: build a table of comments
         static string CommentTable(List<CodeReviewComment> items, string accentColor)
@@ -1624,7 +1625,7 @@ public class CodeReviewController : ControllerBase
                     {(claudeFailureReason is not null
                         ? $"<div style='font-size:14px;font-weight:700;color:#d73a49'>FAILED</div><div style='font-size:10px;color:#586069;margin-top:2px;word-break:break-word'>{System.Web.HttpUtility.HtmlEncode(claudeFailureReason[..Math.Min(80, claudeFailureReason.Length)])}</div>"
                         : claudeComments.Count > 0
-                            ? $"<div style='font-size:22px;font-weight:700;color:#6f42c1'>{claudeComments.Count}</div><div style='font-size:11px;color:#586069;margin-top:2px'>Claude total</div>"
+                            ? $"<div style='font-size:16px;font-weight:700;color:#d73a49'>{claudeHighComments.Count}</div><div style='font-size:10px;color:#586069;margin-top:1px'>Claude critical</div><div style='font-size:16px;font-weight:700;color:#6f42c1;margin-top:4px'>{claudeMediumComments.Count}</div><div style='font-size:10px;color:#586069;margin-top:1px'>Claude medium</div>"
                             : "<div style='font-size:14px;font-weight:700;color:#6a737d'>—</div><div style='font-size:11px;color:#586069;margin-top:2px'>Claude (disabled)</div>"
                     )}
                   </div>
@@ -1672,10 +1673,10 @@ public class CodeReviewController : ControllerBase
                   </table>
                 </div>
 
-                <!-- Claude high/critical table -->
+                <!-- Claude critical/high table -->
                 <div style="padding:16px 24px;border-bottom:1px solid #e1e4e8">
-                  <div style="font-size:13px;font-weight:600;color:#6f42c1;margin-bottom:8px">
-                    Claude — High/Critical Comments ({claudeHighComments.Count})
+                  <div style="font-size:13px;font-weight:600;color:#d73a49;margin-bottom:8px">
+                    Claude — Critical/High Comments ({claudeHighComments.Count}) <span style="font-size:11px;font-weight:400;color:#6a737d">· posted to PR</span>
                   </div>
                   {(claudeFailureReason is not null
                       ? $"<div style='font-size:12px;color:#d73a49;font-weight:700'>FAILED — {System.Web.HttpUtility.HtmlEncode(claudeFailureReason)}</div>"
@@ -1690,7 +1691,28 @@ public class CodeReviewController : ControllerBase
                         <th style='padding:6px 8px;text-align:right;color:#586069;font-weight:600'>Conf</th>
                       </tr>
                     </thead>
-                    <tbody>{CommentTable(claudeHighComments, "#6f42c1")}</tbody>
+                    <tbody>{CommentTable(claudeHighComments, "#d73a49")}</tbody>
+                  </table>"
+                  )}
+                </div>
+
+                <!-- Claude medium table -->
+                <div style="padding:16px 24px;border-bottom:1px solid #e1e4e8">
+                  <div style="font-size:13px;font-weight:600;color:#6f42c1;margin-bottom:8px">
+                    Claude — Medium Comments ({claudeMediumComments.Count}) <span style="font-size:11px;font-weight:400;color:#6a737d">· not posted</span>
+                  </div>
+                  {(claudeFailureReason is not null || claudeComments.Count == 0
+                      ? ""
+                      : $@"<table style='width:100%;border-collapse:collapse;font-size:12px'>
+                    <thead>
+                      <tr style='background:#f6f8fa;border-bottom:2px solid #e1e4e8'>
+                        <th style='padding:6px 8px;text-align:left;color:#586069;font-weight:600'>Sev</th>
+                        <th style='padding:6px 8px;text-align:left;color:#586069;font-weight:600'>File:Line</th>
+                        <th style='padding:6px 8px;text-align:left;color:#586069;font-weight:600'>Comment</th>
+                        <th style='padding:6px 8px;text-align:right;color:#586069;font-weight:600'>Conf</th>
+                      </tr>
+                    </thead>
+                    <tbody>{CommentTable(claudeMediumComments, "#6f42c1")}</tbody>
                   </table>"
                   )}
                 </div>
