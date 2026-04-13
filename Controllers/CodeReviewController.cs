@@ -476,6 +476,7 @@ public class CodeReviewController : ControllerBase
                     jobCompletedAt:     DateTime.UtcNow,
                     _logger,
                     claudeComments:      claudeComments,
+                    claudeConfigured:    !string.IsNullOrWhiteSpace(localClaudeUrl),
                     gptFailureReason:    gptFailureReason,
                     claudeFailureReason: claudeFailureReason);
 
@@ -1462,7 +1463,7 @@ public class CodeReviewController : ControllerBase
     ///   REPORT_EMAIL_TO           — recipient(s), comma-separated
     ///   REPORT_LOGIC_APP_URL      — Logic App HTTP trigger URL (includes SAS signature)
     /// </summary>
-    private static async Task SendReviewEmailAsync(  // signature updated: claudeComments replaces claudePosted
+    private static async Task SendReviewEmailAsync(
         string prLink,
         int prId,
         string project,
@@ -1475,6 +1476,7 @@ public class CodeReviewController : ControllerBase
         DateTime jobCompletedAt,
         ILogger logger,
         List<CodeReviewComment>? claudeComments = null,
+        bool claudeConfigured               = false,
         string? gptFailureReason    = null,
         string? claudeFailureReason = null)
     {
@@ -1501,7 +1503,7 @@ public class CodeReviewController : ControllerBase
         var html = BuildReviewEmailHtml(prLink, prId, project, repository,
                                         gptComments, claudeComments, filteredToPost,
                                         postedComments, skippedCount, jobStartedAt, jobCompletedAt,
-                                        gptFailureReason, claudeFailureReason);
+                                        claudeConfigured, gptFailureReason, claudeFailureReason);
         try
         {
             using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
@@ -1529,6 +1531,7 @@ public class CodeReviewController : ControllerBase
         int skippedCount,
         DateTime jobStartedAt,
         DateTime jobCompletedAt,
+        bool claudeConfigured       = false,
         string? gptFailureReason    = null,
         string? claudeFailureReason = null)
     {
@@ -1626,7 +1629,9 @@ public class CodeReviewController : ControllerBase
                         ? $"<div style='font-size:14px;font-weight:700;color:#d73a49'>FAILED</div><div style='font-size:10px;color:#586069;margin-top:2px;word-break:break-word'>{System.Web.HttpUtility.HtmlEncode(claudeFailureReason[..Math.Min(80, claudeFailureReason.Length)])}</div>"
                         : claudeComments.Count > 0
                             ? $"<div style='font-size:16px;font-weight:700;color:#d73a49'>{claudeHighComments.Count}</div><div style='font-size:10px;color:#586069;margin-top:1px'>Claude critical</div><div style='font-size:16px;font-weight:700;color:#6f42c1;margin-top:4px'>{claudeMediumComments.Count}</div><div style='font-size:10px;color:#586069;margin-top:1px'>Claude medium</div>"
-                            : "<div style='font-size:14px;font-weight:700;color:#6a737d'>—</div><div style='font-size:11px;color:#586069;margin-top:2px'>Claude (disabled)</div>"
+                            : !claudeConfigured
+                                ? "<div style='font-size:14px;font-weight:700;color:#6a737d'>—</div><div style='font-size:11px;color:#586069;margin-top:2px'>Claude (disabled)</div>"
+                                : "<div style='font-size:16px;font-weight:700;color:#28a745'>0</div><div style='font-size:11px;color:#586069;margin-top:2px'>Claude no issues</div>"
                     )}
                   </div>
                   <div style="flex:1;padding:14px 16px;border-right:1px solid #e1e4e8;text-align:center">
@@ -1680,8 +1685,10 @@ public class CodeReviewController : ControllerBase
                   </div>
                   {(claudeFailureReason is not null
                       ? $"<div style='font-size:12px;color:#d73a49;font-weight:700'>FAILED — {System.Web.HttpUtility.HtmlEncode(claudeFailureReason)}</div>"
-                      : claudeComments.Count == 0
+                      : !claudeConfigured
                           ? "<div style='font-size:12px;color:#6a737d'>Claude review was not configured for this run.</div>"
+                      : claudeComments.Count == 0
+                          ? "<div style='font-size:12px;color:#28a745'>No critical or high issues found.</div>"
                           : $@"<table style='width:100%;border-collapse:collapse;font-size:12px'>
                     <thead>
                       <tr style='background:#f6f8fa;border-bottom:2px solid #e1e4e8'>
@@ -1701,7 +1708,7 @@ public class CodeReviewController : ControllerBase
                   <div style="font-size:13px;font-weight:600;color:#6f42c1;margin-bottom:8px">
                     Claude — Medium Comments ({claudeMediumComments.Count}) <span style="font-size:11px;font-weight:400;color:#6a737d">· not posted</span>
                   </div>
-                  {(claudeFailureReason is not null || claudeComments.Count == 0
+                  {(!claudeConfigured || claudeFailureReason is not null || claudeComments.Count == 0
                       ? ""
                       : $@"<table style='width:100%;border-collapse:collapse;font-size:12px'>
                     <thead>
