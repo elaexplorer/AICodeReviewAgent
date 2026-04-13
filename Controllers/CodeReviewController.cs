@@ -31,7 +31,7 @@ public class CodeReviewController : ControllerBase
     private static readonly object _indexingLock = new();
     private static readonly ConcurrentDictionary<string, ReviewByLinkAndPostJobStatus> _reviewByLinkAndPostJobs = new();
     private static readonly TimeSpan ReviewByLinkAndPostSyncWait = TimeSpan.FromSeconds(5);
-    private static readonly HttpClient _localClaudeHttpClient = new() { Timeout = TimeSpan.FromMinutes(5) };
+    private static readonly HttpClient _localClaudeHttpClient = new() { Timeout = TimeSpan.FromMinutes(2) };
 
     // Latest pipeline token received via X-Ado-Access-Token header.
     // Overwritten on every inbound pipeline request so the delete endpoint
@@ -1771,9 +1771,9 @@ public class CodeReviewController : ControllerBase
         var jobId = jobIdEl.GetString() ?? "";
         _logger.LogInformation("Local Claude job submitted: {JobId}", jobId);
 
-        // Poll until done (max 22 min — multi-agent plugin runs up to 20 min)
+        // Poll until done (max 35 min — multi-agent plugin runs up to 40 min on local server)
         var pollUrl      = $"{baseUrl}/claudeCodeReview/{jobId}";
-        var deadline     = DateTime.UtcNow.AddMinutes(22);
+        var deadline     = DateTime.UtcNow.AddMinutes(35);
         var pollInterval = TimeSpan.FromSeconds(20);
 
         while (DateTime.UtcNow < deadline)
@@ -1808,7 +1808,7 @@ public class CodeReviewController : ControllerBase
             return comments;
         }
 
-        throw new TimeoutException("Claude /code-review plugin timed out after 22 min");
+        throw new TimeoutException("Claude /code-review plugin timed out after 35 min");
     }
 
     private static List<CodeReviewComment> ParseClaudeComments(JsonElement root)
