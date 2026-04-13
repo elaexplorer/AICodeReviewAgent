@@ -1,0 +1,583 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Code Review Agent — Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #0d1117;
+      color: #c9d1d9;
+      min-height: 100vh;
+    }
+
+    /* ── header ─────────────────────────────────────────── */
+    header {
+      background: #161b22;
+      border-bottom: 1px solid #30363d;
+      padding: 16px 28px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+    header h1 {
+      font-size: 18px;
+      font-weight: 600;
+      color: #f0f6fc;
+      letter-spacing: -0.3px;
+    }
+    header h1 span { color: #58a6ff; }
+    .header-actions { display: flex; align-items: center; gap: 12px; }
+    #last-updated { font-size: 12px; color: #8b949e; }
+    #refresh-btn {
+      background: #21262d;
+      border: 1px solid #30363d;
+      color: #c9d1d9;
+      padding: 6px 14px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 13px;
+      transition: background 0.15s;
+    }
+    #refresh-btn:hover { background: #30363d; }
+    .nav-link {
+      font-size: 13px;
+      color: #58a6ff;
+      text-decoration: none;
+    }
+    .nav-link:hover { text-decoration: underline; }
+
+    /* ── main layout ─────────────────────────────────────── */
+    main { max-width: 1400px; margin: 0 auto; padding: 24px 20px; }
+
+    /* ── summary cards ───────────────────────────────────── */
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 16px;
+      margin-bottom: 28px;
+    }
+    .card {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 10px;
+      padding: 18px 20px;
+    }
+    .card-label {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      color: #8b949e;
+      margin-bottom: 8px;
+    }
+    .card-value {
+      font-size: 32px;
+      font-weight: 700;
+      color: #f0f6fc;
+      line-height: 1;
+    }
+    .card-sub {
+      font-size: 12px;
+      color: #8b949e;
+      margin-top: 4px;
+    }
+    .card-value.accent-blue   { color: #58a6ff; }
+    .card-value.accent-orange { color: #f78166; }
+    .card-value.accent-green  { color: #3fb950; }
+    .card-value.accent-purple { color: #bc8cff; }
+
+    /* ── section header ──────────────────────────────────── */
+    .section-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: #8b949e;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin: 0 0 14px;
+    }
+
+    /* ── chart row ───────────────────────────────────────── */
+    .charts-row {
+      display: grid;
+      grid-template-columns: 2fr 1fr 1fr;
+      gap: 16px;
+      margin-bottom: 28px;
+    }
+    @media (max-width: 960px) {
+      .charts-row { grid-template-columns: 1fr 1fr; }
+    }
+    @media (max-width: 600px) {
+      .charts-row { grid-template-columns: 1fr; }
+    }
+    .chart-box {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 10px;
+      padding: 20px;
+    }
+    .chart-box canvas { max-height: 220px; }
+
+    /* ── model comparison ────────────────────────────────── */
+    .model-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      margin-bottom: 28px;
+    }
+    @media (max-width: 600px) { .model-row { grid-template-columns: 1fr; } }
+
+    /* ── recent PRs table ────────────────────────────────── */
+    .table-box {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 10px;
+      overflow: hidden;
+    }
+    .table-box table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    .table-box thead tr {
+      background: #21262d;
+      border-bottom: 1px solid #30363d;
+    }
+    .table-box th {
+      padding: 10px 14px;
+      text-align: left;
+      font-weight: 600;
+      color: #8b949e;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+      white-space: nowrap;
+    }
+    .table-box td {
+      padding: 10px 14px;
+      border-bottom: 1px solid #21262d;
+      vertical-align: middle;
+    }
+    .table-box tr:last-child td { border-bottom: none; }
+    .table-box tr:hover td { background: #1c2128; }
+    .pr-link { color: #58a6ff; text-decoration: none; font-weight: 500; }
+    .pr-link:hover { text-decoration: underline; }
+    .repo-tag {
+      display: inline-block;
+      background: #21262d;
+      border: 1px solid #30363d;
+      border-radius: 12px;
+      padding: 2px 8px;
+      font-size: 11px;
+      color: #8b949e;
+      max-width: 180px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 22px;
+      height: 20px;
+      padding: 0 6px;
+      border-radius: 10px;
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .badge-red    { background: rgba(248,81,73,0.15); color: #f85149; }
+    .badge-orange { background: rgba(210,153,34,0.15); color: #d29922; }
+    .badge-green  { background: rgba(63,185,80,0.15);  color: #3fb950; }
+    .badge-blue   { background: rgba(88,166,255,0.15); color: #58a6ff; }
+    .badge-gray   { background: rgba(139,148,158,0.12); color: #8b949e; }
+    .badge-purple { background: rgba(188,140,255,0.15); color: #bc8cff; }
+
+    /* ── status mini-bars ────────────────────────────────── */
+    .status-bar { display: flex; gap: 3px; align-items: center; }
+    .bar-seg {
+      height: 6px;
+      border-radius: 3px;
+      min-width: 4px;
+    }
+    .bar-green  { background: #3fb950; }
+    .bar-red    { background: #f85149; }
+    .bar-gray   { background: #30363d; }
+
+    /* ── loading / error ─────────────────────────────────── */
+    #loading {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 300px;
+      gap: 16px;
+      color: #8b949e;
+    }
+    .spinner {
+      width: 36px;
+      height: 36px;
+      border: 3px solid #30363d;
+      border-top-color: #58a6ff;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    #error-banner {
+      display: none;
+      background: rgba(248,81,73,0.1);
+      border: 1px solid rgba(248,81,73,0.3);
+      border-radius: 8px;
+      padding: 12px 16px;
+      color: #f85149;
+      margin-bottom: 20px;
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+<header>
+  <h1>Code Review <span>Foundry</span> — Dashboard</h1>
+  <div class="header-actions">
+    <a class="nav-link" href="/">Review Tool</a>
+    <span id="last-updated"></span>
+    <button id="refresh-btn" onclick="load()">↻ Refresh</button>
+  </div>
+</header>
+
+<main>
+  <div id="error-banner"></div>
+  <div id="loading">
+    <div class="spinner"></div>
+    <span>Loading metrics…</span>
+  </div>
+  <div id="content" style="display:none">
+
+    <!-- Summary cards -->
+    <div class="cards" id="cards"></div>
+
+    <!-- Charts row: timeline | resolution donut | severity bar -->
+    <p class="section-title">Trends &amp; Distributions</p>
+    <div class="charts-row">
+      <div class="chart-box">
+        <p class="section-title" style="margin-bottom:12px">PRs Reviewed — last 30 days</p>
+        <canvas id="chart-timeline"></canvas>
+      </div>
+      <div class="chart-box">
+        <p class="section-title" style="margin-bottom:12px">Comment Resolution</p>
+        <canvas id="chart-resolution"></canvas>
+      </div>
+      <div class="chart-box">
+        <p class="section-title" style="margin-bottom:12px">Posted by Severity</p>
+        <canvas id="chart-severity"></canvas>
+      </div>
+    </div>
+
+    <!-- Model comparison -->
+    <p class="section-title">Model Breakdown</p>
+    <div class="model-row">
+      <div class="chart-box">
+        <p class="section-title" style="margin-bottom:12px">Comments Posted</p>
+        <canvas id="chart-model-comments"></canvas>
+      </div>
+      <div class="chart-box">
+        <p class="section-title" style="margin-bottom:12px">Critical / High Comments Posted</p>
+        <canvas id="chart-model-critical"></canvas>
+      </div>
+    </div>
+
+    <!-- Recent PRs table -->
+    <p class="section-title">Recent Pull Requests</p>
+    <div class="table-box">
+      <table>
+        <thead>
+          <tr>
+            <th>PR</th>
+            <th>Repository</th>
+            <th>Reviewed</th>
+            <th>Posted</th>
+            <th>GPT Critical</th>
+            <th>Claude Critical</th>
+            <th>Accepted</th>
+            <th>Won't Fix</th>
+            <th>Open</th>
+          </tr>
+        </thead>
+        <tbody id="pr-table-body"></tbody>
+      </table>
+    </div>
+
+  </div><!-- #content -->
+</main>
+
+<script>
+// ── helpers ─────────────────────────────────────────────────────────────────
+const $ = id => document.getElementById(id);
+const fmt = n => n == null ? '—' : n.toLocaleString();
+const badge = (n, cls) => n > 0
+  ? `<span class="badge badge-${cls}">${n}</span>`
+  : `<span class="badge badge-gray">0</span>`;
+
+const CHART_DEFAULTS = {
+  responsive: true,
+  maintainAspectRatio: true,
+  plugins: { legend: { labels: { color: '#8b949e', font: { size: 11 } } } },
+};
+
+function mkChart(id, type, data, opts = {}) {
+  const ctx = $(id).getContext('2d');
+  return new Chart(ctx, {
+    type,
+    data,
+    options: { ...CHART_DEFAULTS, ...opts }
+  });
+}
+
+// ── load data ────────────────────────────────────────────────────────────────
+let charts = {};
+
+async function load() {
+  $('loading').style.display = 'flex';
+  $('content').style.display = 'none';
+  $('error-banner').style.display = 'none';
+
+  // Destroy old charts before re-creating
+  Object.values(charts).forEach(c => c.destroy());
+  charts = {};
+
+  try {
+    const res = await fetch('/api/codereview/dashboard/stats');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const d = await res.json();
+    render(d);
+    $('last-updated').textContent = 'Updated ' + new Date().toLocaleTimeString();
+  } catch (e) {
+    $('error-banner').textContent = 'Failed to load dashboard data: ' + e.message;
+    $('error-banner').style.display = 'block';
+  } finally {
+    $('loading').style.display = 'none';
+    $('content').style.display = 'block';
+  }
+}
+
+// ── render ───────────────────────────────────────────────────────────────────
+function render(d) {
+  renderCards(d);
+  renderTimeline(d.prsPerDay || []);
+  renderResolution(d.resolutionByStatus || {});
+  renderSeverity(d.severityBreakdown || {});
+  renderModelComments(d);
+  renderModelCritical(d);
+  renderTable(d.recentPrs || []);
+}
+
+function renderCards(d) {
+  const res   = d.resolutionByStatus || {};
+  const fixed = res['fixed'] || 0;
+  const total = Object.values(res).reduce((a,b)=>a+b,0);
+  const pct   = total > 0 ? Math.round(fixed*100/total) : 0;
+
+  $('cards').innerHTML = `
+    <div class="card">
+      <div class="card-label">PRs Reviewed</div>
+      <div class="card-value accent-blue">${fmt(d.totalPrsReviewed)}</div>
+      <div class="card-sub">all time</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Comments Posted</div>
+      <div class="card-value">${fmt(d.totalCommentsPosted)}</div>
+      <div class="card-sub">GPT ${fmt(d.gptCommentsPosted)} &nbsp;·&nbsp; Claude ${fmt(d.claudeCommentsPosted)}</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Critical (GPT)</div>
+      <div class="card-value accent-orange">${fmt(d.gptCriticalPosted)}</div>
+      <div class="card-sub">high + critical</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Critical (Claude)</div>
+      <div class="card-value accent-purple">${fmt(d.claudeCriticalPosted)}</div>
+      <div class="card-sub">high + critical</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Accepted / Fixed</div>
+      <div class="card-value accent-green">${fmt(fixed)}</div>
+      <div class="card-sub">${pct}% of ${fmt(total)} synced</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Won't Fix</div>
+      <div class="card-value">${fmt((res['wontFix']||0)+(res['byDesign']||0))}</div>
+      <div class="card-sub">wontFix + byDesign</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Feedback</div>
+      <div class="card-value accent-green">${fmt(d.helpfulFeedback)}</div>
+      <div class="card-sub">👍 helpful &nbsp;·&nbsp; 👎 ${fmt(d.notHelpfulFeedback)}</div>
+    </div>
+  `;
+}
+
+function renderTimeline(rows) {
+  if (!rows.length) {
+    $('chart-timeline').parentElement.innerHTML += '<p style="color:#8b949e;font-size:12px;text-align:center;margin-top:20px">No data yet</p>';
+    return;
+  }
+  charts.timeline = mkChart('chart-timeline', 'line', {
+    labels: rows.map(r => r.day),
+    datasets: [{
+      label: 'PRs reviewed',
+      data: rows.map(r => r.count),
+      borderColor: '#58a6ff',
+      backgroundColor: 'rgba(88,166,255,0.08)',
+      tension: 0.3,
+      fill: true,
+      pointRadius: 3,
+      pointHoverRadius: 5,
+    }]
+  }, {
+    scales: {
+      x: { ticks: { color: '#8b949e', font: { size: 10 }, maxTicksLimit: 8 }, grid: { color: '#21262d' } },
+      y: { ticks: { color: '#8b949e', font: { size: 10 }, precision: 0 }, grid: { color: '#21262d' }, beginAtZero: true }
+    },
+    plugins: { legend: { display: false } }
+  });
+}
+
+function renderResolution(status) {
+  const labels = [];
+  const data   = [];
+  const colors = [];
+  const map = {
+    'fixed':    ['Fixed / Accepted', '#3fb950'],
+    'active':   ['Still Open',       '#8b949e'],
+    'wontFix':  ["Won't Fix",        '#f85149'],
+    'byDesign': ['By Design',        '#d29922'],
+    'closed':   ['Closed',           '#bc8cff'],
+    'pending':  ['Pending',          '#388bfd'],
+  };
+  for (const [key, [label, color]] of Object.entries(map)) {
+    if (status[key]) { labels.push(label); data.push(status[key]); colors.push(color); }
+  }
+  if (!data.length) {
+    $('chart-resolution').parentElement.innerHTML += '<p style="color:#8b949e;font-size:12px;text-align:center;margin-top:20px">No resolution data yet</p>';
+    return;
+  }
+  charts.resolution = mkChart('chart-resolution', 'doughnut', {
+    labels,
+    datasets: [{ data, backgroundColor: colors, borderWidth: 1, borderColor: '#161b22' }]
+  }, {
+    cutout: '60%',
+    plugins: { legend: { position: 'bottom', labels: { color: '#8b949e', font: { size: 11 }, padding: 10 } } }
+  });
+}
+
+function renderSeverity(sev) {
+  const order = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO'];
+  const colors = { CRITICAL: '#f85149', HIGH: '#d29922', MEDIUM: '#388bfd', LOW: '#3fb950', INFO: '#8b949e' };
+  const labels = order.filter(k => sev[k]);
+  const data   = labels.map(k => sev[k]);
+  const bgColors = labels.map(k => colors[k] || '#8b949e');
+  if (!data.length) {
+    $('chart-severity').parentElement.innerHTML += '<p style="color:#8b949e;font-size:12px;text-align:center;margin-top:20px">No data yet</p>';
+    return;
+  }
+  charts.severity = mkChart('chart-severity', 'bar', {
+    labels,
+    datasets: [{ label: 'Posted comments', data, backgroundColor: bgColors, borderRadius: 4 }]
+  }, {
+    indexAxis: 'y',
+    scales: {
+      x: { ticks: { color: '#8b949e', font: { size: 10 }, precision: 0 }, grid: { color: '#21262d' }, beginAtZero: true },
+      y: { ticks: { color: '#8b949e', font: { size: 11 } }, grid: { display: false } }
+    },
+    plugins: { legend: { display: false } }
+  });
+}
+
+function renderModelComments(d) {
+  charts.modelComments = mkChart('chart-model-comments', 'bar', {
+    labels: ['GPT-4', 'Claude'],
+    datasets: [{
+      label: 'Comments posted',
+      data: [d.gptCommentsPosted || 0, d.claudeCommentsPosted || 0],
+      backgroundColor: ['#388bfd', '#bc8cff'],
+      borderRadius: 6,
+    }]
+  }, {
+    scales: {
+      x: { ticks: { color: '#8b949e' }, grid: { display: false } },
+      y: { ticks: { color: '#8b949e', precision: 0 }, grid: { color: '#21262d' }, beginAtZero: true }
+    },
+    plugins: { legend: { display: false } }
+  });
+}
+
+function renderModelCritical(d) {
+  charts.modelCritical = mkChart('chart-model-critical', 'bar', {
+    labels: ['GPT-4', 'Claude'],
+    datasets: [{
+      label: 'Critical / High posted',
+      data: [d.gptCriticalPosted || 0, d.claudeCriticalPosted || 0],
+      backgroundColor: ['rgba(248,81,73,0.7)', 'rgba(210,153,34,0.7)'],
+      borderColor:     ['#f85149', '#d29922'],
+      borderWidth: 1,
+      borderRadius: 6,
+    }]
+  }, {
+    scales: {
+      x: { ticks: { color: '#8b949e' }, grid: { display: false } },
+      y: { ticks: { color: '#8b949e', precision: 0 }, grid: { color: '#21262d' }, beginAtZero: true }
+    },
+    plugins: { legend: { display: false } }
+  });
+}
+
+function renderTable(rows) {
+  if (!rows.length) {
+    $('pr-table-body').innerHTML = '<tr><td colspan="9" style="text-align:center;color:#8b949e;padding:24px">No reviews recorded yet</td></tr>';
+    return;
+  }
+  $('pr-table-body').innerHTML = rows.map(r => {
+    const total  = r.accepted + r.rejected + r.stillOpen;
+    const accPct = total > 0 ? (r.accepted / total) : 0;
+    const rejPct = total > 0 ? (r.rejected / total) : 0;
+    const openPct= total > 0 ? (r.stillOpen/ total) : 0;
+    const barW = 60;
+    const barHtml = total > 0
+      ? `<div class="status-bar">
+           <div class="bar-seg bar-green"  style="width:${Math.round(accPct*barW)}px"></div>
+           <div class="bar-seg bar-red"    style="width:${Math.round(rejPct*barW)}px"></div>
+           <div class="bar-seg bar-gray"   style="width:${Math.round(openPct*barW)}px"></div>
+         </div>`
+      : '';
+    const dt = r.reviewedAt ? r.reviewedAt.replace('T',' ').substring(0,16) + ' UTC' : '—';
+    const prLink = r.prUrl
+      ? `<a class="pr-link" href="${r.prUrl}" target="_blank">#${r.prId}</a>`
+      : `<span class="pr-link">#${r.prId}</span>`;
+    return `<tr>
+      <td>${prLink}</td>
+      <td><span class="repo-tag" title="${r.repository}">${r.repository}</span></td>
+      <td style="color:#8b949e;white-space:nowrap">${dt}</td>
+      <td>${badge(r.postedCount, 'blue')}</td>
+      <td>${badge(r.gptCritical, 'orange')}</td>
+      <td>${badge(r.claudeCritical, 'purple')}</td>
+      <td>${badge(r.accepted, 'green')}&nbsp;${barHtml}</td>
+      <td>${badge(r.rejected, 'red')}</td>
+      <td>${badge(r.stillOpen, 'gray')}</td>
+    </tr>`;
+  }).join('');
+}
+
+// ── boot ─────────────────────────────────────────────────────────────────────
+load();
+// Auto-refresh every 5 minutes
+setInterval(load, 5 * 60 * 1000);
+</script>
+</body>
+</html>

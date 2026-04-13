@@ -136,14 +136,26 @@ public class CodeReviewService
             codebaseContext = basicContext;
         }
 
-        // Prepend git history and existing reviewer comments so agents know full context
+        // Prepend PR metadata, git history, and existing reviewer comments so agents know full context
         var prefixBuilder = new StringBuilder();
+
+        // PR title + description: models must read this before flagging anything as an error
+        prefixBuilder.AppendLine($"## Pull Request Context");
+        prefixBuilder.AppendLine($"**Title:** {pullRequest.Title}");
+        if (!string.IsNullOrWhiteSpace(pullRequest.Description))
+        {
+            prefixBuilder.AppendLine($"**Description (author's stated intent):**");
+            prefixBuilder.AppendLine(pullRequest.Description.Trim());
+            prefixBuilder.AppendLine();
+            prefixBuilder.AppendLine("IMPORTANT: If a change in the diff is explained by the PR description above, do NOT flag it as an issue.");
+        }
+        prefixBuilder.AppendLine();
+
         if (gitBlameContext.Length > 0)
             prefixBuilder.AppendLine(gitBlameContext.ToString());
         if (!string.IsNullOrEmpty(existingThreadSummary))
             prefixBuilder.AppendLine(existingThreadSummary);
-        if (prefixBuilder.Length > 0)
-            codebaseContext = prefixBuilder.ToString() + codebaseContext;
+        codebaseContext = prefixBuilder.ToString() + codebaseContext;
 
         // Use orchestrator to route reviews to language-specific agents
         var comments = await _orchestrator.ReviewFilesAsync(files, codebaseContext);

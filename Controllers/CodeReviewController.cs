@@ -92,6 +92,9 @@ public class CodeReviewController : ControllerBase
                 });
             }
 
+            if (IsAuthorBlocked(pullRequest))
+                return Ok(new { skipped = true, reason = $"PR author '{pullRequest.CreatedBy?.UniqueName}' is on the blocklist." });
+
             TriggerBackgroundIndexing(
                 request.Project,
                 request.Repository,
@@ -177,6 +180,9 @@ public class CodeReviewController : ControllerBase
                 });
             }
 
+            if (IsAuthorBlocked(pullRequest))
+                return Ok(new { skipped = true, reason = $"PR author '{pullRequest.CreatedBy?.UniqueName}' is on the blocklist." });
+
             TriggerBackgroundIndexing(
                 parsed.Project,
                 parsed.Repository,
@@ -253,20 +259,43 @@ public class CodeReviewController : ControllerBase
                     string.IsNullOrWhiteSpace(localClaudeUrl) ? "disabled" : localClaudeUrl,
                     request.DryRun);
 
-                // Run GPT-4 and local Claude in parallel
+                // Run GPT-4 and local Claude in parallel, capturing failures independently
                 var gptTask    = RunReviewByLinkCoreAsync(request.PullRequestLink, parsed, adoAccessTokenOverride);
                 var claudeTask = string.IsNullOrWhiteSpace(localClaudeUrl)
                     ? Task.FromResult<List<CodeReviewComment>>([])
                     : CallLocalClaudeAgentAsync(localClaudeUrl, request.PullRequestLink, adoAccessTokenOverride);
 
-                await Task.WhenAll(gptTask, claudeTask);
+                // Await both without letting one failure cancel the other
+                // reviewOutput is non-nullable; null! is safe because we throw below if GPT failed
+                ReviewByLinkExecutionResult reviewOutput = null!;
+                List<CodeReviewComment> claudeComments  = [];
+                string? gptFailureReason    = null;
+                string? claudeFailureReason = null;
 
-                var reviewOutput    = await gptTask;
-                var claudeComments  = await claudeTask;
+                try { reviewOutput = await gptTask; }
+                catch (Exception ex)
+                {
+                    gptFailureReason = ex.Message;
+                    _logger.LogError(ex, "GPT-4 review failed for {Link}", request.PullRequestLink);
+                }
+
+                try { claudeComments = await claudeTask; }
+                catch (Exception ex)
+                {
+                    claudeFailureReason = ex.Message;
+                    _logger.LogError(ex, "Claude review failed for {Link}", request.PullRequestLink);
+                }
+
+                // GPT is required — without it we have no diff/file metadata to post against
+                if (gptFailureReason is not null)
+                    throw new InvalidOperationException($"GPT-4 review failed: {gptFailureReason}");
 
                 _logger.LogInformation(
-                    "Parallel review complete — GPT-4: {GptCount} comments, Claude: {ClaudeCount} comments",
-                    reviewOutput.Comments.Count, claudeComments.Count);
+                    "Parallel review complete — GPT-4: {GptCount} comments, Claude: {ClaudeStatus}",
+                    reviewOutput.Comments.Count,
+                    claudeFailureReason is not null ? $"FAILED — {claudeFailureReason}"
+                    : claudeComments.Count > 0       ? $"{claudeComments.Count} comment(s)"
+                    :                                   "disabled or no issues");
 
                 // Post high/critical comments from both models (union), deduped by position
                 var highPriorityComments = reviewOutput.Comments
@@ -394,8 +423,6 @@ public class CodeReviewController : ControllerBase
 
                 }
 
-                var dualModel = claudeComments.Count > 0;
-
                 // Persist job record and posted thread IDs to SQLite for daily reporting
                 var jobRecord = new ReviewJobRecord
                 {
@@ -411,7 +438,9 @@ public class CodeReviewController : ControllerBase
                     ClaudeHigh   = claudeComments.Count(IsHighPriorityComment),
                     PostedCount  = postedCount,
                     SkippedCount = skippedCount,
-                    ModelTag     = dualModel ? "GPT + Claude (union)" : "GPT only",
+                    ModelTag     = claudeFailureReason is not null ? "GPT only (Claude FAILED)"
+                                 : claudeComments.Count > 0        ? "GPT + Claude (union)"
+                                 :                                   "GPT only",
                 };
                 _ = _feedbackService.RecordJobAsync(jobRecord);
 
@@ -440,13 +469,15 @@ public class CodeReviewController : ControllerBase
                     reviewOutput.Project,
                     reviewOutput.Repository,
                     gptComments:        reviewOutput.Comments,
-                    claudeComments:     claudeComments,
                     filteredToPost:     highPriorityComments.Count,
                     postedComments:     postedComments,
                     skippedCount:       skippedCount,
                     jobStartedAt:       jobStartedAt,
                     jobCompletedAt:     DateTime.UtcNow,
-                    _logger);
+                    _logger,
+                    claudeComments:      claudeComments,
+                    gptFailureReason:    gptFailureReason,
+                    claudeFailureReason: claudeFailureReason);
 
                 _reviewByLinkAndPostJobs[jobId] = new ReviewByLinkAndPostJobStatus
                 {
@@ -457,6 +488,8 @@ public class CodeReviewController : ControllerBase
                     PullRequestId = reviewOutput.PullRequestId,
                     IsDraft = reviewOutput.IsDraft,
                     Status = "completed",
+                    GptFailureReason    = gptFailureReason,
+                    ClaudeFailureReason = claudeFailureReason,
                     StartedAtUtc = _reviewByLinkAndPostJobs[jobId].StartedAtUtc,
                     CompletedAtUtc = DateTime.UtcNow,
                     TotalComments = reviewOutput.Comments.Count,
@@ -610,9 +643,15 @@ public class CodeReviewController : ControllerBase
         {
             // Try with the saved pipeline token first (can delete Build Service comments).
             // Fall back to null (uses the configured PAT) if no token is saved.
-            var tokenAge    = DateTime.UtcNow - _latestPipelineTokenReceivedAt;
-            var pipelineToken = _latestPipelineToken != null && tokenAge.TotalHours < 6
-                ? _latestPipelineToken : null;
+            // Allow caller to supply a token via header (e.g. manual delete calls)
+            var headerToken = Request.Headers.TryGetValue("X-Ado-Access-Token", out var hv)
+                ? hv.ToString() : null;
+
+            var tokenAge      = DateTime.UtcNow - _latestPipelineTokenReceivedAt;
+            var pipelineToken = !string.IsNullOrWhiteSpace(headerToken)
+                ? headerToken
+                : (_latestPipelineToken != null && tokenAge.TotalHours < 24
+                    ? _latestPipelineToken : null);
 
             if (pipelineToken != null)
                 _logger.LogInformation(
@@ -1371,6 +1410,9 @@ public class CodeReviewController : ControllerBase
             throw new InvalidOperationException(PullRequestFetchFailedClientError);
         }
 
+        if (IsAuthorBlocked(pullRequest))
+            throw new InvalidOperationException($"PR author '{pullRequest.CreatedBy?.UniqueName}' is on the blocklist — review skipped.");
+
         TriggerBackgroundIndexing(
             parsed.Project,
             parsed.Repository,
@@ -1420,20 +1462,23 @@ public class CodeReviewController : ControllerBase
     ///   REPORT_EMAIL_TO           — recipient(s), comma-separated
     ///   REPORT_LOGIC_APP_URL      — Logic App HTTP trigger URL (includes SAS signature)
     /// </summary>
-    private static async Task SendReviewEmailAsync(
+    private static async Task SendReviewEmailAsync(  // signature updated: claudeComments replaces claudePosted
         string prLink,
         int prId,
         string project,
         string repository,
         List<CodeReviewComment> gptComments,
-        List<CodeReviewComment> claudeComments,
         int filteredToPost,
         List<CodeReviewComment> postedComments,
         int skippedCount,
         DateTime jobStartedAt,
         DateTime jobCompletedAt,
-        ILogger logger)
+        ILogger logger,
+        List<CodeReviewComment>? claudeComments = null,
+        string? gptFailureReason    = null,
+        string? claudeFailureReason = null)
     {
+        claudeComments ??= [];
         var emailTo      = Environment.GetEnvironmentVariable("REPORT_EMAIL_TO")       ?? "";
         var logicAppUrl  = Environment.GetEnvironmentVariable("REPORT_LOGIC_APP_URL")  ?? "";
 
@@ -1443,13 +1488,20 @@ public class CodeReviewController : ControllerBase
             return;
         }
 
-        var subject = postedComments.Count > 0
-            ? $"AI Code Review — PR #{prId} ({project}/{repository}) — {postedComments.Count} comments posted"
-            : $"AI Code Review — PR #{prId} ({project}/{repository}) — no high/critical issues found";
+        var failures = new List<string>();
+        if (gptFailureReason    is not null) failures.Add("GPT FAILED");
+        if (claudeFailureReason is not null) failures.Add("Claude FAILED");
+
+        var subject = failures.Count > 0
+            ? $"AI Code Review — PR #{prId} ({project}/{repository}) — {string.Join(", ", failures)}"
+            : postedComments.Count > 0
+                ? $"AI Code Review — PR #{prId} ({project}/{repository}) — {postedComments.Count} comments posted"
+                : $"AI Code Review — PR #{prId} ({project}/{repository}) — no high/critical issues found";
 
         var html = BuildReviewEmailHtml(prLink, prId, project, repository,
                                         gptComments, claudeComments, filteredToPost,
-                                        postedComments, skippedCount, jobStartedAt, jobCompletedAt);
+                                        postedComments, skippedCount, jobStartedAt, jobCompletedAt,
+                                        gptFailureReason, claudeFailureReason);
         try
         {
             using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
@@ -1476,14 +1528,17 @@ public class CodeReviewController : ControllerBase
         List<CodeReviewComment> postedComments,
         int skippedCount,
         DateTime jobStartedAt,
-        DateTime jobCompletedAt)
+        DateTime jobCompletedAt,
+        string? gptFailureReason    = null,
+        string? claudeFailureReason = null)
     {
         var startedStr         = jobStartedAt.ToString("yyyy-MM-dd HH:mm:ss") + " UTC";
         var completedStr       = jobCompletedAt.ToString("yyyy-MM-dd HH:mm:ss") + " UTC";
         var durationSec        = (int)(jobCompletedAt - jobStartedAt).TotalSeconds;
         var durationStr        = durationSec >= 60 ? $"{durationSec / 60}m {durationSec % 60}s" : $"{durationSec}s";
-        var dualModel          = claudeComments.Count > 0;
-        var modelTag           = dualModel ? "GPT + Claude (union)" : "GPT only";
+        var modelTag           = claudeFailureReason is not null ? "GPT only (Claude FAILED)"
+                               : claudeComments.Count > 0        ? "GPT + Claude (union)"
+                               :                                   "GPT only";
         var notPosted          = Math.Max(0, filteredToPost - postedComments.Count - skippedCount);
         var gptHighComments    = gptComments.Where(c => c.Severity?.ToLower() is "critical" or "high").OrderByDescending(c => c.Confidence).ToList();
         var claudeHighComments = claudeComments.Where(c => c.Severity?.ToLower() is "critical" or "high").OrderByDescending(c => c.Confidence).ToList();
@@ -1500,17 +1555,15 @@ public class CodeReviewController : ControllerBase
                 var conf = $"{c.Confidence * 100:F0}%";
                 var file = System.Web.HttpUtility.HtmlEncode(
                     System.IO.Path.GetFileName(c.FilePath ?? ""));
-                var text = System.Web.HttpUtility.HtmlEncode((c.CommentText ?? "").Length > 120
-                    ? (c.CommentText!)[..120] + "…"
-                    : c.CommentText ?? "");
+                var text = System.Web.HttpUtility.HtmlEncode(c.CommentText ?? "");
                 sb.Append($"""
                     <tr style="border-bottom:1px solid #eaecef">
-                      <td style="padding:6px 8px;white-space:nowrap">
+                      <td style="padding:6px 8px;white-space:nowrap;vertical-align:top">
                         <span style="font-size:10px;font-weight:700;color:{accentColor};background:#ffeef0;padding:2px 5px;border-radius:3px">{sev}</span>
                       </td>
-                      <td style="padding:6px 8px;font-size:11px;color:#586069;white-space:nowrap">{file}:{c.StartLine}</td>
-                      <td style="padding:6px 8px;font-size:12px;color:#24292e">{text}</td>
-                      <td style="padding:6px 8px;font-size:11px;color:#6a737d;white-space:nowrap;text-align:right">{conf}</td>
+                      <td style="padding:6px 8px;font-size:11px;color:#586069;white-space:nowrap;vertical-align:top">{file}:{c.StartLine}</td>
+                      <td style="padding:6px 8px;font-size:12px;color:#24292e;word-wrap:break-word;max-width:500px">{text}</td>
+                      <td style="padding:6px 8px;font-size:11px;color:#6a737d;white-space:nowrap;text-align:right;vertical-align:top">{conf}</td>
                     </tr>
                     """);
             }
@@ -1562,12 +1615,18 @@ public class CodeReviewController : ControllerBase
                 <!-- Stats row -->
                 <div style="display:flex;border-bottom:1px solid #e1e4e8">
                   <div style="flex:1;padding:14px 16px;border-right:1px solid #e1e4e8;text-align:center">
-                    <div style="font-size:22px;font-weight:700;color:#0366d6">{gptComments.Count}</div>
-                    <div style="font-size:11px;color:#586069;margin-top:2px">GPT total</div>
+                    {(gptFailureReason is null
+                        ? $"<div style='font-size:22px;font-weight:700;color:#0366d6'>{gptComments.Count}</div><div style='font-size:11px;color:#586069;margin-top:2px'>GPT total</div>"
+                        : $"<div style='font-size:14px;font-weight:700;color:#d73a49'>FAILED</div><div style='font-size:10px;color:#586069;margin-top:2px;word-break:break-word'>{System.Web.HttpUtility.HtmlEncode(gptFailureReason[..Math.Min(80, gptFailureReason.Length)])}</div>"
+                    )}
                   </div>
                   <div style="flex:1;padding:14px 16px;border-right:1px solid #e1e4e8;text-align:center">
-                    <div style="font-size:22px;font-weight:700;color:#6f42c1">{claudeComments.Count}</div>
-                    <div style="font-size:11px;color:#586069;margin-top:2px">Claude total</div>
+                    {(claudeFailureReason is not null
+                        ? $"<div style='font-size:14px;font-weight:700;color:#d73a49'>FAILED</div><div style='font-size:10px;color:#586069;margin-top:2px;word-break:break-word'>{System.Web.HttpUtility.HtmlEncode(claudeFailureReason[..Math.Min(80, claudeFailureReason.Length)])}</div>"
+                        : claudeComments.Count > 0
+                            ? $"<div style='font-size:22px;font-weight:700;color:#6f42c1'>{claudeComments.Count}</div><div style='font-size:11px;color:#586069;margin-top:2px'>Claude total</div>"
+                            : "<div style='font-size:14px;font-weight:700;color:#6a737d'>—</div><div style='font-size:11px;color:#586069;margin-top:2px'>Claude (disabled)</div>"
+                    )}
                   </div>
                   <div style="flex:1;padding:14px 16px;border-right:1px solid #e1e4e8;text-align:center">
                     <div style="font-size:22px;font-weight:700;color:#d73a49">{filteredToPost}</div>
@@ -1618,17 +1677,22 @@ public class CodeReviewController : ControllerBase
                   <div style="font-size:13px;font-weight:600;color:#6f42c1;margin-bottom:8px">
                     Claude — High/Critical Comments ({claudeHighComments.Count})
                   </div>
-                  <table style="width:100%;border-collapse:collapse;font-size:12px">
+                  {(claudeFailureReason is not null
+                      ? $"<div style='font-size:12px;color:#d73a49;font-weight:700'>FAILED — {System.Web.HttpUtility.HtmlEncode(claudeFailureReason)}</div>"
+                      : claudeComments.Count == 0
+                          ? "<div style='font-size:12px;color:#6a737d'>Claude review was not configured for this run.</div>"
+                          : $@"<table style='width:100%;border-collapse:collapse;font-size:12px'>
                     <thead>
-                      <tr style="background:#f6f8fa;border-bottom:2px solid #e1e4e8">
-                        <th style="padding:6px 8px;text-align:left;color:#586069;font-weight:600">Sev</th>
-                        <th style="padding:6px 8px;text-align:left;color:#586069;font-weight:600">File:Line</th>
-                        <th style="padding:6px 8px;text-align:left;color:#586069;font-weight:600">Comment</th>
-                        <th style="padding:6px 8px;text-align:right;color:#586069;font-weight:600">Conf</th>
+                      <tr style='background:#f6f8fa;border-bottom:2px solid #e1e4e8'>
+                        <th style='padding:6px 8px;text-align:left;color:#586069;font-weight:600'>Sev</th>
+                        <th style='padding:6px 8px;text-align:left;color:#586069;font-weight:600'>File:Line</th>
+                        <th style='padding:6px 8px;text-align:left;color:#586069;font-weight:600'>Comment</th>
+                        <th style='padding:6px 8px;text-align:right;color:#586069;font-weight:600'>Conf</th>
                       </tr>
                     </thead>
                     <tbody>{CommentTable(claudeHighComments, "#6f42c1")}</tbody>
-                  </table>
+                  </table>"
+                  )}
                 </div>
 
                 <!-- Posted to PR -->
@@ -1655,75 +1719,74 @@ public class CodeReviewController : ControllerBase
     /// The server returns immediately with a jobId; the skill runs asynchronously in the background
     /// so the devtunnel proxy never hits its gateway timeout.
     /// </summary>
+    /// <summary>
+    /// Triggers the local Claude /code-review plugin and waits for it to complete.
+    /// Returns the list of comments Claude found. Throws on any failure.
+    /// </summary>
     private async Task<List<CodeReviewComment>> CallLocalClaudeAgentAsync(
         string localAgentUrl, string pullRequestLink, string? adoToken)
     {
         var baseUrl = localAgentUrl.TrimEnd('/');
-        try
+
+        // Submit job
+        var payload = JsonSerializer.Serialize(new { pullRequestLink });
+        var submitReq = new HttpRequestMessage(HttpMethod.Post, $"{baseUrl}/claudeCodeReview")
         {
-            // Step 1 — submit job
-            var payload = JsonSerializer.Serialize(new { pullRequestLink });
-            var submitReq = new HttpRequestMessage(HttpMethod.Post, $"{baseUrl}/claudeCodeReview")
+            Content = new StringContent(payload, Encoding.UTF8, "application/json")
+        };
+        if (!string.IsNullOrWhiteSpace(adoToken))
+            submitReq.Headers.TryAddWithoutValidation("X-Ado-Access-Token", adoToken);
+
+        var submitResp = await _localClaudeHttpClient.SendAsync(submitReq);
+        if (!submitResp.IsSuccessStatusCode)
+            throw new InvalidOperationException($"Claude server returned {(int)submitResp.StatusCode} on submit");
+
+        var submitJson = await submitResp.Content.ReadAsStringAsync();
+        var submitDoc  = JsonDocument.Parse(submitJson);
+        if (!submitDoc.RootElement.TryGetProperty("jobId", out var jobIdEl))
+            throw new InvalidOperationException("Claude server response missing jobId");
+
+        var jobId = jobIdEl.GetString() ?? "";
+        _logger.LogInformation("Local Claude job submitted: {JobId}", jobId);
+
+        // Poll until done (max 22 min — multi-agent plugin runs up to 20 min)
+        var pollUrl      = $"{baseUrl}/claudeCodeReview/{jobId}";
+        var deadline     = DateTime.UtcNow.AddMinutes(22);
+        var pollInterval = TimeSpan.FromSeconds(20);
+
+        while (DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(pollInterval);
+
+            HttpResponseMessage pollResp;
+            try { pollResp = await _localClaudeHttpClient.SendAsync(new HttpRequestMessage(HttpMethod.Get, pollUrl)); }
+            catch (Exception ex) { _logger.LogWarning("Claude poll error: {E}", ex.Message); continue; }
+
+            if (pollResp.StatusCode == System.Net.HttpStatusCode.Accepted)
+                continue; // still pending
+
+            if (!pollResp.IsSuccessStatusCode)
             {
-                Content = new StringContent(payload, Encoding.UTF8, "application/json")
-            };
-            if (!string.IsNullOrWhiteSpace(adoToken))
-                submitReq.Headers.TryAddWithoutValidation("X-Ado-Access-Token", adoToken);
-
-            var submitResp = await _localClaudeHttpClient.SendAsync(submitReq);
-            if (!submitResp.IsSuccessStatusCode)
-            {
-                _logger.LogWarning("Local Claude agent returned {Status} on submit", submitResp.StatusCode);
-                return [];
-            }
-
-            var submitJson = await submitResp.Content.ReadAsStringAsync();
-            var submitDoc  = JsonDocument.Parse(submitJson);
-            if (!submitDoc.RootElement.TryGetProperty("jobId", out var jobIdEl))
-            {
-                // Older server returning comments directly — parse inline
-                return ParseClaudeComments(submitDoc.RootElement);
-            }
-            var jobId = jobIdEl.GetString() ?? "";
-            _logger.LogInformation("Local Claude job submitted: {JobId}", jobId);
-
-            // Step 2 — poll until done (max 12 min, 20-second intervals)
-            var pollUrl     = $"{baseUrl}/claudeCodeReview/{jobId}";
-            var deadline    = DateTime.UtcNow.AddMinutes(12);
-            var pollInterval = TimeSpan.FromSeconds(20);
-
-            while (DateTime.UtcNow < deadline)
-            {
-                await Task.Delay(pollInterval);
-
-                HttpResponseMessage pollResp;
-                try { pollResp = await _localClaudeHttpClient.SendAsync(new HttpRequestMessage(HttpMethod.Get, pollUrl)); }
-                catch (Exception ex) { _logger.LogWarning("Poll error: {E}", ex.Message); continue; }
-
-                if (pollResp.StatusCode == System.Net.HttpStatusCode.Accepted)
-                    continue; // still pending
-
-                if (!pollResp.IsSuccessStatusCode)
+                var errBody = await pollResp.Content.ReadAsStringAsync();
+                var errMsg  = $"HTTP {(int)pollResp.StatusCode}";
+                try
                 {
-                    _logger.LogWarning("Local Claude agent poll returned {Status}", pollResp.StatusCode);
-                    return [];
+                    var errDoc = JsonDocument.Parse(errBody);
+                    if (errDoc.RootElement.TryGetProperty("error", out var e))
+                        errMsg = e.GetString() ?? errMsg;
                 }
-
-                var pollJson = await pollResp.Content.ReadAsStringAsync();
-                var pollDoc  = JsonDocument.Parse(pollJson);
-                var comments = ParseClaudeComments(pollDoc.RootElement);
-                _logger.LogInformation("Local Claude agent returned {Count} comments", comments.Count);
-                return comments;
+                catch { /* ignore parse errors */ }
+                throw new InvalidOperationException($"Claude review failed: {errMsg}");
             }
 
-            _logger.LogWarning("Local Claude agent timed out after 12 min. Proceeding with GPT-4 only.");
-            return [];
+            var pollJson = await pollResp.Content.ReadAsStringAsync();
+            var pollDoc  = JsonDocument.Parse(pollJson);
+            var comments = ParseClaudeComments(pollDoc.RootElement);
+            _logger.LogInformation("Local Claude agent returned {Count} comment(s)", comments.Count);
+            return comments;
         }
-        catch (Exception ex)
-        {
-            _logger.LogWarning("Local Claude agent call failed — {Error}. Proceeding with GPT-4 only.", ex.Message);
-            return [];
-        }
+
+        throw new TimeoutException("Claude /code-review plugin timed out after 22 min");
     }
 
     private static List<CodeReviewComment> ParseClaudeComments(JsonElement root)
@@ -1773,6 +1836,30 @@ public class CodeReviewController : ControllerBase
             return false;
         var severity = comment.Severity?.Trim().ToLowerInvariant();
         return severity is "critical" or "high";
+    }
+
+    /// <summary>
+    /// Returns true if the PR author is in the PR_AUTHOR_BLOCKLIST env var (comma-separated emails).
+    /// </summary>
+    private bool IsAuthorBlocked(PullRequest pullRequest)
+    {
+        var blocklist = Environment.GetEnvironmentVariable("PR_AUTHOR_BLOCKLIST");
+        if (string.IsNullOrWhiteSpace(blocklist)) return false;
+
+        var authorEmail = pullRequest.CreatedBy?.UniqueName?.Trim().ToLowerInvariant() ?? string.Empty;
+        if (string.IsNullOrWhiteSpace(authorEmail)) return false;
+
+        foreach (var entry in blocklist.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (string.Equals(entry.ToLowerInvariant(), authorEmail, StringComparison.Ordinal))
+            {
+                _logger.LogInformation(
+                    "PR {PullRequestId} by '{Author}' is on the author blocklist — skipping review",
+                    pullRequest.Id, pullRequest.CreatedBy?.UniqueName);
+                return true;
+            }
+        }
+        return false;
     }
 
     private static CodeReviewComment CloneComment(CodeReviewComment comment)
@@ -2002,6 +2089,17 @@ public class CodeReviewController : ControllerBase
     {
         var metrics = _feedbackService.GetMetrics();
         return Ok(metrics);
+    }
+
+    /// <summary>
+    /// Returns aggregated stats for the dashboard.
+    /// GET /api/codereview/dashboard/stats
+    /// </summary>
+    [HttpGet("dashboard/stats")]
+    public IActionResult GetDashboardStats()
+    {
+        var stats = _feedbackService.GetDashboardStats();
+        return Ok(stats);
     }
 
     /// <summary>
@@ -2291,6 +2389,8 @@ public class ReviewByLinkAndPostJobStatus
     public bool IsDraft { get; set; } = false;
     public string Status { get; set; } = string.Empty;
     public string? Error { get; set; }
+    public string? GptFailureReason { get; set; }
+    public string? ClaudeFailureReason { get; set; }
     public DateTime StartedAtUtc { get; set; }
     public DateTime? CompletedAtUtc { get; set; }
     public int TotalComments { get; set; }

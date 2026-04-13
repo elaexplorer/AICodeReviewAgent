@@ -43,23 +43,37 @@ public class RagAutoIndexHostedService : BackgroundService
         // Write git credentials so clone can authenticate in a headless container (no TTY)
         ConfigureGitCredentials(_adoConfig.PersonalAccessToken);
 
-        _logger.LogInformation("RAG auto-index: starting background indexing for {Count} repo(s)", _targets.Count);
+        // Refresh interval: default 2 hours, overridable via RAG_REFRESH_INTERVAL_MINUTES
+        var intervalMinutes = int.TryParse(
+            Environment.GetEnvironmentVariable("RAG_REFRESH_INTERVAL_MINUTES"), out var m) && m > 0 ? m : 120;
+        var refreshInterval = TimeSpan.FromMinutes(intervalMinutes);
+        _logger.LogInformation("RAG auto-index: refresh interval = {Minutes} min", intervalMinutes);
+
+        using var timer = new PeriodicTimer(refreshInterval);
+
+        // Run immediately on startup, then repeat on schedule
+        bool firstRun = true;
+        do
+        {
+            if (!firstRun)
+                _logger.LogInformation("RAG auto-index: periodic refresh triggered");
+
+            await RefreshAllTargetsAsync(stoppingToken);
+            firstRun = false;
+        }
+        while (await timer.WaitForNextTickAsync(stoppingToken));
+    }
+
+    private async Task RefreshAllTargetsAsync(CancellationToken stoppingToken)
+    {
+        _logger.LogInformation("RAG auto-index: starting refresh for {Count} repo(s)", _targets.Count);
 
         foreach (var target in _targets)
         {
             if (stoppingToken.IsCancellationRequested) break;
 
-            if (_codebaseContextService.IsRepositoryIndexed(target.Repository))
-            {
-                _logger.LogInformation(
-                    "RAG auto-index: {Repository} already indexed ({Chunks} chunks) — skipping",
-                    target.Repository,
-                    _codebaseContextService.GetChunkCount(target.Repository));
-                continue;
-            }
-
             _logger.LogInformation(
-                "RAG auto-index: indexing {Project}/{Repository} @ {Branch}",
+                "RAG auto-index: refreshing {Project}/{Repository} @ {Branch}",
                 target.Project, target.Repository, target.Branch);
 
             try
@@ -72,7 +86,7 @@ public class RagAutoIndexHostedService : BackgroundService
                     accessTokenOverride: _adoConfig.PersonalAccessToken);
 
                 _logger.LogInformation(
-                    "RAG auto-index: {Repository} ready — {Result}",
+                    "RAG auto-index: {Repository} — {Result}",
                     target.Repository,
                     result switch
                     {
@@ -84,12 +98,12 @@ public class RagAutoIndexHostedService : BackgroundService
             catch (Exception ex)
             {
                 _logger.LogError(ex,
-                    "RAG auto-index: failed to index {Project}/{Repository}",
+                    "RAG auto-index: failed to refresh {Project}/{Repository}",
                     target.Project, target.Repository);
             }
         }
 
-        _logger.LogInformation("RAG auto-index: completed");
+        _logger.LogInformation("RAG auto-index: refresh cycle complete");
     }
 
     private static List<AutoIndexTarget> ParseTargets(string? raw)

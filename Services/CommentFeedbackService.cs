@@ -11,75 +11,93 @@ public class CommentFeedbackService
 {
     private readonly string _dbPath;
     private readonly ILogger<CommentFeedbackService> _logger;
+    // Set to false when InitDb cannot open the DB; all public methods no-op in degraded mode.
+    private bool _dbAvailable;
 
     public CommentFeedbackService(ILogger<CommentFeedbackService> logger)
     {
-        var dir = Path.Combine(Path.GetTempPath(), "code-review-agent");
+        // Prefer the persistent file share mount so data survives container restarts/redeployments.
+        // Falls back to /tmp only for local development.
+        var mountRoot = Environment.GetEnvironmentVariable("RagRuntime__TempReposRootPath");
+        var dir = !string.IsNullOrWhiteSpace(mountRoot)
+            ? Path.Combine(mountRoot, "code-review-agent")
+            : Path.Combine(Path.GetTempPath(), "code-review-agent");
         Directory.CreateDirectory(dir);
         _dbPath = Path.Combine(dir, "feedback.db");
         _logger = logger;
+        _logger.LogInformation("CommentFeedbackService: SQLite DB at {DbPath}", _dbPath);
         InitDb();
     }
 
     private void InitDb()
     {
-        using var conn = Open();
-        using var cmd = conn.CreateCommand();
-        cmd.CommandText = """
-            CREATE TABLE IF NOT EXISTS feedback (
-                comment_id   TEXT    NOT NULL,
-                pr_id        INTEGER NOT NULL,
-                project      TEXT    NOT NULL,
-                repository   TEXT    NOT NULL,
-                file_path    TEXT    NOT NULL,
-                severity     TEXT    NOT NULL,
-                comment_type TEXT    NOT NULL,
-                is_helpful   INTEGER NOT NULL,   -- 1 = helpful, 0 = not helpful
-                recorded_at  TEXT    NOT NULL,
-                PRIMARY KEY (comment_id, is_helpful)
-            );
-            CREATE TABLE IF NOT EXISTS resolution (
-                comment_id  TEXT NOT NULL PRIMARY KEY,
-                pr_id       INTEGER NOT NULL,
-                project     TEXT NOT NULL,
-                repository  TEXT NOT NULL,
-                thread_id   INTEGER NOT NULL,
-                status      TEXT NOT NULL,   -- active | fixed | wontFix | byDesign | closed | pending
-                synced_at   TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS review_jobs (
-                job_id         TEXT    NOT NULL PRIMARY KEY,
-                pr_id          INTEGER NOT NULL,
-                pr_url         TEXT    NOT NULL,
-                project        TEXT    NOT NULL,
-                repository     TEXT    NOT NULL,
-                reviewed_at    TEXT    NOT NULL,
-                gpt_total      INTEGER NOT NULL DEFAULT 0,
-                gpt_high       INTEGER NOT NULL DEFAULT 0,
-                claude_total   INTEGER NOT NULL DEFAULT 0,
-                claude_high    INTEGER NOT NULL DEFAULT 0,
-                posted_count   INTEGER NOT NULL DEFAULT 0,
-                skipped_count  INTEGER NOT NULL DEFAULT 0,
-                model_tag      TEXT    NOT NULL DEFAULT ''
-            );
-            CREATE TABLE IF NOT EXISTS posted_threads (
-                thread_id    INTEGER NOT NULL,
-                job_id       TEXT    NOT NULL,
-                pr_id        INTEGER NOT NULL,
-                project      TEXT    NOT NULL,
-                repository   TEXT    NOT NULL,
-                file_path    TEXT    NOT NULL,
-                start_line   INTEGER NOT NULL,
-                severity     TEXT    NOT NULL,
-                comment_type TEXT    NOT NULL,
-                source_model TEXT    NOT NULL DEFAULT 'gpt',
-                posted_at    TEXT    NOT NULL,
-                PRIMARY KEY (thread_id, pr_id, project, repository)
-            );
-            CREATE INDEX IF NOT EXISTS idx_review_jobs_date ON review_jobs(reviewed_at);
-            CREATE INDEX IF NOT EXISTS idx_posted_threads_pr ON posted_threads(pr_id, project, repository);
-            """;
-        cmd.ExecuteNonQuery();
+        try
+        {
+            using var conn = OpenRaw();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = """
+                CREATE TABLE IF NOT EXISTS feedback (
+                    comment_id   TEXT    NOT NULL,
+                    pr_id        INTEGER NOT NULL,
+                    project      TEXT    NOT NULL,
+                    repository   TEXT    NOT NULL,
+                    file_path    TEXT    NOT NULL,
+                    severity     TEXT    NOT NULL,
+                    comment_type TEXT    NOT NULL,
+                    is_helpful   INTEGER NOT NULL,   -- 1 = helpful, 0 = not helpful
+                    recorded_at  TEXT    NOT NULL,
+                    PRIMARY KEY (comment_id, is_helpful)
+                );
+                CREATE TABLE IF NOT EXISTS resolution (
+                    comment_id  TEXT NOT NULL PRIMARY KEY,
+                    pr_id       INTEGER NOT NULL,
+                    project     TEXT NOT NULL,
+                    repository  TEXT NOT NULL,
+                    thread_id   INTEGER NOT NULL,
+                    status      TEXT NOT NULL,   -- active | fixed | wontFix | byDesign | closed | pending
+                    synced_at   TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS review_jobs (
+                    job_id         TEXT    NOT NULL PRIMARY KEY,
+                    pr_id          INTEGER NOT NULL,
+                    pr_url         TEXT    NOT NULL,
+                    project        TEXT    NOT NULL,
+                    repository     TEXT    NOT NULL,
+                    reviewed_at    TEXT    NOT NULL,
+                    gpt_total      INTEGER NOT NULL DEFAULT 0,
+                    gpt_high       INTEGER NOT NULL DEFAULT 0,
+                    claude_total   INTEGER NOT NULL DEFAULT 0,
+                    claude_high    INTEGER NOT NULL DEFAULT 0,
+                    posted_count   INTEGER NOT NULL DEFAULT 0,
+                    skipped_count  INTEGER NOT NULL DEFAULT 0,
+                    model_tag      TEXT    NOT NULL DEFAULT ''
+                );
+                CREATE TABLE IF NOT EXISTS posted_threads (
+                    thread_id    INTEGER NOT NULL,
+                    job_id       TEXT    NOT NULL,
+                    pr_id        INTEGER NOT NULL,
+                    project      TEXT    NOT NULL,
+                    repository   TEXT    NOT NULL,
+                    file_path    TEXT    NOT NULL,
+                    start_line   INTEGER NOT NULL,
+                    severity     TEXT    NOT NULL,
+                    comment_type TEXT    NOT NULL,
+                    source_model TEXT    NOT NULL DEFAULT 'gpt',
+                    posted_at    TEXT    NOT NULL,
+                    PRIMARY KEY (thread_id, pr_id, project, repository)
+                );
+                CREATE INDEX IF NOT EXISTS idx_review_jobs_date ON review_jobs(reviewed_at);
+                CREATE INDEX IF NOT EXISTS idx_posted_threads_pr ON posted_threads(pr_id, project, repository);
+                """;
+            cmd.ExecuteNonQuery();
+            _dbAvailable = true;
+            _logger.LogInformation("CommentFeedbackService: DB initialized at {DbPath}", _dbPath);
+        }
+        catch (Exception ex)
+        {
+            _dbAvailable = false;
+            _logger.LogError(ex, "CommentFeedbackService: DB init failed; feedback metrics unavailable (degraded mode)");
+        }
     }
 
     public async Task RecordAsync(
@@ -92,6 +110,7 @@ public class CommentFeedbackService
         string commentType,
         bool isHelpful)
     {
+        if (!_dbAvailable) return;
         await Task.Run(() =>
         {
             using var conn = Open();
@@ -126,6 +145,7 @@ public class CommentFeedbackService
         int prId,
         List<AgentThreadStatus> statuses)
     {
+        if (!_dbAvailable) return 0;
         var count = 0;
         await Task.Run(() =>
         {
@@ -158,6 +178,7 @@ public class CommentFeedbackService
 
     public async Task RecordJobAsync(ReviewJobRecord job)
     {
+        if (!_dbAvailable) return;
         await Task.Run(() =>
         {
             using var conn = Open();
@@ -194,6 +215,7 @@ public class CommentFeedbackService
         string jobId, int prId, string project, string repository,
         List<PostedThreadRecord> threads)
     {
+        if (!_dbAvailable) return;
         await Task.Run(() =>
         {
             using var conn = Open();
@@ -232,6 +254,7 @@ public class CommentFeedbackService
         string project, string repository, int prId,
         Func<string, string, int, Task<List<AgentThreadStatus>>> fetchStatusesFromAdo)
     {
+        if (!_dbAvailable) return 0;
         // Collect all thread IDs we posted for this PR
         var tracked = await Task.Run(() =>
         {
@@ -272,6 +295,7 @@ public class CommentFeedbackService
 
     public List<DailyReportRow> GetTodayJobs(DateTimeOffset? forDate = null)
     {
+        if (!_dbAvailable) return [];
         var date = (forDate ?? DateTimeOffset.UtcNow).ToString("yyyy-MM-dd");
         var rows = new List<DailyReportRow>();
 
@@ -323,6 +347,7 @@ public class CommentFeedbackService
 
     public CommentFeedbackMetrics GetMetrics()
     {
+        if (!_dbAvailable) return new CommentFeedbackMetrics();
         using var conn = Open();
 
         var metrics = new CommentFeedbackMetrics();
@@ -454,9 +479,206 @@ public class CommentFeedbackService
         return metrics;
     }
 
+    /// <summary>
+    /// Returns distinct PRs that have posted threads where at least one thread is still in a
+    /// non-terminal state (active/pending) OR has never been synced.
+    /// Excludes PRs whose threads were all last synced within <paramref name="staleAfter"/>.
+    /// </summary>
+    public DashboardStats GetDashboardStats()
+    {
+        if (!_dbAvailable) return new DashboardStats();
+
+        var stats = new DashboardStats();
+        using var conn = Open();
+
+        // Totals from review_jobs
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = """
+                SELECT
+                    COUNT(DISTINCT pr_id)  AS prs,
+                    COALESCE(SUM(gpt_high),    0) AS gpt_critical,
+                    COALESCE(SUM(claude_high), 0) AS claude_critical,
+                    COALESCE(SUM(posted_count),0) AS total_posted
+                FROM review_jobs;
+                """;
+            using var r = cmd.ExecuteReader();
+            if (r.Read())
+            {
+                stats.TotalPrsReviewed   = r.GetInt32(0);
+                stats.GptCriticalPosted  = r.GetInt32(1);
+                stats.ClaudeCriticalPosted = r.GetInt32(2);
+                stats.TotalCommentsPosted = r.GetInt32(3);
+            }
+        }
+
+        // Comments by model from posted_threads
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = """
+                SELECT source_model, COUNT(*) FROM posted_threads GROUP BY source_model;
+                """;
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+            {
+                var model = r.GetString(0);
+                var cnt   = r.GetInt32(1);
+                if (model == "gpt")     stats.GptCommentsPosted    = cnt;
+                else if (model == "claude") stats.ClaudeCommentsPosted = cnt;
+            }
+        }
+
+        // Severity breakdown of posted comments
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = """
+                SELECT severity, COUNT(*) FROM posted_threads GROUP BY severity;
+                """;
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                stats.SeverityBreakdown[r.GetString(0)] = r.GetInt32(1);
+        }
+
+        // Resolution status breakdown
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = """
+                SELECT status, COUNT(*) FROM resolution GROUP BY status;
+                """;
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                stats.ResolutionByStatus[r.GetString(0)] = r.GetInt32(1);
+        }
+
+        // Helpful feedback totals
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = """
+                SELECT
+                    COALESCE(SUM(CASE WHEN is_helpful=1 THEN 1 ELSE 0 END),0),
+                    COALESCE(SUM(CASE WHEN is_helpful=0 THEN 1 ELSE 0 END),0)
+                FROM feedback;
+                """;
+            using var r = cmd.ExecuteReader();
+            if (r.Read())
+            {
+                stats.HelpfulFeedback    = r.GetInt32(0);
+                stats.NotHelpfulFeedback = r.GetInt32(1);
+            }
+        }
+
+        // PRs reviewed per day (last 30 days)
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = """
+                SELECT DATE(reviewed_at) AS day, COUNT(DISTINCT pr_id) AS cnt
+                FROM review_jobs
+                WHERE reviewed_at >= datetime('now','-30 days')
+                GROUP BY day
+                ORDER BY day;
+                """;
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                stats.PrsPerDay.Add(new DailyCount { Day = r.GetString(0), Count = r.GetInt32(1) });
+        }
+
+        // Recent PRs (last 30 reviews)
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = """
+                SELECT j.pr_id, j.pr_url, j.repository, j.reviewed_at,
+                       j.gpt_high, j.claude_high, j.posted_count,
+                       COALESCE(SUM(CASE WHEN r.status='fixed'   THEN 1 ELSE 0 END),0) AS accepted,
+                       COALESCE(SUM(CASE WHEN r.status IN ('wontFix','byDesign','closed') THEN 1 ELSE 0 END),0) AS rejected,
+                       COALESCE(SUM(CASE WHEN r.status='active'  THEN 1 ELSE 0 END),0) AS still_open
+                FROM review_jobs j
+                LEFT JOIN posted_threads pt ON pt.job_id=j.job_id
+                LEFT JOIN resolution r ON r.thread_id=pt.thread_id
+                    AND r.project=j.project AND r.repository=j.repository
+                GROUP BY j.job_id
+                ORDER BY j.reviewed_at DESC
+                LIMIT 30;
+                """;
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+            {
+                stats.RecentPrs.Add(new RecentPrRow
+                {
+                    PrId        = r.GetInt32(0),
+                    PrUrl       = r.GetString(1),
+                    Repository  = r.GetString(2),
+                    ReviewedAt  = r.GetString(3),
+                    GptCritical = r.GetInt32(4),
+                    ClaudeCritical = r.GetInt32(5),
+                    PostedCount = r.GetInt32(6),
+                    Accepted    = r.GetInt32(7),
+                    Rejected    = r.GetInt32(8),
+                    StillOpen   = r.GetInt32(9),
+                });
+            }
+        }
+
+        return stats;
+    }
+
+    public List<(string Project, string Repository, int PrId)> GetPrsNeedingSync(TimeSpan staleAfter)
+    {
+        if (!_dbAvailable) return [];
+        var cutoff = DateTime.UtcNow.Subtract(staleAfter).ToString("o");
+        var results = new List<(string, string, int)>();
+        using var conn = Open();
+        using var cmd  = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT DISTINCT pt.project, pt.repository, pt.pr_id
+            FROM posted_threads pt
+            WHERE EXISTS (
+                SELECT 1 FROM posted_threads pt2
+                WHERE pt2.pr_id=pt.pr_id AND pt2.project=pt.project AND pt2.repository=pt.repository
+                  AND (
+                    -- thread has never been synced
+                    NOT EXISTS (SELECT 1 FROM resolution r
+                                WHERE r.thread_id=pt2.thread_id
+                                  AND r.project=pt2.project AND r.repository=pt2.repository)
+                    OR
+                    -- thread is in a non-terminal state and stale
+                    EXISTS (SELECT 1 FROM resolution r
+                            WHERE r.thread_id=pt2.thread_id
+                              AND r.project=pt2.project AND r.repository=pt2.repository
+                              AND r.status IN ('active','pending')
+                              AND r.synced_at < $cutoff)
+                  )
+            )
+            ORDER BY pt.pr_id DESC
+            LIMIT 200;
+            """;
+        cmd.Parameters.AddWithValue("$cutoff", cutoff);
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            results.Add((reader.GetString(0), reader.GetString(1), reader.GetInt32(2)));
+        return results;
+    }
+
     private SqliteConnection Open()
     {
-        var conn = new SqliteConnection($"Data Source={_dbPath}");
+        if (!_dbAvailable)
+            throw new InvalidOperationException("CommentFeedbackService is in degraded mode — DB unavailable");
+        return OpenRaw();
+    }
+
+    /// <summary>
+    /// Opens a SQLite connection without the _dbAvailable guard.
+    /// Used by InitDb() before _dbAvailable is set to true.
+    /// </summary>
+    private SqliteConnection OpenRaw()
+    {
+        // Azure Files (SMB) on Linux does not support the POSIX fcntl() advisory locks that
+        // SQLite uses by default.  Every lock acquisition blocks for busy_timeout ms and then
+        // fails with SQLITE_BUSY.  Using nolock=1 disables SQLite's file-locking protocol
+        // entirely — safe here because we only ever have ONE container replica writing to this DB.
+        // Pooling=false ensures each Dispose() truly closes the underlying file handle instead
+        // of returning it to the connection pool (which would keep stale handles open).
+        var connStr = $"Data Source=file://{_dbPath}?nolock=1;Pooling=false";
+        var conn = new SqliteConnection(connStr);
         conn.Open();
         return conn;
     }
@@ -564,4 +786,40 @@ public class DailyReportRow
     public int    Rejected     { get; set; }
     public int    Active       { get; set; }
     public int    TotalThreads { get; set; }
+}
+
+public class DashboardStats
+{
+    public int TotalPrsReviewed      { get; set; }
+    public int TotalCommentsPosted   { get; set; }
+    public int GptCommentsPosted     { get; set; }
+    public int ClaudeCommentsPosted  { get; set; }
+    public int GptCriticalPosted     { get; set; }
+    public int ClaudeCriticalPosted  { get; set; }
+    public int HelpfulFeedback       { get; set; }
+    public int NotHelpfulFeedback    { get; set; }
+    public Dictionary<string, int> ResolutionByStatus { get; set; } = new();
+    public Dictionary<string, int> SeverityBreakdown  { get; set; } = new();
+    public List<DailyCount>  PrsPerDay  { get; set; } = new();
+    public List<RecentPrRow> RecentPrs  { get; set; } = new();
+}
+
+public class DailyCount
+{
+    public string Day   { get; set; } = string.Empty;
+    public int    Count { get; set; }
+}
+
+public class RecentPrRow
+{
+    public int    PrId          { get; set; }
+    public string PrUrl         { get; set; } = string.Empty;
+    public string Repository    { get; set; } = string.Empty;
+    public string ReviewedAt    { get; set; } = string.Empty;
+    public int    GptCritical   { get; set; }
+    public int    ClaudeCritical { get; set; }
+    public int    PostedCount   { get; set; }
+    public int    Accepted      { get; set; }
+    public int    Rejected      { get; set; }
+    public int    StillOpen     { get; set; }
 }

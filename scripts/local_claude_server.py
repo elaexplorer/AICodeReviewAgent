@@ -11,22 +11,28 @@ Exposes a local HTTP endpoint that the cloud code review agent calls to get
 Claude's review comments for a PR.
 
 When called, it:
-  1. Ensures the ADO repo is cloned/updated locally (for CLAUDE.md context)
-  2. Checks out the PR source branch
-  3. Invokes the code-review:code-review Claude skill with 5 parallel agents
-     (CLAUDE.md compliance, bugs, git history, previous PRs, code comments)
-  4. Instructs the skill to return JSON instead of posting to ADO
+  1. Clones / updates the waimea ADO repo locally into .repo_cache/
+  2. Checks out the PR source branch (so CLAUDE.md reflects the PR state)
+  3. Invokes the installed /code-review Claude plugin from that directory
+     — this runs the full multi-agent flow: haiku gating, CLAUDE.md compliance
+       via Sonnet×2, bug detection via Opus×2, plus validation agents
+     — the plugin adapts to ADO: gh CLI calls fail gracefully and Claude
+       falls back to the globally configured ADO MCP tools
+     — invoked WITHOUT --comment so step 7 stops before posting any threads
+     — only read-only ADO MCP tools are listed in --allowedTools as a second
+       safety layer to prevent accidental comment creation
+  4. Parses the plugin's terminal output into structured JSON via a fast
+     secondary Haiku call
   5. Returns the JSON comment list to the cloud agent
 
-The cloud agent intersects these with its GPT-4/5 comments and only posts
-comments flagged by BOTH models.
+The cloud agent then posts the union of high/critical comments from both
+GPT-4 (container) and Claude (this server) to the ADO PR.
 
 Usage:
-  pip install flask
+  pip install flask requests
   python scripts/local_claude_server.py              # port 5010
 
 Expose via tunnel so the cloud agent can reach it:
-  ngrok http 5010
   devtunnel host -p 5010 --allow-anonymous
 
 Set on the container app:
@@ -39,7 +45,6 @@ import argparse
 import json
 import os
 import subprocess
-import textwrap
 import threading
 import uuid
 from pathlib import Path
@@ -96,109 +101,6 @@ def get_pr_metadata(pat: str, pr_id: int) -> dict:
     r = _requests.get(url, headers=ado_headers(pat), timeout=30)
     r.raise_for_status()
     return r.json()
-
-
-def get_pr_changed_files(pat: str, pr_id: int) -> list[dict]:
-    """Return list of changed files with their paths and change types."""
-    url = (f"https://dev.azure.com/{ADO_ORGANIZATION}/{ADO_PROJECT}/_apis/"
-           f"git/repositories/{ADO_REPOSITORY}/pullRequests/{pr_id}/iterations?api-version=7.0")
-    r = _requests.get(url, headers=ado_headers(pat), timeout=30)
-    r.raise_for_status()
-    iterations = r.json().get("value", [])
-    if not iterations:
-        return []
-    latest_iter = iterations[-1]["id"]
-
-    url2 = (f"https://dev.azure.com/{ADO_ORGANIZATION}/{ADO_PROJECT}/_apis/"
-            f"git/repositories/{ADO_REPOSITORY}/pullRequests/{pr_id}"
-            f"/iterations/{latest_iter}/changes?api-version=7.0")
-    r2 = _requests.get(url2, headers=ado_headers(pat), timeout=30)
-    r2.raise_for_status()
-    changes = r2.json().get("changeEntries", [])
-    return [
-        {
-            "path":       c["item"]["path"],
-            "changeType": c.get("changeType", "edit"),
-        }
-        for c in changes
-        if "path" in c.get("item", {})
-    ]
-
-
-def get_file_content_at_commit(pat: str, path: str, commit_id: str) -> str:
-    """Fetch raw file content at a specific commit. Returns empty string on error."""
-    url = (f"https://dev.azure.com/{ADO_ORGANIZATION}/{ADO_PROJECT}/_apis/"
-           f"git/repositories/{ADO_REPOSITORY}/items"
-           f"?path={path}&versionDescriptor.version={commit_id}&versionDescriptor.versionType=commit"
-           f"&$format=text&api-version=7.0")
-    try:
-        r = _requests.get(url, headers=ado_headers(pat), timeout=20)
-        if r.status_code == 200:
-            return r.text
-    except Exception:
-        pass
-    return ""
-
-
-def build_pr_context(pat: str, pr: dict, changed_files: list[dict], max_files: int = 30) -> str:
-    """
-    Build a text block with PR metadata and the content of each changed file
-    at the source commit. Files are included in full up to MAX_FILE_BYTES;
-    total content is capped at MAX_TOTAL_BYTES so the prompt stays tractable.
-    Skipped/deleted files are listed but content is not fetched.
-    """
-    source_commit = pr.get("lastMergeSourceCommit", {}).get("commitId", "")
-    title         = pr.get("title", "")
-    description   = (pr.get("description") or "")[:800]
-
-    lines = [
-        f"## Pull Request: {title}",
-        f"Description: {description}",
-        f"Changed files ({len(changed_files)} total):",
-    ]
-    for f in changed_files:
-        lines.append(f"  [{f['changeType']}] {f['path']}")
-    lines.append("")
-
-    MAX_FILE_BYTES  = 6_000   # ~1500 tokens per file
-    MAX_TOTAL_BYTES = 40_000  # ~10K tokens total — keeps Claude well within timeout
-
-    shown = 0
-    total_bytes = len("\n".join(lines))
-
-    # Only include real source code files, skip lock/yaml/config/docs
-    code_exts = {".rs", ".cs", ".py", ".go", ".ts", ".js", ".cpp", ".c", ".h", ".md"}
-    skip_names = {"Cargo.lock", "package-lock.json", "yarn.lock"}
-
-    eligible = [
-        f for f in changed_files
-        if f.get("path")
-        and f["changeType"] != "delete"
-        and any(f["path"].endswith(e) for e in code_exts)
-        and not any(f["path"].endswith(s) for s in skip_names)
-    ]
-
-    # Added files first (new code most likely to have bugs), then edits
-    sorted_files = sorted(eligible, key=lambda f: (0 if f["changeType"] == "add" else 1, f["path"]))
-
-    for f in sorted_files[:max_files]:
-        path   = f["path"]
-        change = f["changeType"]
-
-        content = get_file_content_at_commit(pat, path, source_commit) if source_commit else ""
-        if not content:
-            continue
-
-        content = content[:MAX_FILE_BYTES]
-        block = f"\n### {path} [{change}]\n```\n{content}\n```\n"
-        total_bytes += len(block)
-        if total_bytes > MAX_TOTAL_BYTES:
-            lines.append(f"\n[... content truncated at {shown} files, {total_bytes // 1024} KB total ...]")
-            break
-        lines.append(block)
-        shown += 1
-
-    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -260,147 +162,128 @@ def checkout_pr_branch(repo_dir: Path, pr: dict):
 
 
 # ---------------------------------------------------------------------------
-# Claude review invocation
+# Claude /code-review plugin invocation
 # ---------------------------------------------------------------------------
 
-# Prompt template — PR diff context is injected by Python before calling Claude.
-# No MCP needed: diffs are fetched by the server and passed directly.
-REVIEW_PROMPT = textwrap.dedent("""
-    You are a senior code reviewer. Review the following pull request diff and return a JSON array of issues.
-
-    {pr_context}
-
-    Focus on:
-    - Runtime panics, crashes, or process-terminating assertions on reachable paths
-    - Data races, concurrency bugs
-    - Security vulnerabilities (injection, auth bypass, credential exposure)
-    - Breaking API / ABI changes visible to external callers
-    - Correctness bugs: wrong logic, missing error handling on failure paths
-    - Incomplete migrations where one file was changed but a dependent file was not
-
-    Scoring rules:
-    - Only include issues with confidence >= 0.85
-    - "critical": will cause a production outage or security breach
-    - "high": likely causes incorrect behaviour or crashes under realistic conditions
-    - "medium": meaningful code quality issue but not immediately dangerous
-    - "low": minor style or nitpick
-
-    Return ONLY a raw JSON array — no prose, no markdown fences, nothing else.
-    Each element must have exactly these fields:
-    {{
-      "filePath":    "/path/to/file",
-      "startLine":   42,
-      "endLine":     42,
-      "severity":    "critical" | "high" | "medium" | "low",
-      "commentType": "issue" | "suggestion",
-      "commentText": "Clear, specific description referencing the actual code",
-      "suggestedFix": "Concrete fix, or empty string",
-      "confidence":  0.0-1.0
-    }}
-
-    Return [] if no significant issues survive the confidence filter.
-""").strip()
+# Appended to the /code-review prompt so Claude emits a parseable JSON array
+# at the end of its step-7 terminal output instead of prose only.
+_JSON_SUFFIX = (
+    "\n\nAfter completing your review findings (step 7), append a raw JSON array "
+    "at the very end of your response — no prose after it. "
+    "Each item must have exactly these fields:\n"
+    '{"filePath":"/path/to/file","startLine":1,"endLine":1,'
+    '"severity":"critical|high|medium|low","commentType":"issue",'
+    '"commentText":"description","suggestedFix":"fix or empty","confidence":0.9}\n'
+    "Return [] if no issues were found."
+)
 
 
-def run_skill_review(pr_link: str, repo_dir: Path, pat: str = "", pr: dict | None = None) -> list[dict]:
+def run_plugin_review(pr_link: str, repo_dir: Path, pat: str = "") -> list[dict]:
     """
-    Fetch PR diffs via ADO REST (no MCP), build context, and send to Claude.
-    Claude runs as a stateless subprocess with the diff embedded in the prompt.
+    Invoke the /code-review Claude plugin from the waimea repo checkout.
+
+    No --comment flag: Claude runs the full multi-agent flow (haiku gating,
+    CLAUDE.md scan via Sonnet×2, bug detection via Opus×2, validation agents)
+    and outputs findings to stdout without posting to ADO.
+
+    --dangerouslySkipPermissions gives Claude unrestricted access to all MCP
+    tools (ADO read/search) so it can fetch the PR diff and CLAUDE.md.
+
+    The JSON array Claude appends to its step-7 output is extracted and
+    returned to the container, which posts using its pipeline PAT.
+
+    Raises RuntimeError on timeout or non-zero exit.
     """
-    print(f"[Review] Starting Claude review for {pr_link}", flush=True)
-
-    # Fetch diff context from ADO
-    try:
-        pr_id = int(pr_link.rstrip("/").split("/")[-1].split("?")[0])
-        if not pat:
-            pat = os.environ.get("ADO_PAT", "")
-        if not pr:
-            pr = get_pr_metadata(pat, pr_id)
-        changed_files = get_pr_changed_files(pat, pr_id)
-        print(f"[Review] {len(changed_files)} changed files", flush=True)
-        pr_context = build_pr_context(pat, pr, changed_files)
-    except Exception as e:
-        print(f"[Review] Failed to build PR context: {e}", flush=True)
-        return []
-
-    prompt = REVIEW_PROMPT.format(pr_context=pr_context)
-    print(f"[Review] Prompt size: {len(prompt)} chars", flush=True)
+    print(f"[Review] Invoking /code-review plugin for {pr_link}", flush=True)
 
     env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_LOG"}
     env["PYTHONUTF8"] = "1"
-    try:
-        # Run from a temp dir so Claude doesn't load .mcp.json from the project
-        # (MCP server startup adds 2+ minutes of overhead we don't need here —
-        #  all ADO data is already embedded in the prompt)
-        # Semaphore ensures only one claude --print process runs at a time;
-        # concurrent invocations caused the second process to return nothing.
-        import tempfile
-        with _claude_semaphore, tempfile.TemporaryDirectory() as tmpdir:
+
+    plugin_prompt = f"/code-review {pr_link}{_JSON_SUFFIX}"
+
+    with _claude_semaphore:
+        try:
             result = subprocess.run(
-                ["claude", "--print", "--output-format", "json",
-                 "--model", CLAUDE_MODEL],
-                input=prompt,
+                [
+                    "claude", "--print",
+                    "--dangerouslySkipPermissions",
+                    "--model", CLAUDE_MODEL,
+                ],
+                input=plugin_prompt,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
-                timeout=420,      # 7 min — prompt is ~40KB, Claude takes 2-4 min for a full review
+                timeout=1200,   # 20 min for the full multi-agent flow
                 env=env,
-                cwd=tmpdir,
+                cwd=str(repo_dir),
             )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("Claude /code-review plugin timed out after 20 min")
 
-        print(f"[Review] Claude exit code: {result.returncode}", flush=True)
-        if result.returncode != 0:
-            print(f"[Review] stderr: {result.stderr[:400]}", flush=True)
-            return []
+    print(f"[Review] Plugin exit: {result.returncode}", flush=True)
+    if result.returncode != 0:
+        snippet = (result.stderr or "").strip()[:400]
+        raise RuntimeError(
+            f"Claude plugin failed (exit {result.returncode}): {snippet or '(no output)'}"
+        )
 
-        stdout = "\n".join(
-            l for l in result.stdout.splitlines()
-            if not l.startswith("process.env[")
-        ).strip()
+    output = result.stdout.strip()
+    print(f"[Review] Plugin output ({len(output)} chars):\n{output[:600]}", flush=True)
 
-        try:
-            outer = json.loads(stdout)
-            text  = outer.get("result", stdout)
-        except json.JSONDecodeError:
-            text = stdout
+    if not output:
+        raise RuntimeError("Claude plugin produced no output — review did not complete")
 
-        comments = parse_json_comments(text)
-        print(f"[Review] {len(comments)} comments parsed", flush=True)
-        if not comments:
-            print(f"[Review] Raw result (first 600): {text[:600]}", flush=True)
-        return comments
+    comments = _parse_json_from_output(output)
+    print(f"[Review] {len(comments)} comment(s) collected", flush=True)
+    return comments
 
-    except subprocess.TimeoutExpired:
-        print("[Review] Claude timed out after 7 minutes", flush=True)
+
+def _parse_json_from_output(text: str) -> list[dict]:
+    """
+    Extract the last JSON array from Claude's plugin output.
+    Searches from the end to find the outermost [...] block.
+    """
+    last_close = text.rfind("]")
+    if last_close == -1:
         return []
-    except Exception as e:
-        print(f"[Review] Failed: {e}", flush=True)
+
+    # Walk backwards to find the matching opening bracket
+    depth = 0
+    start = -1
+    for i in range(last_close, -1, -1):
+        if text[i] == "]":
+            depth += 1
+        elif text[i] == "[":
+            depth -= 1
+            if depth == 0:
+                start = i
+                break
+
+    if start == -1:
         return []
 
-
-def parse_json_comments(text: str) -> list[dict]:
-    text  = text.strip()
-    start = text.find("[")
-    end   = text.rfind("]")
-    if start == -1 or end == -1:
-        return []
     try:
-        items = json.loads(text[start:end + 1])
+        items = json.loads(text[start:last_close + 1])
         if not isinstance(items, list):
             return []
         normalised = []
         for item in items:
             if not isinstance(item, dict):
                 continue
+            comment_text = (
+                item.get("commentText") or item.get("comment_text") or item.get("comment", "")
+            )
+            if not comment_text:
+                continue
             normalised.append({
-                "filePath":    item.get("filePath")    or item.get("file_path", ""),
-                "startLine":   int(item.get("startLine") or item.get("start_line") or item.get("lineNumber") or 1),
-                "endLine":     int(item.get("endLine")   or item.get("end_line")   or item.get("lineNumber") or 1),
+                "filePath":    item.get("filePath") or item.get("file_path", ""),
+                "startLine":   int(item.get("startLine") or item.get("start_line") or 1),
+                "endLine":     int(item.get("endLine")   or item.get("end_line")   or 1),
                 "severity":    item.get("severity",    "medium"),
                 "commentType": item.get("commentType") or item.get("comment_type") or "issue",
-                "commentText": item.get("commentText") or item.get("comment_text") or item.get("comment", ""),
+                "commentText": comment_text,
                 "suggestedFix":item.get("suggestedFix") or item.get("suggested_fix") or "",
-                "confidence":  float(item.get("confidence", 0.8)),
+                "confidence":  float(item.get("confidence", 0.9)),
             })
         return normalised
     except (json.JSONDecodeError, ValueError):
@@ -436,11 +319,19 @@ _claude_semaphore = threading.Semaphore(1)  # only one claude --print at a time
 
 def _run_review_job(job_id: str, pr_link: str, ado_pat: str,
                     pr_id: int, project: str, repo: str):
-    """Background thread: fetch PR diffs and run Claude review."""
+    """
+    Background thread:
+      1. Clone/update the waimea repo and check out the PR source branch.
+      2. Invoke the /code-review plugin (no --comment; Claude does not post).
+      3. Return the collected comments — the container posts using its pipeline PAT.
+    """
     try:
         pr = get_pr_metadata(ado_pat, pr_id)
-        comments = run_skill_review(pr_link, repo_dir=None, pat=ado_pat, pr=pr)
-        print(f"[Job {job_id[:8]}] PR #{pr_id} -> {len(comments)} comments", flush=True)
+        repo_dir = ensure_repo_cloned(ado_pat)
+        checkout_pr_branch(repo_dir, pr)
+
+        comments = run_plugin_review(pr_link, repo_dir=repo_dir)
+        print(f"[Job {job_id[:8]}] PR #{pr_id} → {len(comments)} comment(s)", flush=True)
 
         with _jobs_lock:
             _jobs[job_id] = {
@@ -449,7 +340,7 @@ def _run_review_job(job_id: str, pr_link: str, ado_pat: str,
                 "comments":      comments,
             }
     except Exception as e:
-        print(f"[Job {job_id[:8]}] Error: {e}")
+        print(f"[Job {job_id[:8]}] Error: {e}", flush=True)
         with _jobs_lock:
             _jobs[job_id] = {
                 "status": "error",

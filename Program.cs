@@ -136,6 +136,7 @@ builder.Services.AddSingleton<EmbeddingPersistenceService>(provider =>
         provider.GetRequiredService<ILogger<EmbeddingPersistenceService>>()));
 builder.Services.AddHostedService<IndexRestoreHostedService>();
 builder.Services.AddHostedService<RagAutoIndexHostedService>();
+builder.Services.AddHostedService<FeedbackSyncHostedService>();
 
 // Add RAG context service
 builder.Services.AddSingleton<CodebaseContextService>();
