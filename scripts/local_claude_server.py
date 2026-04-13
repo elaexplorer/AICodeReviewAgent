@@ -82,83 +82,6 @@ REPO_CACHE_DIR = Path(os.environ.get(
     str(REPO_ROOT / ".repo_cache" / ADO_REPOSITORY)
 ))
 
-import requests as _requests
-import base64
-
-
-# ---------------------------------------------------------------------------
-# ADO helpers (for repo clone auth + PR metadata)
-# ---------------------------------------------------------------------------
-
-def ado_headers(pat: str) -> dict:
-    token = base64.b64encode(f":{pat}".encode()).decode()
-    return {"Authorization": f"Basic {token}", "Content-Type": "application/json"}
-
-
-def get_pr_metadata(pat: str, pr_id: int) -> dict:
-    url = (f"https://dev.azure.com/{ADO_ORGANIZATION}/{ADO_PROJECT}/_apis/"
-           f"git/repositories/{ADO_REPOSITORY}/pullRequests/{pr_id}?api-version=7.0")
-    r = _requests.get(url, headers=ado_headers(pat), timeout=30)
-    r.raise_for_status()
-    return r.json()
-
-
-# ---------------------------------------------------------------------------
-# Repo clone / update
-# ---------------------------------------------------------------------------
-
-def ensure_repo_cloned(pat: str) -> Path:
-    """Clone the ADO repo locally if not present, otherwise fetch latest."""
-    clone_url = (
-        f"https://x:{pat}@dev.azure.com/{ADO_ORGANIZATION}/{ADO_PROJECT}"
-        f"/_git/{ADO_REPOSITORY}"
-    )
-    if not REPO_CACHE_DIR.exists():
-        print(f"[Repo] Cloning {ADO_REPOSITORY} into {REPO_CACHE_DIR} ...")
-        REPO_CACHE_DIR.parent.mkdir(parents=True, exist_ok=True)
-        result = subprocess.run(
-            ["git", "clone", "--depth=100", clone_url, str(REPO_CACHE_DIR)],
-            capture_output=True, text=True, timeout=300
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"git clone failed: {result.stderr[:400]}")
-        print("[Repo] Clone complete")
-    else:
-        subprocess.run(
-            ["git", "remote", "set-url", "origin", clone_url],
-            cwd=str(REPO_CACHE_DIR), capture_output=True, timeout=15
-        )
-        subprocess.run(
-            ["git", "fetch", "origin", "--depth=50", "--prune"],
-            cwd=str(REPO_CACHE_DIR), capture_output=True, timeout=120
-        )
-    return REPO_CACHE_DIR
-
-
-def checkout_pr_branch(repo_dir: Path, pr: dict):
-    """Check out the PR source branch so CLAUDE.md reflects the PR state."""
-    source_commit = pr.get("lastMergeSourceCommit", {}).get("commitId", "")
-    source_ref    = pr.get("sourceRefName", "").replace("refs/heads/", "")
-
-    if source_commit:
-        r = subprocess.run(
-            ["git", "checkout", "--detach", source_commit],
-            cwd=str(repo_dir), capture_output=True, text=True, timeout=30
-        )
-        if r.returncode == 0:
-            print(f"[Repo] Checked out commit {source_commit[:8]}")
-            return
-
-    if source_ref:
-        subprocess.run(
-            ["git", "fetch", "origin", source_ref, "--depth=10"],
-            cwd=str(repo_dir), capture_output=True, timeout=60
-        )
-        subprocess.run(
-            ["git", "checkout", "-B", source_ref, f"origin/{source_ref}"],
-            cwd=str(repo_dir), capture_output=True, timeout=30
-        )
-        print(f"[Repo] Checked out branch {source_ref}")
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +101,7 @@ _JSON_SUFFIX = (
 )
 
 
-def run_plugin_review(pr_link: str, repo_dir: Path, pat: str = "") -> list[dict]:
+def run_plugin_review(pr_link: str, repo_dir: Path) -> list[dict]:
     """
     Invoke the code-review:code-review skill via claude --print.
 
@@ -338,20 +261,18 @@ _jobs_lock = threading.Lock()
 _claude_semaphore = threading.Semaphore(1)  # only one claude --print at a time
 
 
-def _run_review_job(job_id: str, pr_link: str, ado_pat: str,
-                    pr_id: int, project: str, repo: str):
+def _run_review_job(job_id: str, pr_link: str, pr_id: int, project: str, repo: str):
     """
-    Background thread:
-      1. Clone/update the waimea repo and check out the PR source branch.
-      2. Invoke the /code-review plugin (no --comment; Claude does not post).
-      3. Return the collected comments — the container posts using its pipeline PAT.
+    Background thread: invoke the /code-review:code-review skill and return
+    the collected comments. The skill fetches everything it needs via ADO MCP
+    tools — no local repo clone or PAT required here.
     """
     try:
-        pr = get_pr_metadata(ado_pat, pr_id)
-        repo_dir = ensure_repo_cloned(ado_pat)
-        checkout_pr_branch(repo_dir, pr)
+        # Use the cached repo dir as cwd if it exists (Claude can read local
+        # CLAUDE.md), otherwise fall back to the agent root directory.
+        cwd = REPO_CACHE_DIR if REPO_CACHE_DIR.exists() else REPO_ROOT
 
-        comments = run_plugin_review(pr_link, repo_dir=repo_dir)
+        comments = run_plugin_review(pr_link, repo_dir=cwd)
         print(f"[Job {job_id[:8]}] PR #{pr_id} → {len(comments)} comment(s)", flush=True)
 
         with _jobs_lock:
@@ -396,15 +317,8 @@ def review():
     data    = request.get_json(force=True) or {}
     pr_link = data.get("pullRequestLink", "")
 
-    ado_pat = (
-        request.headers.get("X-Ado-Access-Token")
-        or os.environ.get("ADO_PAT", "")
-    )
-
     if not pr_link:
         return jsonify({"error": "pullRequestLink is required"}), 400
-    if not ado_pat:
-        return jsonify({"error": "ADO_PAT not configured"}), 500
 
     parsed = parse_pr_link(pr_link)
     if not parsed:
@@ -419,7 +333,7 @@ def review():
 
     t = threading.Thread(
         target=_run_review_job,
-        args=(job_id, pr_link, ado_pat, pr_id, project, repo),
+        args=(job_id, pr_link, pr_id, project, repo),
         daemon=True,
     )
     t.start()
