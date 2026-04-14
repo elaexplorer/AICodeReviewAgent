@@ -349,6 +349,18 @@ public class CodeReviewController : ControllerBase
                     foreach (var comment in commentsToPost)
                     {
                         var commentToPost = CloneComment(comment);
+
+                        // Skip if the file isn't in the PR diff at all
+                        var normalizedFilePath = NormalizePath(commentToPost.FilePath);
+                        if (!validRightSideLinesByFile.ContainsKey(normalizedFilePath))
+                        {
+                            _logger.LogInformation(
+                                "Skipping comment for PR {PullRequestId} at {FilePath}:{StartLine} — file not in PR diff",
+                                reviewOutput.PullRequestId, commentToPost.FilePath, commentToPost.StartLine);
+                            skippedCount++;
+                            continue;
+                        }
+
                         var remappedLine = RemapToNearestValidRightSideLine(commentToPost, validRightSideLinesByFile);
                         if (remappedLine.HasValue)
                         {
@@ -1659,24 +1671,6 @@ public class CodeReviewController : ControllerBase
                   <a href="{prLink}" style="font-weight:600;color:#0366d6;text-decoration:none;font-size:14px">PR #{prId}: {project}/{repository}</a>
                 </div>
 
-                <!-- GPT all comments (email only) -->
-                <div style="padding:16px 24px;border-bottom:1px solid #e1e4e8">
-                  <div style="font-size:13px;font-weight:600;color:#0366d6;margin-bottom:8px">
-                    GPT — All Comments ({gptComments.Count}) <span style="font-size:11px;font-weight:400;color:#6a737d">· email only, not posted to PR</span>
-                  </div>
-                  <table style="width:100%;border-collapse:collapse;font-size:12px">
-                    <thead>
-                      <tr style="background:#f6f8fa;border-bottom:2px solid #e1e4e8">
-                        <th style="padding:6px 8px;text-align:left;color:#586069;font-weight:600">Sev</th>
-                        <th style="padding:6px 8px;text-align:left;color:#586069;font-weight:600">File:Line</th>
-                        <th style="padding:6px 8px;text-align:left;color:#586069;font-weight:600">Comment</th>
-                        <th style="padding:6px 8px;text-align:right;color:#586069;font-weight:600">Conf</th>
-                      </tr>
-                    </thead>
-                    <tbody>{CommentTable(gptComments.OrderByDescending(c => c.Confidence).ToList(), "#0366d6")}</tbody>
-                  </table>
-                </div>
-
                 <!-- Claude critical/high table -->
                 <div style="padding:16px 24px;border-bottom:1px solid #e1e4e8">
                   <div style="font-size:13px;font-weight:600;color:#d73a49;margin-bottom:8px">
@@ -1721,6 +1715,24 @@ public class CodeReviewController : ControllerBase
                     <tbody>{CommentTable(claudeMediumComments, "#6f42c1")}</tbody>
                   </table>"
                   )}
+                </div>
+
+                <!-- GPT all comments (email only) -->
+                <div style="padding:16px 24px;border-bottom:1px solid #e1e4e8">
+                  <div style="font-size:13px;font-weight:600;color:#0366d6;margin-bottom:8px">
+                    GPT — All Comments ({gptComments.Count}) <span style="font-size:11px;font-weight:400;color:#6a737d">· email only, not posted to PR</span>
+                  </div>
+                  <table style="width:100%;border-collapse:collapse;font-size:12px">
+                    <thead>
+                      <tr style="background:#f6f8fa;border-bottom:2px solid #e1e4e8">
+                        <th style="padding:6px 8px;text-align:left;color:#586069;font-weight:600">Sev</th>
+                        <th style="padding:6px 8px;text-align:left;color:#586069;font-weight:600">File:Line</th>
+                        <th style="padding:6px 8px;text-align:left;color:#586069;font-weight:600">Comment</th>
+                        <th style="padding:6px 8px;text-align:right;color:#586069;font-weight:600">Conf</th>
+                      </tr>
+                    </thead>
+                    <tbody>{CommentTable(gptComments.OrderByDescending(c => c.Confidence).ToList(), "#0366d6")}</tbody>
+                  </table>
                 </div>
 
                 <!-- Posted to PR -->

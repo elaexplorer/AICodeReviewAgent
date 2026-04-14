@@ -876,7 +876,7 @@ public class AzureDevOpsRestClient
         var startLine = comment.StartLine > 0 ? comment.StartLine : 1;
         var endLine = comment.EndLine >= startLine ? comment.EndLine : startLine;
         var lineRef = startLine == endLine ? $"Line {startLine}" : $"Lines {startLine}–{endLine}";
-        var confidenceStr = comment.Confidence > 0.0 ? $" · confidence: {comment.Confidence:F2}" : "";
+        var confidenceStr = comment.Confidence > 0.0 ? $" · confidence: {comment.Confidence * 100:F0}%" : "";
         var severityLabel = (comment.Severity?.ToLower() is "high" or "critical") ? "CRITICAL" : (comment.Severity?.ToUpper() ?? "MEDIUM");
         var anchorTitle = $"**[{severityLabel}] {comment.CommentType}**";
         var body = $"{anchorTitle} ({lineRef}{confidenceStr})\n\n{comment.CommentText}";
