@@ -297,19 +297,19 @@ public class CodeReviewController : ControllerBase
                     : claudeComments.Count > 0       ? $"{claudeComments.Count} comment(s)"
                     :                                   "disabled or no issues");
 
-                // Post high/critical comments from both models (union), deduped by position
-                var highPriorityComments = reviewOutput.Comments
-                    .Where(IsHighPriorityComment)
-                    .Concat(claudeComments.Where(IsHighPriorityComment))
+                // Post Claude comments (critical, high, medium with ≥0.7 confidence) — GPT is email-only
+                var commentsToPost = claudeComments
+                    .Where(c => c.Confidence >= 0.7 && c.Severity?.Trim().ToLowerInvariant() is "critical" or "high" or "medium")
                     .GroupBy(c => $"{NormalizePath(c.FilePath)}:{c.StartLine}")
                     .Select(g => g.First())
                     .ToList();
 
                 _logger.LogInformation(
-                    "Union filter: {GptHigh} GPT-4 high/critical + {ClaudeHigh} Claude high/critical → {Total} to post (after dedup)",
-                    reviewOutput.Comments.Count(IsHighPriorityComment),
-                    claudeComments.Count(IsHighPriorityComment),
-                    highPriorityComments.Count);
+                    "Claude to post: {ClaudeHigh} critical/high + {ClaudeMedium} medium → {Total} (GPT {GptTotal} comments are email-only)",
+                    claudeComments.Count(c => c.Confidence >= 0.7 && c.Severity?.Trim().ToLowerInvariant() is "critical" or "high"),
+                    claudeComments.Count(c => c.Confidence >= 0.7 && c.Severity?.Trim().ToLowerInvariant() is "medium"),
+                    commentsToPost.Count,
+                    reviewOutput.Comments.Count);
                 var validRightSideLinesByFile = BuildValidRightSideLineLookup(reviewOutput.Files);
                 var existingFingerprints = await _adoClient.GetExistingCommentFingerprintsAsync(
                     reviewOutput.Project,
@@ -334,20 +334,19 @@ public class CodeReviewController : ControllerBase
                 if (skipPosting)
                 {
                     _logger.LogInformation(
-                        "{Reason} — skipping all ADO posts. GPT-4: {GptTotal} comments ({GptHigh} high/critical), Claude: {ClaudeTotal} comments ({ClaudeHigh} high/critical), deduped high-priority to post: {Total}",
+                        "{Reason} — skipping all ADO posts. GPT-4: {GptTotal} comments (email-only), Claude: {ClaudeTotal} comments ({ClaudeToPost} to post)",
                         skipReason,
-                        reviewOutput.Comments.Count, reviewOutput.Comments.Count(IsHighPriorityComment),
-                        claudeComments.Count, claudeComments.Count(IsHighPriorityComment),
-                        highPriorityComments.Count);
+                        reviewOutput.Comments.Count,
+                        claudeComments.Count, commentsToPost.Count);
 
-                    foreach (var c in highPriorityComments)
+                    foreach (var c in commentsToPost)
                         _logger.LogInformation(
                             "{Reason} would-post [{Severity}] {FilePath}:{Line} — {Text}",
                             skipReason, c.Severity, c.FilePath, c.StartLine, c.CommentText[..Math.Min(120, c.CommentText.Length)]);
                 }
                 else if (!skipPosting)
                 {
-                    foreach (var comment in highPriorityComments)
+                    foreach (var comment in commentsToPost)
                     {
                         var commentToPost = CloneComment(comment);
                         var remappedLine = RemapToNearestValidRightSideLine(commentToPost, validRightSideLinesByFile);
@@ -453,7 +452,7 @@ public class CodeReviewController : ControllerBase
                         StartLine   = c.StartLine,
                         Severity    = c.Severity ?? "high",
                         CommentType = c.CommentType ?? "issue",
-                        SourceModel = "gpt",
+                        SourceModel = "claude",
                     })
                     .ToList();
                 if (postedThreadRecords.Count > 0)
@@ -469,7 +468,7 @@ public class CodeReviewController : ControllerBase
                     reviewOutput.Project,
                     reviewOutput.Repository,
                     gptComments:        reviewOutput.Comments,
-                    filteredToPost:     highPriorityComments.Count,
+                    filteredToPost:     commentsToPost.Count,
                     postedComments:     postedComments,
                     skippedCount:       skippedCount,
                     jobStartedAt:       jobStartedAt,
@@ -495,7 +494,7 @@ public class CodeReviewController : ControllerBase
                     CompletedAtUtc = DateTime.UtcNow,
                     TotalComments = reviewOutput.Comments.Count,
                     ClaudeTotalComments = claudeComments.Count,
-                    HighPriorityComments = highPriorityComments.Count,
+                    HighPriorityComments = commentsToPost.Count,
                     PostedHighPriorityComments = postedCount,
                     SkippedHighPriorityComments = skippedCount,
                     Comments = reviewOutput.Comments,
@@ -1636,7 +1635,7 @@ public class CodeReviewController : ControllerBase
                   </div>
                   <div style="flex:1;padding:14px 16px;border-right:1px solid #e1e4e8;text-align:center">
                     <div style="font-size:22px;font-weight:700;color:#d73a49">{filteredToPost}</div>
-                    <div style="font-size:11px;color:#586069;margin-top:2px">High/critical (both)</div>
+                    <div style="font-size:11px;color:#586069;margin-top:2px">Claude to post</div>
                   </div>
                   <div style="flex:1;padding:14px 16px;border-right:1px solid #e1e4e8;text-align:center">
                     <div style="font-size:22px;font-weight:700;color:#28a745">{postedComments.Count}</div>
@@ -1660,10 +1659,10 @@ public class CodeReviewController : ControllerBase
                   <a href="{prLink}" style="font-weight:600;color:#0366d6;text-decoration:none;font-size:14px">PR #{prId}: {project}/{repository}</a>
                 </div>
 
-                <!-- GPT high/critical table -->
+                <!-- GPT all comments (email only) -->
                 <div style="padding:16px 24px;border-bottom:1px solid #e1e4e8">
                   <div style="font-size:13px;font-weight:600;color:#0366d6;margin-bottom:8px">
-                    GPT — High/Critical Comments ({gptHighComments.Count})
+                    GPT — All Comments ({gptComments.Count}) <span style="font-size:11px;font-weight:400;color:#6a737d">· email only, not posted to PR</span>
                   </div>
                   <table style="width:100%;border-collapse:collapse;font-size:12px">
                     <thead>
@@ -1674,7 +1673,7 @@ public class CodeReviewController : ControllerBase
                         <th style="padding:6px 8px;text-align:right;color:#586069;font-weight:600">Conf</th>
                       </tr>
                     </thead>
-                    <tbody>{CommentTable(gptHighComments, "#d73a49")}</tbody>
+                    <tbody>{CommentTable(gptComments.OrderByDescending(c => c.Confidence).ToList(), "#0366d6")}</tbody>
                   </table>
                 </div>
 
@@ -1706,7 +1705,7 @@ public class CodeReviewController : ControllerBase
                 <!-- Claude medium table -->
                 <div style="padding:16px 24px;border-bottom:1px solid #e1e4e8">
                   <div style="font-size:13px;font-weight:600;color:#6f42c1;margin-bottom:8px">
-                    Claude — Medium Comments ({claudeMediumComments.Count}) <span style="font-size:11px;font-weight:400;color:#6a737d">· not posted</span>
+                    Claude — Medium Comments ({claudeMediumComments.Count}) <span style="font-size:11px;font-weight:400;color:#6a737d">· posted to PR</span>
                   </div>
                   {(!claudeConfigured || claudeFailureReason is not null || claudeComments.Count == 0
                       ? ""
