@@ -109,6 +109,12 @@ ADO_PROJECT      = os.environ.get("ADO_PROJECT", "SCC")
 ADO_REPOSITORY   = os.environ.get("ADO_REPOSITORY", "service-shared_framework_waimea")
 CLAUDE_MODEL     = os.environ.get("CLAUDE_REVIEW_MODEL", "claude-sonnet-4-6")
 
+# How many Claude subprocesses may run in parallel.
+# Each run consumes ~500 MB RAM and fires Haiku+Sonnet×2+Opus×2 API calls.
+# Set MAX_CONCURRENT_REVIEWS=1 in .env to serialise (safe but slow).
+# Default 2 works on any machine with 8 GB+ RAM without hitting rate limits.
+MAX_CONCURRENT_REVIEWS = int(os.environ.get("MAX_CONCURRENT_REVIEWS", "2"))
+
 REPO_CACHE_DIR = Path(os.environ.get(
     "REPO_CACHE_DIR",
     str(REPO_ROOT / ".repo_cache" / ADO_REPOSITORY)
@@ -166,7 +172,7 @@ def run_plugin_review(pr_link: str, repo_dir: Path) -> list[dict]:
     stdout_lines: list[str] = []
     stderr_lines: list[str] = []
 
-    _log.info("[Review] Waiting for semaphore (only one Claude run at a time)...")
+    _log.info("[Review] Waiting for concurrency slot (max %d parallel runs)...", MAX_CONCURRENT_REVIEWS)
     with _claude_semaphore:
         semaphore_wait = time.monotonic() - t0
         _log.info("[Review] Semaphore acquired after %.1fs — launching subprocess", semaphore_wait)
@@ -313,7 +319,10 @@ def parse_pr_link(pr_link: str) -> tuple[int, str, str] | None:
 # job_id -> {"status": "pending"|"done"|"error", "pullRequestId": int, "comments": [...], "error": str}
 _jobs: dict[str, dict] = {}
 _jobs_lock = threading.Lock()
-_claude_semaphore = threading.Semaphore(1)  # only one claude --print at a time
+# Semaphore caps parallel Claude subprocesses at MAX_CONCURRENT_REVIEWS.
+# Jobs that arrive while all slots are busy queue in their background thread
+# and start as soon as a slot frees up.
+_claude_semaphore = threading.Semaphore(MAX_CONCURRENT_REVIEWS)
 
 
 def _run_review_job(job_id: str, pr_link: str, pr_id: int, project: str, repo: str):
@@ -363,11 +372,20 @@ app = Flask(__name__)
 
 @app.get("/health")
 def health():
+    with _jobs_lock:
+        pending  = sum(1 for j in _jobs.values() if j["status"] == "pending")
+        done     = sum(1 for j in _jobs.values() if j["status"] == "done")
+    # Semaphore._value is the number of FREE slots remaining
+    active = MAX_CONCURRENT_REVIEWS - _claude_semaphore._value
     return jsonify({
-        "status":     "ok",
-        "model":      CLAUDE_MODEL,
-        "repoCache":  str(REPO_CACHE_DIR),
-        "repoCached": REPO_CACHE_DIR.exists(),
+        "status":             "ok",
+        "model":              CLAUDE_MODEL,
+        "repoCache":          str(REPO_CACHE_DIR),
+        "repoCached":         REPO_CACHE_DIR.exists(),
+        "maxConcurrent":      MAX_CONCURRENT_REVIEWS,
+        "activeReviews":      active,
+        "pendingJobs":        pending,
+        "completedJobs":      done,
     })
 
 
@@ -440,11 +458,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     _log.info("Local Claude review server starting")
-    _log.info("  Skill  : code-review:code-review")
-    _log.info("  Model  : %s", CLAUDE_MODEL)
-    _log.info("  Repo   : %s/%s/%s", ADO_ORGANIZATION, ADO_PROJECT, ADO_REPOSITORY)
-    _log.info("  Cache  : %s", REPO_CACHE_DIR)
-    _log.info("  Port   : %d", args.port)
-    _log.info("  Log    : %s", _LOG_FILE)
+    _log.info("  Skill       : code-review:code-review")
+    _log.info("  Model       : %s", CLAUDE_MODEL)
+    _log.info("  Concurrency : %d parallel Claude runs (MAX_CONCURRENT_REVIEWS)", MAX_CONCURRENT_REVIEWS)
+    _log.info("  Repo        : %s/%s/%s", ADO_ORGANIZATION, ADO_PROJECT, ADO_REPOSITORY)
+    _log.info("  Cache       : %s", REPO_CACHE_DIR)
+    _log.info("  Port        : %d", args.port)
+    _log.info("  Log         : %s", _LOG_FILE)
 
     app.run(host="0.0.0.0", port=args.port)
