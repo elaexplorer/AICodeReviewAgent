@@ -128,8 +128,13 @@ REPO_CACHE_DIR = Path(os.environ.get(
 
 # Appended after the skill invocation so Claude emits a parseable JSON array
 # at the end of its step-7 terminal output instead of prose only.
+# IMPORTANT: DO NOT post anything to the PR — the cloud agent owns all posting.
 _JSON_SUFFIX = (
-    "\n\nAfter completing your review findings (step 7), append a raw JSON array "
+    "\n\nDo NOT post any comments, threads, votes, or summaries to the PR. "
+    "Do not call any ADO tools that write to the PR (no create_pull_request_thread, "
+    "reply_to_comment, update_pull_request, vote_pull_request, etc.). "
+    "Return your findings ONLY as the JSON array below — the calling service handles posting.\n\n"
+    "After completing your review findings, append a raw JSON array "
     "at the very end of your response — no prose after it. "
     "Each item must have exactly these fields:\n"
     '{"filePath":"/path/to/file","startLine":1,"endLine":1,'
@@ -137,6 +142,23 @@ _JSON_SUFFIX = (
     '"commentText":"description","suggestedFix":"fix or empty","confidence":0.9}\n'
     "Return [] if no issues were found."
 )
+
+# ADO MCP tools that write to a PR — blocked via --allowedTools so Claude
+# cannot post even if it tries to ignore the prompt instruction above.
+_ADO_WRITE_TOOLS = [
+    "mcp__azure-devops__repo_create_pull_request",
+    "mcp__azure-devops__repo_create_pull_request_thread",
+    "mcp__azure-devops__repo_reply_to_comment",
+    "mcp__azure-devops__repo_update_pull_request",
+    "mcp__azure-devops__repo_update_pull_request_thread",
+    "mcp__azure-devops__repo_update_pull_request_reviewers",
+    "mcp__azure-devops__repo_vote_pull_request",
+    "mcp__azure-devops__repo_create_branch",
+    "mcp__azure-devops__wit_create_work_item",
+    "mcp__azure-devops__wit_add_work_item_comment",
+    "mcp__azure-devops__wit_update_work_item",
+    "mcp__azure-devops__wiki_create_or_update_page",
+]
 
 
 def run_plugin_review(pr_link: str, repo_dir: Path) -> list[dict]:
@@ -182,6 +204,7 @@ def run_plugin_review(pr_link: str, repo_dir: Path) -> list[dict]:
                 "claude", "--print",
                 "--dangerously-skip-permissions",
                 "--model", CLAUDE_MODEL,
+                "--disallowedTools", ",".join(_ADO_WRITE_TOOLS),
             ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
