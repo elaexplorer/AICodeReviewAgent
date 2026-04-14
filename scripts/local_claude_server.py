@@ -43,13 +43,45 @@ Set on the container app:
 
 import argparse
 import json
+import logging
 import os
 import subprocess
 import threading
+import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 from flask import Flask, jsonify, request
+
+# ---------------------------------------------------------------------------
+# Logging — write to both console AND a log file with timestamps so execution
+# timing is always visible regardless of how the server is started.
+# ---------------------------------------------------------------------------
+
+_LOG_FILE = Path(__file__).resolve().parent.parent / "local_claude_server.log"
+
+def _setup_logging():
+    fmt = logging.Formatter("%(asctime)s %(message)s", datefmt="%H:%M:%S")
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+
+    # Console handler
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setFormatter(fmt)
+    root.addHandler(ch)
+
+    # File handler — always appends, so restarts don't wipe history
+    fh = logging.FileHandler(str(_LOG_FILE), encoding="utf-8")
+    fh.setFormatter(fmt)
+    root.addHandler(fh)
+
+_setup_logging()
+_log = logging.getLogger(__name__)
+
+def _ts() -> str:
+    """UTC timestamp string for inline timing annotations."""
+    return datetime.now(timezone.utc).strftime("%H:%M:%S")
 
 # ---------------------------------------------------------------------------
 # Config
@@ -112,7 +144,12 @@ def run_plugin_review(pr_link: str, repo_dir: Path) -> list[dict]:
     Always returns a list (may be empty) — never raises, so the caller
     always gets a consistent "done" response even if Claude fails or times out.
     """
-    print(f"[Review] Invoking /code-review:code-review skill for {pr_link}", flush=True)
+    _log.info("[Review] ── START ── /code-review:code-review for %s", pr_link)
+    t0 = time.monotonic()
+
+    def _elapsed() -> str:
+        secs = int(time.monotonic() - t0)
+        return f"{secs // 60}m{secs % 60:02d}s"
 
     plugin_prompt = f"/code-review:code-review {pr_link}{_JSON_SUFFIX}"
 
@@ -120,16 +157,20 @@ def run_plugin_review(pr_link: str, repo_dir: Path) -> list[dict]:
     env["PYTHONUTF8"] = "1"
 
     def _drain(stream, lines: list, tag: str):
-        """Read stream line by line, print each line, and accumulate."""
+        """Read stream line by line, log each line, and accumulate."""
         for raw in stream:
             line = raw.rstrip("\n")
-            print(f"[Claude{tag}] {line}", flush=True)
+            _log.info("[Claude%s +%s] %s", tag, _elapsed(), line)
             lines.append(line)
 
     stdout_lines: list[str] = []
     stderr_lines: list[str] = []
 
+    _log.info("[Review] Waiting for semaphore (only one Claude run at a time)...")
     with _claude_semaphore:
+        semaphore_wait = time.monotonic() - t0
+        _log.info("[Review] Semaphore acquired after %.1fs — launching subprocess", semaphore_wait)
+
         proc = subprocess.Popen(
             [
                 "claude", "--print",
@@ -155,7 +196,7 @@ def run_plugin_review(pr_link: str, repo_dir: Path) -> list[dict]:
         try:
             proc.stdin.write(plugin_prompt)
             proc.stdin.close()
-            proc.wait(timeout=2400)   # 40 min for the full multi-agent flow
+            proc.wait(timeout=2400)   # 40 min hard limit
         except subprocess.TimeoutExpired:
             proc.kill()
             timed_out = True
@@ -165,32 +206,34 @@ def run_plugin_review(pr_link: str, repo_dir: Path) -> list[dict]:
 
     returncode = proc.returncode
     output = "\n".join(stdout_lines).strip()
+    elapsed_total = time.monotonic() - t0
+    elapsed_str = f"{int(elapsed_total) // 60}m{int(elapsed_total) % 60:02d}s"
 
     if timed_out:
-        print(f"[Review] Plugin timed out after 40 min — attempting to parse {len(stdout_lines)} lines of partial output", flush=True)
+        _log.warning("[Review] ── TIMEOUT ── after %s (40 min hard limit) — trying to recover partial output (%d lines)",
+                     elapsed_str, len(stdout_lines))
         comments = _parse_json_from_output(output)
-        print(f"[Review] Recovered {len(comments)} comment(s) from partial output", flush=True)
+        _log.info("[Review] Recovered %d comment(s) from partial output", len(comments))
         return comments
 
-    print(f"[Review] Plugin exit: {returncode}", flush=True)
+    _log.info("[Review] Plugin exit=%d elapsed=%s output=%d chars", returncode, elapsed_str, len(output))
     if returncode != 0:
-        # Try to recover comments from stdout before giving up
         comments = _parse_json_from_output(output)
         if comments:
-            print(f"[Review] Plugin exited {returncode} but output contained {len(comments)} comment(s)", flush=True)
+            _log.info("[Review] Exit %d but recovered %d comment(s) from output", returncode, len(comments))
             return comments
         snippet = "\n".join(stderr_lines[-20:])[:400]
-        print(f"[Review] Plugin failed (exit {returncode}), no parseable output: {snippet or '(no stderr)'}", flush=True)
+        _log.warning("[Review] ── FAILED ── exit=%d elapsed=%s stderr=%s",
+                     returncode, elapsed_str, snippet or "(none)")
         return []
-
-    print(f"[Review] Plugin output ({len(output)} chars) — last 600 chars:\n{output[-600:]}", flush=True)
 
     if not output:
-        print("[Review] Claude plugin produced no output", flush=True)
+        _log.warning("[Review] ── NO OUTPUT ── Claude produced nothing after %s", elapsed_str)
         return []
 
+    _log.info("[Review] Output: %d chars — last 400:\n%s", len(output), output[-400:])
     comments = _parse_json_from_output(output)
-    print(f"[Review] {len(comments)} comment(s) collected", flush=True)
+    _log.info("[Review] ── DONE ── %d comment(s) in %s", len(comments), elapsed_str)
     return comments
 
 
@@ -282,6 +325,10 @@ def _run_review_job(job_id: str, pr_link: str, pr_id: int, project: str, repo: s
     Always sets job status to "done" (never "error") so the cloud agent gets
     a consistent response. Errors are logged server-side only.
     """
+    short = job_id[:8]
+    t0 = time.monotonic()
+    _log.info("[Job %s] PR #%d (%s/%s) — starting", short, pr_id, project, repo)
+
     # Use the cached repo dir as cwd if it exists (Claude can read local
     # CLAUDE.md), otherwise fall back to the agent root directory.
     cwd = REPO_CACHE_DIR if REPO_CACHE_DIR.exists() else REPO_ROOT
@@ -291,15 +338,19 @@ def _run_review_job(job_id: str, pr_link: str, pr_id: int, project: str, repo: s
     except Exception as e:
         # run_plugin_review should never raise (it returns [] on failure),
         # but guard here so a bug doesn't leave the job stuck as pending.
-        print(f"[Job {job_id[:8]}] Unexpected error: {e}", flush=True)
+        _log.exception("[Job %s] Unexpected error: %s", short, e)
         comments = []
 
-    print(f"[Job {job_id[:8]}] PR #{pr_id} → {len(comments)} comment(s)", flush=True)
+    elapsed = time.monotonic() - t0
+    elapsed_str = f"{int(elapsed) // 60}m{int(elapsed) % 60:02d}s"
+    _log.info("[Job %s] PR #%d → %d comment(s) in %s", short, pr_id, len(comments), elapsed_str)
+
     with _jobs_lock:
         _jobs[job_id] = {
             "status":        "done",
             "pullRequestId": pr_id,
             "comments":      comments,
+            "elapsedSeconds": int(elapsed),
         }
 
 
@@ -339,7 +390,7 @@ def review():
 
     pr_id, project, repo = parsed
     job_id = str(uuid.uuid4())
-    print(f"\n[Review] PR #{pr_id} ({project}/{repo}) -> job {job_id[:8]}")
+    _log.info("[Review] PR #%d (%s/%s) → job %s submitted at %s", pr_id, project, repo, job_id[:8], _ts())
 
     with _jobs_lock:
         _jobs[job_id] = {"status": "pending", "pullRequestId": pr_id}
@@ -371,10 +422,11 @@ def review_result(job_id: str):
 
     # done
     return jsonify({
-        "jobId":         job_id,
-        "status":        "done",
-        "pullRequestId": job.get("pullRequestId"),
-        "comments":      job.get("comments", []),
+        "jobId":          job_id,
+        "status":         "done",
+        "pullRequestId":  job.get("pullRequestId"),
+        "comments":       job.get("comments", []),
+        "elapsedSeconds": job.get("elapsedSeconds"),
     })
 
 
@@ -387,12 +439,12 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=5010)
     args = parser.parse_args()
 
-    print(f"Local Claude review server")
-    print(f"  Skill:    code-review:code-review")
-    print(f"  Model:    {CLAUDE_MODEL}")
-    print(f"  Repo:     {ADO_ORGANIZATION}/{ADO_PROJECT}/{ADO_REPOSITORY}")
-    print(f"  Cache:    {REPO_CACHE_DIR}")
-    print(f"  Port:     {args.port}")
-    print()
+    _log.info("Local Claude review server starting")
+    _log.info("  Skill  : code-review:code-review")
+    _log.info("  Model  : %s", CLAUDE_MODEL)
+    _log.info("  Repo   : %s/%s/%s", ADO_ORGANIZATION, ADO_PROJECT, ADO_REPOSITORY)
+    _log.info("  Cache  : %s", REPO_CACHE_DIR)
+    _log.info("  Port   : %d", args.port)
+    _log.info("  Log    : %s", _LOG_FILE)
 
     app.run(host="0.0.0.0", port=args.port)
