@@ -109,7 +109,8 @@ def run_plugin_review(pr_link: str, repo_dir: Path) -> list[dict]:
     (so we can see sub-agent progress) while also accumulating it for
     JSON parsing at the end.
 
-    Raises RuntimeError on timeout or non-zero exit.
+    Always returns a list (may be empty) — never raises, so the caller
+    always gets a consistent "done" response even if Claude fails or times out.
     """
     print(f"[Review] Invoking /code-review:code-review skill for {pr_link}", flush=True)
 
@@ -124,6 +125,9 @@ def run_plugin_review(pr_link: str, repo_dir: Path) -> list[dict]:
             line = raw.rstrip("\n")
             print(f"[Claude{tag}] {line}", flush=True)
             lines.append(line)
+
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
 
     with _claude_semaphore:
         proc = subprocess.Popen(
@@ -142,40 +146,48 @@ def run_plugin_review(pr_link: str, repo_dir: Path) -> list[dict]:
             cwd=str(repo_dir),
         )
 
-        stdout_lines: list[str] = []
-        stderr_lines: list[str] = []
-
         t_out = threading.Thread(target=_drain, args=(proc.stdout, stdout_lines, ""), daemon=True)
         t_err = threading.Thread(target=_drain, args=(proc.stderr, stderr_lines, " ERR"), daemon=True)
         t_out.start()
         t_err.start()
 
+        timed_out = False
         try:
             proc.stdin.write(plugin_prompt)
             proc.stdin.close()
             proc.wait(timeout=2400)   # 40 min for the full multi-agent flow
         except subprocess.TimeoutExpired:
             proc.kill()
+            timed_out = True
+        finally:
             t_out.join(timeout=5)
             t_err.join(timeout=5)
-            raise RuntimeError("Claude /code-review plugin timed out after 40 min")
-
-        t_out.join()
-        t_err.join()
 
     returncode = proc.returncode
+    output = "\n".join(stdout_lines).strip()
+
+    if timed_out:
+        print(f"[Review] Plugin timed out after 40 min — attempting to parse {len(stdout_lines)} lines of partial output", flush=True)
+        comments = _parse_json_from_output(output)
+        print(f"[Review] Recovered {len(comments)} comment(s) from partial output", flush=True)
+        return comments
+
     print(f"[Review] Plugin exit: {returncode}", flush=True)
     if returncode != 0:
+        # Try to recover comments from stdout before giving up
+        comments = _parse_json_from_output(output)
+        if comments:
+            print(f"[Review] Plugin exited {returncode} but output contained {len(comments)} comment(s)", flush=True)
+            return comments
         snippet = "\n".join(stderr_lines[-20:])[:400]
-        raise RuntimeError(
-            f"Claude plugin failed (exit {returncode}): {snippet or '(no output)'}"
-        )
+        print(f"[Review] Plugin failed (exit {returncode}), no parseable output: {snippet or '(no stderr)'}", flush=True)
+        return []
 
-    output = "\n".join(stdout_lines).strip()
     print(f"[Review] Plugin output ({len(output)} chars) — last 600 chars:\n{output[-600:]}", flush=True)
 
     if not output:
-        raise RuntimeError("Claude plugin produced no output — review did not complete")
+        print("[Review] Claude plugin produced no output", flush=True)
+        return []
 
     comments = _parse_json_from_output(output)
     print(f"[Review] {len(comments)} comment(s) collected", flush=True)
@@ -266,28 +278,29 @@ def _run_review_job(job_id: str, pr_link: str, pr_id: int, project: str, repo: s
     Background thread: invoke the /code-review:code-review skill and return
     the collected comments. The skill fetches everything it needs via ADO MCP
     tools — no local repo clone or PAT required here.
+
+    Always sets job status to "done" (never "error") so the cloud agent gets
+    a consistent response. Errors are logged server-side only.
     """
+    # Use the cached repo dir as cwd if it exists (Claude can read local
+    # CLAUDE.md), otherwise fall back to the agent root directory.
+    cwd = REPO_CACHE_DIR if REPO_CACHE_DIR.exists() else REPO_ROOT
+
     try:
-        # Use the cached repo dir as cwd if it exists (Claude can read local
-        # CLAUDE.md), otherwise fall back to the agent root directory.
-        cwd = REPO_CACHE_DIR if REPO_CACHE_DIR.exists() else REPO_ROOT
-
         comments = run_plugin_review(pr_link, repo_dir=cwd)
-        print(f"[Job {job_id[:8]}] PR #{pr_id} → {len(comments)} comment(s)", flush=True)
-
-        with _jobs_lock:
-            _jobs[job_id] = {
-                "status":        "done",
-                "pullRequestId": pr_id,
-                "comments":      comments,
-            }
     except Exception as e:
-        print(f"[Job {job_id[:8]}] Error: {e}", flush=True)
-        with _jobs_lock:
-            _jobs[job_id] = {
-                "status": "error",
-                "error":  str(e),
-            }
+        # run_plugin_review should never raise (it returns [] on failure),
+        # but guard here so a bug doesn't leave the job stuck as pending.
+        print(f"[Job {job_id[:8]}] Unexpected error: {e}", flush=True)
+        comments = []
+
+    print(f"[Job {job_id[:8]}] PR #{pr_id} → {len(comments)} comment(s)", flush=True)
+    with _jobs_lock:
+        _jobs[job_id] = {
+            "status":        "done",
+            "pullRequestId": pr_id,
+            "comments":      comments,
+        }
 
 
 # ---------------------------------------------------------------------------

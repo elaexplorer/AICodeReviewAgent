@@ -1744,7 +1744,7 @@ public class CodeReviewController : ControllerBase
     }
 
     /// <summary>
-    /// Submits a review job to the local Claude server, then polls until done (up to 12 min).
+    /// Submits a review job to the local Claude server, then polls until done (up to 43 min).
     /// The server returns immediately with a jobId; the skill runs asynchronously in the background
     /// so the devtunnel proxy never hits its gateway timeout.
     /// </summary>
@@ -1778,9 +1778,10 @@ public class CodeReviewController : ControllerBase
         var jobId = jobIdEl.GetString() ?? "";
         _logger.LogInformation("Local Claude job submitted: {JobId}", jobId);
 
-        // Poll until done (max 35 min — multi-agent plugin runs up to 40 min on local server)
+        // Poll until done (max 43 min — multi-agent plugin runs up to 40 min on local server,
+        // plus buffer for semaphore wait if a prior job is running)
         var pollUrl      = $"{baseUrl}/claudeCodeReview/{jobId}";
-        var deadline     = DateTime.UtcNow.AddMinutes(35);
+        var deadline     = DateTime.UtcNow.AddMinutes(43);
         var pollInterval = TimeSpan.FromSeconds(20);
 
         while (DateTime.UtcNow < deadline)
@@ -1815,7 +1816,7 @@ public class CodeReviewController : ControllerBase
             return comments;
         }
 
-        throw new TimeoutException("Claude /code-review plugin timed out after 35 min");
+        throw new TimeoutException("Claude /code-review plugin timed out after 43 min");
     }
 
     private static List<CodeReviewComment> ParseClaudeComments(JsonElement root)
