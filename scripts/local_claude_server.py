@@ -123,25 +123,50 @@ REPO_CACHE_DIR = Path(os.environ.get(
 
 
 # ---------------------------------------------------------------------------
-# Claude /code-review plugin invocation
+# Claude direct-prompt review (no slash command — works under any OS user)
 # ---------------------------------------------------------------------------
 
-# Appended after the skill invocation so Claude emits a parseable JSON array
-# at the end of its step-7 terminal output instead of prose only.
-# IMPORTANT: DO NOT post anything to the PR — the cloud agent owns all posting.
-_JSON_SUFFIX = (
-    "\n\nDo NOT post any comments, threads, votes, or summaries to the PR. "
-    "Do not call any ADO tools that write to the PR (no create_pull_request_thread, "
-    "reply_to_comment, update_pull_request, vote_pull_request, etc.). "
-    "Return your findings ONLY as the JSON array below — the calling service handles posting.\n\n"
-    "After completing your review findings, append a raw JSON array "
-    "at the very end of your response — no prose after it. "
-    "Each item must have exactly these fields:\n"
-    '{"filePath":"/path/to/file","startLine":1,"endLine":1,'
-    '"severity":"critical|high|medium|low","commentType":"issue",'
-    '"commentText":"description","suggestedFix":"fix or empty","confidence":0.9}\n'
-    "Return [] if no issues were found."
-)
+def _build_review_prompt(pr_link: str) -> str:
+    """
+    Build a self-contained review prompt for Claude.
+    Uses ADO REST API via curl ($ADO_PAT env var) to fetch PR data.
+    Returns findings as a JSON array — no plugin or command discovery needed.
+    """
+    return f"""You are performing a code review for an Azure DevOps pull request.
+
+PR URL: {pr_link}
+
+URL format: https://{{org}}.visualstudio.com/{{project}}/_git/{{repo}}/pullrequest/{{prId}}
+Parse the URL to extract ORG, PROJECT, REPO, PR_ID.
+
+CONSTRAINTS (strictly enforced):
+- Do NOT post any comment, thread, vote, or review to the PR.
+- Do NOT call any ADO MCP write tools.
+- Your response MUST end with a raw JSON array and NOTHING after it.
+
+STEPS:
+
+1. Get PR details and changed files using curl with basic auth (password = $ADO_PAT):
+   curl -s -u ":$ADO_PAT" "https://ORG.visualstudio.com/PROJECT/_apis/git/repositories/REPO/pullRequests/PR_ID?api-version=7.0"
+   curl -s -u ":$ADO_PAT" "https://ORG.visualstudio.com/PROJECT/_apis/git/repositories/REPO/pullRequests/PR_ID/iterations?api-version=7.0"
+   curl -s -u ":$ADO_PAT" "https://ORG.visualstudio.com/PROJECT/_apis/git/repositories/REPO/pullRequests/PR_ID/iterations/LAST_ITERATION_ID/changes?api-version=7.0"
+
+2. For files with changeType add/edit/rename (skip deleted, test files, generated files, binaries):
+   Fetch content at the source commit:
+   curl -s -u ":$ADO_PAT" "https://ORG.visualstudio.com/PROJECT/_apis/git/repositories/REPO/items?path=FILE_PATH&version=SOURCE_COMMIT_SHA&versionType=commit&api-version=7.0"
+   Limit to 25 files, prioritising .cs .py .ts .js .go .java .rs files.
+
+3. Review changed code for:
+   - Bugs: null dereferences, off-by-one errors, broken error handling, race conditions, resource leaks
+   - Security: hardcoded secrets, missing auth checks, injection vulnerabilities
+   - Logic errors: wrong conditions, missing edge cases
+   - Performance: N+1 queries, blocking async calls, unnecessary allocations
+   Skip: pre-existing issues, style/formatting, missing tests (unless a bug is introduced), false positives.
+
+4. Output ONLY a raw JSON array as the very last thing — no prose after it:
+[{{"filePath":"/path/to/file","startLine":1,"endLine":1,"severity":"critical|high|medium|low","commentType":"issue","commentText":"description","suggestedFix":"fix or empty string","confidence":0.85}}]
+Return [] if no real issues found. Only include issues with confidence >= 0.60.
+"""
 
 # ADO MCP tools that write to a PR — blocked via --allowedTools so Claude
 # cannot post even if it tries to ignore the prompt instruction above.
@@ -163,7 +188,7 @@ _ADO_WRITE_TOOLS = [
 
 def run_plugin_review(pr_link: str, repo_dir: Path) -> list[dict]:
     """
-    Invoke the code-review:code-review skill via claude --print.
+    Send a direct review prompt to Claude via claude --print.
 
     Uses Popen to stream Claude's output to the server log in real time
     (so we can see sub-agent progress) while also accumulating it for
@@ -172,14 +197,14 @@ def run_plugin_review(pr_link: str, repo_dir: Path) -> list[dict]:
     Always returns a list (may be empty) — never raises, so the caller
     always gets a consistent "done" response even if Claude fails or times out.
     """
-    _log.info("[Review] ── START ── /code-review:code-review for %s", pr_link)
+    _log.info("[Review] ── START ── direct prompt review for %s", pr_link)
     t0 = time.monotonic()
 
     def _elapsed() -> str:
         secs = int(time.monotonic() - t0)
         return f"{secs // 60}m{secs % 60:02d}s"
 
-    plugin_prompt = f"/code-review:code-review {pr_link}{_JSON_SUFFIX}"
+    plugin_prompt = _build_review_prompt(pr_link)
 
     env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_LOG"}
     env["PYTHONUTF8"] = "1"
@@ -361,9 +386,9 @@ def _run_review_job(job_id: str, pr_link: str, pr_id: int, project: str, repo: s
     t0 = time.monotonic()
     _log.info("[Job %s] PR #%d (%s/%s) — starting", short, pr_id, project, repo)
 
-    # Use the cached repo dir as cwd if it exists (Claude can read local
-    # CLAUDE.md), otherwise fall back to the agent root directory.
-    cwd = REPO_CACHE_DIR if REPO_CACHE_DIR.exists() else REPO_ROOT
+    # Always use REPO_ROOT as cwd so Claude finds .claude/commands/code-review.md.
+    # The review command uses ADO MCP tools and does not need the local repo clone.
+    cwd = REPO_ROOT
 
     try:
         comments = run_plugin_review(pr_link, repo_dir=cwd)

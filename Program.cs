@@ -138,6 +138,10 @@ builder.Services.AddHostedService<IndexRestoreHostedService>();
 builder.Services.AddHostedService<RagAutoIndexHostedService>();
 builder.Services.AddHostedService<FeedbackSyncHostedService>();
 
+// Pipeline token persistence (Azure Blob Storage)
+builder.Services.AddSingleton<PipelineTokenStore>();
+builder.Services.AddHostedService<PipelineTokenRestoreHostedService>();
+
 // Add RAG context service
 builder.Services.AddSingleton<CodebaseContextService>();
 

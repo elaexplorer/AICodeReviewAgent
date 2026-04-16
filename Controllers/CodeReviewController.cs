@@ -33,11 +33,7 @@ public class CodeReviewController : ControllerBase
     private static readonly TimeSpan ReviewByLinkAndPostSyncWait = TimeSpan.FromSeconds(5);
     private static readonly HttpClient _localClaudeHttpClient = new() { Timeout = TimeSpan.FromMinutes(2) };
 
-    // Latest pipeline token received via X-Ado-Access-Token header.
-    // Overwritten on every inbound pipeline request so the delete endpoint
-    // can use it to remove comments posted by the build service identity.
-    private static string? _latestPipelineToken;
-    private static DateTime _latestPipelineTokenReceivedAt = DateTime.MinValue;
+    private readonly PipelineTokenStore _tokenStore;
 
     public CodeReviewController(
         CodeReviewAgentService codeReviewAgent,
@@ -48,6 +44,7 @@ public class CodeReviewController : ControllerBase
         EmbeddingConfigurationService embeddingConfig,
         CodebaseContextService codebaseContextService,
         CommentFeedbackService feedbackService,
+        PipelineTokenStore tokenStore,
         ILogger<CodeReviewController> logger)
     {
         _codeReviewAgent = codeReviewAgent;
@@ -58,6 +55,7 @@ public class CodeReviewController : ControllerBase
         _embeddingConfig = embeddingConfig;
         _codebaseContextService = codebaseContextService;
         _feedbackService = feedbackService;
+        _tokenStore = tokenStore;
         _logger = logger;
     }
 
@@ -297,17 +295,15 @@ public class CodeReviewController : ControllerBase
                     : claudeComments.Count > 0       ? $"{claudeComments.Count} comment(s)"
                     :                                   "disabled or no issues");
 
-                // Post Claude comments (critical, high, medium with ≥0.7 confidence) — GPT is email-only
+                // Post all Claude comments that have a confidence score — GPT is email-only
                 var commentsToPost = claudeComments
-                    .Where(c => c.Confidence >= 0.7 && c.Severity?.Trim().ToLowerInvariant() is "critical" or "high" or "medium")
+                    .Where(c => c.Confidence > 0)
                     .GroupBy(c => $"{NormalizePath(c.FilePath)}:{c.StartLine}")
                     .Select(g => g.First())
                     .ToList();
 
                 _logger.LogInformation(
-                    "Claude to post: {ClaudeHigh} critical/high + {ClaudeMedium} medium → {Total} (GPT {GptTotal} comments are email-only)",
-                    claudeComments.Count(c => c.Confidence >= 0.7 && c.Severity?.Trim().ToLowerInvariant() is "critical" or "high"),
-                    claudeComments.Count(c => c.Confidence >= 0.7 && c.Severity?.Trim().ToLowerInvariant() is "medium"),
+                    "Claude to post: {Total} comment(s) (GPT {GptTotal} comments are email-only)",
                     commentsToPost.Count,
                     reviewOutput.Comments.Count);
                 var validRightSideLinesByFile = BuildValidRightSideLineLookup(reviewOutput.Files);
@@ -631,15 +627,15 @@ public class CodeReviewController : ControllerBase
     [HttpGet("pipeline-token/status")]
     public IActionResult GetPipelineTokenStatus()
     {
-        if (_latestPipelineToken == null)
+        if (_tokenStore.Token == null)
             return Ok(new { hasToken = false, message = "No pipeline token received yet." });
 
-        var age   = DateTime.UtcNow - _latestPipelineTokenReceivedAt;
+        var age   = DateTime.UtcNow - _tokenStore.ReceivedAt;
         var valid = age.TotalHours < 6;
         return Ok(new
         {
             hasToken    = true,
-            receivedAt  = _latestPipelineTokenReceivedAt,
+            receivedAt  = _tokenStore.ReceivedAt,
             ageMinutes  = (int)age.TotalMinutes,
             usable      = valid,
             message     = valid
@@ -659,11 +655,11 @@ public class CodeReviewController : ControllerBase
             var headerToken = Request.Headers.TryGetValue("X-Ado-Access-Token", out var hv)
                 ? hv.ToString() : null;
 
-            var tokenAge      = DateTime.UtcNow - _latestPipelineTokenReceivedAt;
+            var tokenAge      = DateTime.UtcNow - _tokenStore.ReceivedAt;
             var pipelineToken = !string.IsNullOrWhiteSpace(headerToken)
                 ? headerToken
-                : (_latestPipelineToken != null && tokenAge.TotalHours < 24
-                    ? _latestPipelineToken : null);
+                : (_tokenStore.Token != null && tokenAge.TotalHours < 24
+                    ? _tokenStore.Token : null);
 
             if (pipelineToken != null)
                 _logger.LogInformation(
@@ -1554,9 +1550,10 @@ public class CodeReviewController : ControllerBase
                                : claudeComments.Count > 0        ? "GPT + Claude (union)"
                                :                                   "GPT only";
         var notPosted          = Math.Max(0, filteredToPost - postedComments.Count - skippedCount);
-        var gptHighComments      = gptComments.Where(c => c.Severity?.ToLower() is "critical" or "high").OrderByDescending(c => c.Confidence).ToList();
-        var claudeHighComments   = claudeComments.Where(c => c.Severity?.ToLower() is "critical" or "high").OrderByDescending(c => c.Confidence).ToList();
-        var claudeMediumComments = claudeComments.Where(c => c.Severity?.ToLower() is "medium").OrderByDescending(c => c.Confidence).ToList();
+        var gptHighComments    = gptComments.Where(c => c.Severity?.ToLower() is "critical" or "high").OrderByDescending(c => c.Confidence).ToList();
+        static int SevOrder(CodeReviewComment c) => c.Severity?.ToLower() switch {
+            "critical" => 0, "high" => 1, "medium" => 2, "low" => 3, _ => 4 };
+        var claudeAllComments  = claudeComments.OrderBy(SevOrder).ThenByDescending(c => c.Confidence).ToList();
 
         // Helper: build a table of comments
         static string CommentTable(List<CodeReviewComment> items, string accentColor)
@@ -1638,10 +1635,10 @@ public class CodeReviewController : ControllerBase
                   <div style="flex:1;padding:14px 16px;border-right:1px solid #e1e4e8;text-align:center">
                     {(claudeFailureReason is not null
                         ? $"<div style='font-size:14px;font-weight:700;color:#d73a49'>FAILED</div><div style='font-size:10px;color:#586069;margin-top:2px;word-break:break-word'>{System.Web.HttpUtility.HtmlEncode(claudeFailureReason[..Math.Min(80, claudeFailureReason.Length)])}</div>"
-                        : claudeComments.Count > 0
-                            ? $"<div style='font-size:16px;font-weight:700;color:#d73a49'>{claudeHighComments.Count}</div><div style='font-size:10px;color:#586069;margin-top:1px'>Claude critical</div><div style='font-size:16px;font-weight:700;color:#6f42c1;margin-top:4px'>{claudeMediumComments.Count}</div><div style='font-size:10px;color:#586069;margin-top:1px'>Claude medium</div>"
-                            : !claudeConfigured
-                                ? "<div style='font-size:14px;font-weight:700;color:#6a737d'>—</div><div style='font-size:11px;color:#586069;margin-top:2px'>Claude (disabled)</div>"
+                        : !claudeConfigured
+                            ? "<div style='font-size:14px;font-weight:700;color:#6a737d'>—</div><div style='font-size:11px;color:#586069;margin-top:2px'>Claude (disabled)</div>"
+                            : claudeComments.Count > 0
+                                ? $"<div style='font-size:22px;font-weight:700;color:#d73a49'>{claudeComments.Count}</div><div style='font-size:11px;color:#586069;margin-top:2px'>Claude total</div>"
                                 : "<div style='font-size:16px;font-weight:700;color:#28a745'>0</div><div style='font-size:11px;color:#586069;margin-top:2px'>Claude no issues</div>"
                     )}
                   </div>
@@ -1671,17 +1668,17 @@ public class CodeReviewController : ControllerBase
                   <a href="{prLink}" style="font-weight:600;color:#0366d6;text-decoration:none;font-size:14px">PR #{prId}: {project}/{repository}</a>
                 </div>
 
-                <!-- Claude critical/high table -->
+                <!-- Claude all comments table -->
                 <div style="padding:16px 24px;border-bottom:1px solid #e1e4e8">
                   <div style="font-size:13px;font-weight:600;color:#d73a49;margin-bottom:8px">
-                    Claude — Critical/High Comments ({claudeHighComments.Count}) <span style="font-size:11px;font-weight:400;color:#6a737d">· posted to PR</span>
+                    Claude — All Comments ({claudeAllComments.Count}) <span style="font-size:11px;font-weight:400;color:#6a737d">· posted to PR</span>
                   </div>
                   {(claudeFailureReason is not null
                       ? $"<div style='font-size:12px;color:#d73a49;font-weight:700'>FAILED — {System.Web.HttpUtility.HtmlEncode(claudeFailureReason)}</div>"
                       : !claudeConfigured
                           ? "<div style='font-size:12px;color:#6a737d'>Claude review was not configured for this run.</div>"
-                      : claudeComments.Count == 0
-                          ? "<div style='font-size:12px;color:#28a745'>No critical or high issues found.</div>"
+                      : claudeAllComments.Count == 0
+                          ? "<div style='font-size:12px;color:#28a745'>No issues found.</div>"
                           : $@"<table style='width:100%;border-collapse:collapse;font-size:12px'>
                     <thead>
                       <tr style='background:#f6f8fa;border-bottom:2px solid #e1e4e8'>
@@ -1691,28 +1688,7 @@ public class CodeReviewController : ControllerBase
                         <th style='padding:6px 8px;text-align:right;color:#586069;font-weight:600'>Conf</th>
                       </tr>
                     </thead>
-                    <tbody>{CommentTable(claudeHighComments, "#d73a49")}</tbody>
-                  </table>"
-                  )}
-                </div>
-
-                <!-- Claude medium table -->
-                <div style="padding:16px 24px;border-bottom:1px solid #e1e4e8">
-                  <div style="font-size:13px;font-weight:600;color:#6f42c1;margin-bottom:8px">
-                    Claude — Medium Comments ({claudeMediumComments.Count}) <span style="font-size:11px;font-weight:400;color:#6a737d">· posted to PR</span>
-                  </div>
-                  {(!claudeConfigured || claudeFailureReason is not null || claudeComments.Count == 0
-                      ? ""
-                      : $@"<table style='width:100%;border-collapse:collapse;font-size:12px'>
-                    <thead>
-                      <tr style='background:#f6f8fa;border-bottom:2px solid #e1e4e8'>
-                        <th style='padding:6px 8px;text-align:left;color:#586069;font-weight:600'>Sev</th>
-                        <th style='padding:6px 8px;text-align:left;color:#586069;font-weight:600'>File:Line</th>
-                        <th style='padding:6px 8px;text-align:left;color:#586069;font-weight:600'>Comment</th>
-                        <th style='padding:6px 8px;text-align:right;color:#586069;font-weight:600'>Conf</th>
-                      </tr>
-                    </thead>
-                    <tbody>{CommentTable(claudeMediumComments, "#6f42c1")}</tbody>
+                    <tbody>{CommentTable(claudeAllComments, "#d73a49")}</tbody>
                   </table>"
                   )}
                 </div>
@@ -1768,18 +1744,50 @@ public class CodeReviewController : ControllerBase
     {
         var baseUrl = localAgentUrl.TrimEnd('/');
 
-        // Submit job
-        var payload = JsonSerializer.Serialize(new { pullRequestLink });
-        var submitReq = new HttpRequestMessage(HttpMethod.Post, $"{baseUrl}/claudeCodeReview")
+        // Devtunnel proxies often return 404/502/503 transiently on first contact — warm it up.
+        try
         {
-            Content = new StringContent(payload, Encoding.UTF8, "application/json")
-        };
-        if (!string.IsNullOrWhiteSpace(adoToken))
-            submitReq.Headers.TryAddWithoutValidation("X-Ado-Access-Token", adoToken);
+            var healthResp = await _localClaudeHttpClient.GetAsync($"{baseUrl}/health");
+            _logger.LogInformation("Claude server health: {Status}", (int)healthResp.StatusCode);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("Claude health check failed ({E}) — proceeding anyway", ex.Message);
+        }
 
-        var submitResp = await _localClaudeHttpClient.SendAsync(submitReq);
+        // Submit job — retry up to 5 times with exponential backoff (5s, 15s, 30s, 60s)
+        // to ride out transient devtunnel 404s/502s.
+        var submitDelays = new[] { 5, 15, 30, 60 };
+        var payload = JsonSerializer.Serialize(new { pullRequestLink });
+        HttpResponseMessage submitResp = null!;
+        for (int attempt = 1; attempt <= 5; attempt++)
+        {
+            var submitReq = new HttpRequestMessage(HttpMethod.Post, $"{baseUrl}/claudeCodeReview")
+            {
+                Content = new StringContent(payload, Encoding.UTF8, "application/json")
+            };
+            if (!string.IsNullOrWhiteSpace(adoToken))
+                submitReq.Headers.TryAddWithoutValidation("X-Ado-Access-Token", adoToken);
+
+            try { submitResp = await _localClaudeHttpClient.SendAsync(submitReq); }
+            catch (Exception ex)
+            {
+                _logger.LogWarning("Claude submit attempt {Attempt}/5 threw {E}", attempt, ex.Message);
+                if (attempt < 5) { await Task.Delay(TimeSpan.FromSeconds(submitDelays[attempt - 1])); continue; }
+                throw new InvalidOperationException($"Claude server unreachable after 5 attempts: {ex.Message}");
+            }
+
+            if (submitResp.IsSuccessStatusCode) break;
+
+            var delayS = attempt <= submitDelays.Length ? submitDelays[attempt - 1] : 60;
+            _logger.LogWarning(
+                "Claude submit attempt {Attempt}/5 returned {Status} — {Retry}",
+                attempt, (int)submitResp.StatusCode,
+                attempt < 5 ? $"retrying in {delayS}s" : "giving up");
+            if (attempt < 5) await Task.Delay(TimeSpan.FromSeconds(delayS));
+        }
         if (!submitResp.IsSuccessStatusCode)
-            throw new InvalidOperationException($"Claude server returned {(int)submitResp.StatusCode} on submit");
+            throw new InvalidOperationException($"Claude server returned {(int)submitResp.StatusCode} on submit after 5 attempts");
 
         var submitJson = await submitResp.Content.ReadAsStringAsync();
         var submitDoc  = JsonDocument.Parse(submitJson);
@@ -1789,27 +1797,60 @@ public class CodeReviewController : ControllerBase
         var jobId = jobIdEl.GetString() ?? "";
         _logger.LogInformation("Local Claude job submitted: {JobId}", jobId);
 
-        // Poll until done (max 43 min — multi-agent plugin runs up to 40 min on local server,
-        // plus buffer for semaphore wait if a prior job is running)
-        var pollUrl      = $"{baseUrl}/claudeCodeReview/{jobId}";
-        var deadline     = DateTime.UtcNow.AddMinutes(43);
-        var pollInterval = TimeSpan.FromSeconds(20);
+        // Poll until done (max 43 min — multi-agent review runs up to 40 min on local server,
+        // plus buffer for semaphore wait if a prior job is running).
+        // Transient devtunnel errors (404, 502, 503, 504) are tolerated — we keep polling
+        // rather than failing the whole review on a momentary tunnel hiccup.
+        var pollUrl            = $"{baseUrl}/claudeCodeReview/{jobId}";
+        var deadline           = DateTime.UtcNow.AddMinutes(43);
+        var pollInterval       = TimeSpan.FromSeconds(20);
+        int consecutiveErrors  = 0;
+        const int maxConsecutiveErrors = 6; // ~2 min of tunnel downtime before giving up
 
         while (DateTime.UtcNow < deadline)
         {
             await Task.Delay(pollInterval);
 
             HttpResponseMessage pollResp;
-            try { pollResp = await _localClaudeHttpClient.SendAsync(new HttpRequestMessage(HttpMethod.Get, pollUrl)); }
-            catch (Exception ex) { _logger.LogWarning("Claude poll error: {E}", ex.Message); continue; }
+            try
+            {
+                pollResp = await _localClaudeHttpClient.SendAsync(new HttpRequestMessage(HttpMethod.Get, pollUrl));
+            }
+            catch (Exception ex)
+            {
+                consecutiveErrors++;
+                _logger.LogWarning("Claude poll error ({N}/{Max}): {E}", consecutiveErrors, maxConsecutiveErrors, ex.Message);
+                if (consecutiveErrors >= maxConsecutiveErrors)
+                    throw new InvalidOperationException($"Claude server unreachable for {consecutiveErrors} consecutive polls");
+                continue;
+            }
 
+            var status = (int)pollResp.StatusCode;
+
+            // 202 = job still running
             if (pollResp.StatusCode == System.Net.HttpStatusCode.Accepted)
-                continue; // still pending
+            {
+                consecutiveErrors = 0;
+                continue;
+            }
 
+            // Transient devtunnel errors — keep polling
+            if (status is 404 or 502 or 503 or 504)
+            {
+                consecutiveErrors++;
+                _logger.LogWarning(
+                    "Claude poll returned {Status} (transient, {N}/{Max}) — continuing",
+                    status, consecutiveErrors, maxConsecutiveErrors);
+                if (consecutiveErrors >= maxConsecutiveErrors)
+                    throw new InvalidOperationException($"Claude server returned {status} for {consecutiveErrors} consecutive polls");
+                continue;
+            }
+
+            // Any other non-success is a real error from the Flask server (e.g. 500)
             if (!pollResp.IsSuccessStatusCode)
             {
                 var errBody = await pollResp.Content.ReadAsStringAsync();
-                var errMsg  = $"HTTP {(int)pollResp.StatusCode}";
+                var errMsg  = $"HTTP {status}";
                 try
                 {
                     var errDoc = JsonDocument.Parse(errBody);
@@ -1820,6 +1861,7 @@ public class CodeReviewController : ControllerBase
                 throw new InvalidOperationException($"Claude review failed: {errMsg}");
             }
 
+            consecutiveErrors = 0;
             var pollJson = await pollResp.Content.ReadAsStringAsync();
             var pollDoc  = JsonDocument.Parse(pollJson);
             var comments = ParseClaudeComments(pollDoc.RootElement);
@@ -1827,7 +1869,7 @@ public class CodeReviewController : ControllerBase
             return comments;
         }
 
-        throw new TimeoutException("Claude /code-review plugin timed out after 43 min");
+        throw new TimeoutException("Claude review timed out after 43 min");
     }
 
     private static List<CodeReviewComment> ParseClaudeComments(JsonElement root)
@@ -2050,9 +2092,8 @@ public class CodeReviewController : ControllerBase
 
         // Persist the latest pipeline token so the delete endpoint can use it
         // to remove comments posted by the Build Service identity.
-        _latestPipelineToken = token;
-        _latestPipelineTokenReceivedAt = DateTime.UtcNow;
-        _logger.LogDebug("Saved latest pipeline token (received at {ReceivedAt})", _latestPipelineTokenReceivedAt);
+        _tokenStore.Set(token);
+        _logger.LogDebug("Saved latest pipeline token (received at {ReceivedAt})", _tokenStore.ReceivedAt);
         return token;
     }
 
